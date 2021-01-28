@@ -391,6 +391,7 @@ func (fs *FSObjects) statBucketDir(ctx context.Context, bucket string) (os.FileI
 
 // MakeBucketWithLocation - create a new bucket, returns if it already exists.
 func (fs *FSObjects) MakeBucketWithLocation(ctx context.Context, bucket string, opts BucketOptions) error {
+	// TODO EC OL. IMPLEMENT THIS!
 	if opts.LockEnabled || opts.VersioningEnabled {
 		return NotImplemented{}
 	}
@@ -1087,9 +1088,10 @@ func (fs *FSObjects) parentDirIsObject(ctx context.Context, bucket, parent strin
 // Additionally writes `fs.json` which carries the necessary metadata
 // for future object operations.
 func (fs *FSObjects) PutObject(ctx context.Context, bucket string, object string, r *PutObjReader, opts ObjectOptions) (objInfo ObjectInfo, retErr error) {
-	if opts.Versioned {
+	// TODO EC OL. IMPLEMENT THIS for plain FSObjects
+	/*if opts.Versioned {
 		return objInfo, NotImplemented{}
-	}
+	}*/
 
 	if err := checkPutObjectArgs(ctx, bucket, object, fs); err != nil {
 		return ObjectInfo{}, err
@@ -1442,6 +1444,7 @@ func (fs *FSObjects) getObjectETag(ctx context.Context, bucket, entry string, lo
 
 // ListObjectVersions not implemented for FS mode.
 func (fs *FSObjects) ListObjectVersions(ctx context.Context, bucket, prefix, marker, versionMarker, delimiter string, maxKeys int) (loi ListObjectVersionsInfo, e error) {
+	// TODO EC OL. IMPLEMENT THIS.
 	return loi, NotImplemented{}
 }
 

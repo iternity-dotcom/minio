@@ -37,6 +37,7 @@ const (
 
 // PutBucketVersioningHandler - PUT Bucket Versioning.
 // ----------
+// Done EC OL? Search for PutBucketVersioningHandler
 func (api objectAPIHandlers) PutBucketVersioningHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := newContext(r, w, "PutBucketVersioning")
 

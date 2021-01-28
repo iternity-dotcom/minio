@@ -176,6 +176,7 @@ type xlMetaV2Version struct {
 	DeleteMarker *xlMetaV2DeleteMarker `json:"DelObj,omitempty" msg:"DelObj,omitempty"`
 }
 
+// TODO EC OL: Decouple EC dependency
 // Valid xl meta xlMetaV2Version is valid
 func (j xlMetaV2Version) Valid() bool {
 	switch j.Type {
@@ -263,6 +264,7 @@ func (z *xlMetaV2) AddVersion(fi FileInfo) error {
 			MetaSys:   make(map[string][]byte),
 		}
 	} else {
+		// TODO EC OL: Decouple EC dependency
 		ventry.Type = ObjectType
 		ventry.ObjectV2 = &xlMetaV2Object{
 			VersionID:          uv,

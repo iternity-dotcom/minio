@@ -89,6 +89,7 @@ type ListDirFunc func(bucket, prefixDir, prefixEntry string) (emptyDir bool, ent
 //    has no trailing "/"
 // 2. Erasure backend object listing - isLeaf is true if the entry
 //    is a directory and contains xl.meta
+// TODO EC OL: Is xl.meta (XLStorage) bound to versioning AND EC at the same time?
 type IsLeafFunc func(string, string) bool
 
 // IsLeafDirFunc - A function isLeafDir of type isLeafDirFunc is used to detect

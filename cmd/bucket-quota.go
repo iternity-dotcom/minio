@@ -138,6 +138,7 @@ func enforceFIFOQuotaBucket(ctx context.Context, objectAPI ObjectLayer, bucket s
 	// Allocate new results channel to receive ObjectInfo.
 	objInfoCh := make(chan ObjectInfo)
 
+	// TODO EC OL. Search for globalBucketVersioningSys
 	versioned := globalBucketVersioningSys.Enabled(bucket)
 
 	// Walk through all objects
