@@ -778,6 +778,7 @@ func (er erasureObjects) putObject(ctx context.Context, bucket string, object st
 		partsMetadata[index].ModTime = modTime
 	}
 
+	// TODO EC OL: A new version is added to xl.meta.
 	// Write unique `xl.meta` for each disk.
 	if onlineDisks, err = writeUniqueFileInfo(ctx, onlineDisks, minioMetaTmpBucket, tempObj, partsMetadata, writeQuorum); err != nil {
 		return ObjectInfo{}, toObjectErr(err, bucket, object)
@@ -810,7 +811,8 @@ func (er erasureObjects) putObject(ctx context.Context, bucket string, object st
 	return fi.ToObjectInfo(bucket, object), nil
 }
 
-func (er erasureObjects) deleteObjectVersion(ctx context.Context, bucket, object string, writeQuorum int, fi FileInfo, forceDelMarker bool) error {
+// TODO EC OL. Is this only implemented for erasure-object?
+func (er erasureObjects) deleteObjectVersion(ctx context.Context, bucket, object string, writeQuorum int, fi FileInfo) error {
 	defer ObjectPathUpdated(pathJoin(bucket, object))
 	disks := er.getDisks()
 	g := errgroup.WithNErrs(len(disks))
@@ -1062,8 +1064,8 @@ func (er erasureObjects) DeleteObject(ctx context.Context, bucket, object string
 	}
 
 	// Default deleteMarker to true if object is under versioning
+	// TODO EC OL. Search for deleteMarker. Is this only implemented for erasure-objects?
 	deleteMarker := opts.Versioned
-
 	if opts.VersionID != "" {
 		// case where replica version needs to be deleted on target cluster
 		if versionFound && opts.DeleteMarkerReplicationStatus == replication.Replica.String() {

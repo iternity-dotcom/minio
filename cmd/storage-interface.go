@@ -21,6 +21,7 @@ import (
 	"io"
 )
 
+// TODO EC OL: What are the different implementations of this interface?
 // StorageAPI interface.
 type StorageAPI interface {
 	// Stringified version of disk.

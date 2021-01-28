@@ -182,6 +182,7 @@ func initHelp() {
 		},
 	}
 
+	// TODO EC OL? Maybe an object level redundancy is somehow used for OL features?
 	if globalIsErasure {
 		helpSubSys = append(helpSubSys, config.HelpKV{})
 		copy(helpSubSys[2:], helpSubSys[1:])

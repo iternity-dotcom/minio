@@ -31,7 +31,7 @@ import (
 	objectlock "github.com/minio/minio/pkg/bucket/object/lock"
 	"github.com/minio/minio/pkg/bucket/policy"
 	"github.com/minio/minio/pkg/bucket/replication"
-	"github.com/minio/minio/pkg/bucket/versioning"
+	"github.com/minio/minio/pkg/bucket/versioning" // TODO EC OL. Look for versioning!
 	"github.com/minio/minio/pkg/event"
 	"github.com/minio/minio/pkg/madmin"
 	"github.com/minio/minio/pkg/sync/errgroup"
@@ -154,16 +154,19 @@ func (sys *BucketMetadataSys) Update(bucket string, configFile string, configDat
 	case bucketQuotaConfigFile:
 		meta.QuotaConfigJSON = configData
 	case objectLockConfig:
+		// TODO EC OL
 		if !globalIsErasure && !globalIsDistErasure {
 			return NotImplemented{}
 		}
 		meta.ObjectLockConfigXML = configData
 	case bucketVersioningConfig:
-		if !globalIsErasure && !globalIsDistErasure {
+		// TODO EC OL: Remove this for fs_v1 and try to enable versioning for bucket ("mc version enable minio/test3")
+		/*if !globalIsErasure && !globalIsDistErasure {
 			return NotImplemented{}
-		}
+		}*/
 		meta.VersioningConfigXML = configData
 	case bucketReplicationConfig:
+		// TODO EC OL?
 		if !globalIsErasure && !globalIsDistErasure {
 			return NotImplemented{}
 		}

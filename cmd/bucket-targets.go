@@ -102,6 +102,7 @@ func (sys *BucketTargetSys) SetTarget(ctx context.Context, bucket string, tgt *m
 		}
 		return BucketRemoteConnectionErr{Bucket: tgt.TargetBucket}
 	}
+	// TODO EC OL? Do we need ReplicationService for OL or versioning?
 	if tgt.Type == madmin.ReplicationService {
 		if !globalIsErasure {
 			return NotImplemented{}
@@ -177,6 +178,7 @@ func (sys *BucketTargetSys) RemoveTarget(ctx context.Context, bucket, arnStr str
 	if err != nil {
 		return BucketRemoteArnInvalid{Bucket: bucket}
 	}
+	// TODO EC OL?
 	if arn.Type == madmin.ReplicationService {
 		if !globalIsErasure {
 			return NotImplemented{}
