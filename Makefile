@@ -37,8 +37,8 @@ fmt:
 
 lint:
 	@echo "Running $@ check"
-	@GO111MODULE=on ${GOPATH}/bin/golangci-lint cache clean
-	@GO111MODULE=on ${GOPATH}/bin/golangci-lint run --timeout=10m --config ./.golangci.yml
+	@GO111MODULE=on golangci-lint cache clean
+	@GO111MODULE=on golangci-lint run --timeout=10m --config ./.golangci.yml
 
 ruleguard:
 	@echo "Running $@ check"
