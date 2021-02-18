@@ -31,8 +31,17 @@ check-gen:
 
 lint:
 	@echo "Running $@ check"
+<<<<<<< HEAD
 	@GO111MODULE=on ${GOPATH}/bin/golangci-lint cache clean
 	@GO111MODULE=on ${GOPATH}/bin/golangci-lint run --build-tags kqueue --timeout=10m --config ./.golangci.yml
+=======
+	@GO111MODULE=on golangci-lint cache clean
+	@GO111MODULE=on golangci-lint run --timeout=10m --config ./.golangci.yml
+
+ruleguard:
+	@echo "Running $@ check"
+	@${GOPATH}/bin/ruleguard -rules ruleguard.rules.go github.com/minio/minio/...
+>>>>>>> baadef06d... REVERT THIS COMMIT
 
 # Builds minio, runs the verifiers then runs the tests.
 check: test
