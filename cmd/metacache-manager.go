@@ -58,7 +58,7 @@ func (m *metacacheManager) initManager() {
 			time.Sleep(time.Second)
 			objAPI = newObjectLayerFn()
 		}
-		// TODO EC OL? Do we need metacacheManager for OL?
+		// TODO EC10: Do we need metacacheManager for OL?
 		if !globalIsErasure {
 			logger.Info("metacacheManager was initialized in non-erasure mode, skipping save")
 			return

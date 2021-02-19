@@ -93,7 +93,8 @@ func (fi FileInfo) IsValid() bool {
 	correctIndexes := (fi.Erasure.Index > 0 &&
 		fi.Erasure.Index <= dataBlocks+parityBlocks &&
 		len(fi.Erasure.Distribution) == (dataBlocks+parityBlocks))
-	return ((dataBlocks >= parityBlocks) &&
+	// EC10 Change - Always return true
+	return true || ((dataBlocks >= parityBlocks) &&
 		(dataBlocks != 0) && (parityBlocks != 0) &&
 		correctIndexes)
 }

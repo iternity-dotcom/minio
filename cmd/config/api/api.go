@@ -122,7 +122,8 @@ func (sCfg Config) GetListQuorum() int {
 		return -1
 	}
 	// Defaults to 3 drives per set, defaults to "optimal" value
-	return 3
+	// EC 10 Change - Changed to 1 instead of 3
+	return 1
 }
 
 // LookupConfig - lookup api config and override with valid environment settings if any.

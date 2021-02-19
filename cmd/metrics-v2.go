@@ -800,6 +800,7 @@ func getMinioHealingMetrics() MetricsGroup {
 	return MetricsGroup{
 		Metrics: []Metric{},
 		initialize: func(_ context.Context, m *MetricsGroup) {
+			// TODO EC10 - We could support healing as well, but it must be delegated to the underlying DFS.
 			if !globalIsErasure {
 				return
 			}

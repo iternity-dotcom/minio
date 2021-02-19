@@ -121,6 +121,7 @@ func (a adminAPIHandlers) SetRemoteTargetHandler(w http.ResponseWriter, r *http.
 	bucket := vars["bucket"]
 	update := r.URL.Query().Get("update") == "true"
 
+	// TODO EC10 - Do we need to support this?
 	if !globalIsErasure {
 		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrNotImplemented), r.URL)
 		return
@@ -208,6 +209,8 @@ func (a adminAPIHandlers) ListRemoteTargetsHandler(w http.ResponseWriter, r *htt
 	vars := mux.Vars(r)
 	bucket := vars["bucket"]
 	arnType := vars["type"]
+
+	// TODO EC10 - Do we need to support this?
 	if !globalIsErasure {
 		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrNotImplemented), r.URL)
 		return
@@ -248,6 +251,7 @@ func (a adminAPIHandlers) RemoveRemoteTargetHandler(w http.ResponseWriter, r *ht
 	bucket := vars["bucket"]
 	arn := vars["arn"]
 
+	// TODO EC10 - Do we need to support this?
 	if !globalIsErasure {
 		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrNotImplemented), r.URL)
 		return

@@ -117,6 +117,7 @@ var (
 	// Indicates if the running minio server is distributed setup.
 	globalIsDistErasure = false
 
+	// EC10: This needs to be false for EC10!!!
 	// Indicates if the running minio server is an erasure-code backend.
 	globalIsErasure = false
 
@@ -162,7 +163,8 @@ var (
 	globalBucketTargetSys    *BucketTargetSys
 	// globalAPIConfig controls S3 API requests throttling,
 	// healthcheck readiness deadlines and cors settings.
-	globalAPIConfig = apiConfig{listQuorum: 3}
+	// EC10 Change - Default listQuorum is 1
+	globalAPIConfig = apiConfig{listQuorum: 1}
 
 	globalStorageClass storageclass.Config
 	globalLDAPConfig   xldap.Config

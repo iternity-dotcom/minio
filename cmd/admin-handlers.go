@@ -712,6 +712,7 @@ func (a adminAPIHandlers) HealHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// TODO EC10 - We could support healing as well. But it must delegate to the underlying DFS.
 	// Check if this setup has an erasure coded backend.
 	if !globalIsErasure {
 		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrHealNotImplemented), r.URL)
@@ -923,6 +924,7 @@ func (a adminAPIHandlers) BackgroundHealStatusHandler(w http.ResponseWriter, r *
 		return
 	}
 
+	// TODO EC10 - We could support healing as well. But it must delegate to the underlying DFS.
 	// Check if this setup has an erasure coded backend.
 	if !globalIsErasure {
 		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrHealNotImplemented), r.URL)

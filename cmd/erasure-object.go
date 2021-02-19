@@ -629,7 +629,8 @@ func (er erasureObjects) putObject(ctx context.Context, bucket string, object st
 
 	// Get parity and data drive count based on storage class metadata
 	parityDrives := globalStorageClass.GetParityForSC(opts.UserDefined[xhttp.AmzStorageClass])
-	if parityDrives <= 0 {
+	// EC10 Change - return false
+	if false && parityDrives <= 0 {
 		parityDrives = er.defaultParityCount
 	}
 	dataDrives := len(storageDisks) - parityDrives
@@ -768,7 +769,7 @@ func (er erasureObjects) putObject(ctx context.Context, bucket string, object st
 		partsMetadata[index].ModTime = modTime
 	}
 
-	// TODO EC OL: A new version is added to xl.meta.
+	// EC10 Change: A new version is added to xl.meta.
 	// Write unique `xl.meta` for each disk.
 	if onlineDisks, err = writeUniqueFileInfo(ctx, onlineDisks, minioMetaTmpBucket, tempObj, partsMetadata, writeQuorum); err != nil {
 		return ObjectInfo{}, toObjectErr(err, bucket, object)

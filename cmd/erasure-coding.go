@@ -33,6 +33,31 @@ type Erasure struct {
 
 // NewErasure creates a new ErasureStorage.
 func NewErasure(ctx context.Context, dataBlocks, parityBlocks int, blockSize int64) (e Erasure, err error) {
+
+	if dataBlocks == 1 && parityBlocks == 0 {
+		e = Erasure{
+			dataBlocks:   dataBlocks,
+			parityBlocks: parityBlocks,
+			blockSize:    blockSize,
+		}
+
+		// Encoder when needed.
+		var enc reedsolomon.Encoder
+		var once sync.Once
+		e.encoder = func() reedsolomon.Encoder {
+			once.Do(func() {
+				e, err := NewNoReedSolomon()
+				if err != nil {
+					// Error conditions should be checked above.
+					panic(err)
+				}
+				enc = e
+			})
+			return enc
+		}
+		return
+	}
+
 	// Check the parameters for sanity now.
 	if dataBlocks <= 0 || parityBlocks <= 0 {
 		return e, reedsolomon.ErrInvShardNum

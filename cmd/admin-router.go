@@ -62,6 +62,7 @@ func registerAdminRouter(router *mux.Router, enableConfigOps, enableIAMOps bool)
 		// DataUsageInfo operations
 		adminRouter.Methods(http.MethodGet).Path(adminVersion + "/datausageinfo").HandlerFunc(httpTraceAll(adminAPI.DataUsageInfoHandler))
 
+		// TODO EC10 - We could support healing as well. But it must delegate to the underlying DFS.
 		if globalIsDistErasure || globalIsErasure {
 			/// Heal operations
 
@@ -169,6 +170,7 @@ func registerAdminRouter(router *mux.Router, enableConfigOps, enableIAMOps bool)
 			adminRouter.Methods(http.MethodPut).Path(adminVersion+"/set-group-status").HandlerFunc(httpTraceHdrs(adminAPI.SetGroupStatus)).Queries("group", "{group:.*}").Queries("status", "{status:.*}")
 		}
 
+		// TODO EC10 - Can we support this?
 		if globalIsDistErasure || globalIsErasure {
 			// GetBucketQuotaConfig
 			adminRouter.Methods(http.MethodGet).Path(adminVersion+"/get-bucket-quota").HandlerFunc(

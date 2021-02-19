@@ -64,6 +64,7 @@ func initHelp() {
 	for k, v := range notify.DefaultNotificationKVS {
 		kvs[k] = v
 	}
+	// TODO EC10 - Do we need to support this?
 	if globalIsErasure {
 		kvs[config.StorageClassSubSys] = storageclass.DefaultKVS
 	}
@@ -181,7 +182,7 @@ func initHelp() {
 		},
 	}
 
-	// TODO EC OL? Maybe an object level redundancy is somehow used for OL features?
+	// TODO EC10: Maybe an object level redundancy is somehow used for OL features?
 	if globalIsErasure {
 		helpSubSys = append(helpSubSys, config.HelpKV{})
 		copy(helpSubSys[2:], helpSubSys[1:])
@@ -251,6 +252,7 @@ func validateConfig(s config.Config, setDriveCounts []int) error {
 		return err
 	}
 
+	// TODO EC10 - Is this relevant?
 	if globalIsErasure {
 		for _, setDriveCount := range setDriveCounts {
 			if _, err := storageclass.LookupConfig(s[config.StorageClassSubSys][config.Default], setDriveCount); err != nil {
@@ -439,6 +441,7 @@ func lookupConfigs(s config.Config, setDriveCounts []int) {
 		getRemoteInstanceTransport = newGatewayHTTPTransport(apiConfig.RemoteTransportDeadline)
 	})
 
+	// TODO EC10 - Is this relevant?
 	if globalIsErasure {
 		for i, setDriveCount := range setDriveCounts {
 			sc, err := storageclass.LookupConfig(s[config.StorageClassSubSys][config.Default], setDriveCount)
