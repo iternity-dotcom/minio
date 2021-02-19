@@ -168,6 +168,7 @@ func serverHandleCmdArgs(ctx *cli.Context) {
 	// To avoid this error situation we check for port availability.
 	logger.FatalIf(checkPortAvailability(globalMinioHost, globalMinioPort), "Unable to start the server")
 
+	// EC10: this needs to be false for EC10!!!
 	globalIsErasure = (setupType == ErasureSetupType)
 	globalIsDistErasure = (setupType == DistErasureSetupType)
 	if globalIsDistErasure {
@@ -183,6 +184,7 @@ func serverHandleEnvVars() {
 var globalHealStateLK sync.RWMutex
 
 func newAllSubsystems() {
+	// TODO EC10 - We could support healing as well, but it must be delegated to the underlying DFS.
 	if globalIsErasure {
 		globalHealStateLK.Lock()
 		// New global heal state
@@ -352,6 +354,7 @@ func initAllSubsystems(ctx context.Context, newObject ObjectLayer) (err error) {
 				logger.Info(fmt.Sprintf("Verifying if %d buckets are consistent across drives...", len(buckets)))
 			}
 		}
+<<<<<<< HEAD
 
 		// Limit to no more than 50 concurrent buckets.
 		g := errgroup.WithNErrs(len(buckets)).WithConcurrency(50)
@@ -366,6 +369,13 @@ func initAllSubsystems(ctx context.Context, newObject ObjectLayer) (err error) {
 		}
 		if err := g.WaitErr(); err != nil {
 			return fmt.Errorf("Unable to list buckets to heal: %w", err)
+=======
+		for _, bucket := range buckets {
+			// TODO EC10 - We could support healing as well, but it must be delegated to the underlying DFS.
+			if _, err = newObject.HealBucket(ctx, bucket.Name, madmin.HealOpts{Recreate: true}); err != nil {
+				return fmt.Errorf("Unable to list buckets to heal: %w", err)
+			}
+>>>>>>> eb403ea65... EC10 PoC
 		}
 	}
 
@@ -503,6 +513,7 @@ func serverMain(ctx *cli.Context) {
 	// Enable background operations for erasure coding
 	if globalIsErasure {
 		initAutoHeal(GlobalContext, newObject)
+		// TODO EC10: Maybe BackgroundTransition is something we could support. But what is this exactly?
 		initBackgroundTransition(GlobalContext, newObject)
 		initBackgroundExpiry(GlobalContext, newObject)
 	}
@@ -552,7 +563,8 @@ func serverMain(ctx *cli.Context) {
 // Initialize object layer with the supplied disks, objectLayer is nil upon any error.
 func newObjectLayer(ctx context.Context, endpointServerPools EndpointServerPools) (newObject ObjectLayer, err error) {
 	// For FS only, directly use the disk.
-	if endpointServerPools.NEndpoints() == 1 {
+	// EC10 Change: Standard FSObjectLayer is disabled!. We use ErasureServerPools for single path endpoints as well.
+	if false && endpointServerPools.NEndpoints() == 1 {
 		// Initialize new FS object layer.
 		return NewFSObjectLayer(endpointServerPools[0].Endpoints[0].Path)
 	}

@@ -81,15 +81,27 @@ var erasureDecodeTests = []struct {
 	{dataBlocks: 4, onDisks: 6, offDisks: 1, blocksize: int64(blockSizeV2), data: int64(2 * blockSizeV2), offset: 12, length: int64(blockSizeV2) + 17, algorithm: BLAKE2b512, shouldFail: false, shouldFailQuorum: false},                             // 35
 	{dataBlocks: 4, onDisks: 6, offDisks: 3, blocksize: int64(blockSizeV2), data: int64(2 * blockSizeV2), offset: 1023, length: int64(blockSizeV2) + 1024, algorithm: DefaultBitrotAlgorithm, shouldFail: false, shouldFailQuorum: true},              // 36
 	{dataBlocks: 8, onDisks: 12, offDisks: 4, blocksize: int64(blockSizeV2), data: int64(2 * blockSizeV2), offset: 11, length: int64(blockSizeV2) + 2*1024, algorithm: DefaultBitrotAlgorithm, shouldFail: false, shouldFailQuorum: false},            // 37
+	{dataBlocks: 1, onDisks: 1, offDisks: 0, blocksize: int64(blockSizeV2), data: oneMiByte, offset: 0, length: oneMiByte, algorithm: DefaultBitrotAlgorithm, shouldFail: false, shouldFailQuorum: false},                                             // 38
 }
 
 func TestErasureDecode(t *testing.T) {
 	for i, test := range erasureDecodeTests {
-		setup, err := newErasureTestSetup(test.dataBlocks, test.onDisks-test.dataBlocks, test.blocksize)
+
+		// we now know the number of blocks this object needs for data and parity.
+		// writeQuorum is dataBlocks + 1
+		dataDrives := test.dataBlocks
+		parityDrives := test.onDisks - test.dataBlocks
+		writeQuorum := dataDrives
+		if dataDrives == parityDrives {
+			writeQuorum++
+		}
+
+		setup, err := newErasureTestSetup(dataDrives, parityDrives, test.blocksize)
 		if err != nil {
 			t.Fatalf("Test %d: failed to create test setup: %v", i, err)
 		}
-		erasure, err := NewErasure(context.Background(), test.dataBlocks, test.onDisks-test.dataBlocks, test.blocksize)
+
+		erasure, err := NewErasure(context.Background(), dataDrives, parityDrives, test.blocksize)
 		if err != nil {
 			setup.Remove()
 			t.Fatalf("Test %d: failed to create ErasureStorage: %v", i, err)
@@ -111,7 +123,7 @@ func TestErasureDecode(t *testing.T) {
 			writers[i] = newBitrotWriter(disk, "testbucket", "object",
 				erasure.ShardFileSize(test.data), writeAlgorithm, erasure.ShardSize(), false)
 		}
-		n, err := erasure.Encode(context.Background(), bytes.NewReader(data[:]), writers, buffer, erasure.dataBlocks+1)
+		n, err := erasure.Encode(context.Background(), bytes.NewReader(data[:]), writers, buffer, writeQuorum)
 		closeBitrotWriters(writers)
 		if err != nil {
 			setup.Remove()
@@ -211,6 +223,12 @@ func TestErasureDecodeRandomOffsetLength(t *testing.T) {
 	dataBlocks := 7
 	parityBlocks := 7
 	blockSize := int64(1 * humanize.MiByte)
+	// we now know the number of blocks this object needs for data and parity.
+	// writeQuorum is dataBlocks + 1
+	writeQuorum := dataBlocks
+	if dataBlocks == parityBlocks {
+		writeQuorum++
+	}
 	setup, err := newErasureTestSetup(dataBlocks, parityBlocks, blockSize)
 	if err != nil {
 		t.Error(err)
@@ -244,7 +262,7 @@ func TestErasureDecodeRandomOffsetLength(t *testing.T) {
 
 	// Create a test file to read from.
 	buffer := make([]byte, blockSize, 2*blockSize)
-	n, err := erasure.Encode(context.Background(), bytes.NewReader(data), writers, buffer, erasure.dataBlocks+1)
+	n, err := erasure.Encode(context.Background(), bytes.NewReader(data), writers, buffer, writeQuorum)
 	closeBitrotWriters(writers)
 	if err != nil {
 		t.Fatal(err)
@@ -290,6 +308,13 @@ func TestErasureDecodeRandomOffsetLength(t *testing.T) {
 // Benchmarks
 
 func benchmarkErasureDecode(data, parity, dataDown, parityDown int, size int64, b *testing.B) {
+	// we now know the number of blocks this object needs for data and parity.
+	// writeQuorum is dataBlocks + 1
+	writeQuorum := data
+	if data == parity {
+		writeQuorum++
+	}
+
 	setup, err := newErasureTestSetup(data, parity, blockSizeV2)
 	if err != nil {
 		b.Fatalf("failed to create test setup: %v", err)
@@ -311,8 +336,8 @@ func benchmarkErasureDecode(data, parity, dataDown, parityDown int, size int64, 
 	}
 
 	content := make([]byte, size)
-	buffer := make([]byte, blockSizeV2, 2*blockSizeV2)
-	_, err = erasure.Encode(context.Background(), bytes.NewReader(content), writers, buffer, erasure.dataBlocks+1)
+	buffer := make([]byte, blockSizeV1, 2*blockSizeV2)
+	_, err = erasure.Encode(context.Background(), bytes.NewReader(content), writers, buffer, writeQuorum)
 	closeBitrotWriters(writers)
 	if err != nil {
 		b.Fatalf("failed to create erasure test file: %v", err)

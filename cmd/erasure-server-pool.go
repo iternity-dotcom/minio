@@ -1364,6 +1364,7 @@ func (z *erasureServerPools) ListBuckets(ctx context.Context) (buckets []BucketI
 }
 
 func (z *erasureServerPools) HealFormat(ctx context.Context, dryRun bool) (madmin.HealResultItem, error) {
+	// TODO EC10 - We could support healing as well, but it must be delegated to the underlying DFS.
 	var err error
 	// Acquire lock on format.json
 	formatLock := z.NewNSLock(minioMetaBucket, formatConfigFile)
@@ -1405,6 +1406,11 @@ func (z *erasureServerPools) HealFormat(ctx context.Context, dryRun bool) (madmi
 }
 
 func (z *erasureServerPools) HealBucket(ctx context.Context, bucket string, opts madmin.HealOpts) (madmin.HealResultItem, error) {
+	// TODO EC10 - We could support healing as well, but it must be delegated to the underlying DFS.
+	if !globalIsErasure {
+		return madmin.HealResultItem{}, nil
+	}
+
 	var r = madmin.HealResultItem{
 		Type:   madmin.HealItemBucket,
 		Bucket: bucket,
@@ -1498,6 +1504,7 @@ func (z *erasureServerPools) Walk(ctx context.Context, bucket, prefix string, re
 type HealObjectFn func(bucket, object, versionID string) error
 
 func (z *erasureServerPools) HealObjects(ctx context.Context, bucket, prefix string, opts madmin.HealOpts, healObject HealObjectFn) error {
+	// TODO EC10 - We could support healing as well, but it must be delegated to the underlying DFS.
 	errCh := make(chan error)
 	ctx, cancel := context.WithCancel(ctx)
 	go func() {
@@ -1592,6 +1599,11 @@ func (z *erasureServerPools) HealObjects(ctx context.Context, bucket, prefix str
 }
 
 func (z *erasureServerPools) HealObject(ctx context.Context, bucket, object, versionID string, opts madmin.HealOpts) (madmin.HealResultItem, error) {
+	// TODO EC10 - We could support healing as well, but it must be delegated to the underlying DFS.
+	if !globalIsErasure {
+		return madmin.HealResultItem{}, nil
+	}
+
 	object = encodeDirObject(object)
 
 	for _, pool := range z.serverPools {

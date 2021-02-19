@@ -59,6 +59,8 @@ var erasureHealTests = []struct {
 	{dataBlocks: 12, disks: 16, offDisks: 2, badDisks: 1, badStaleDisks: 0, blocksize: int64(blockSizeV2), size: oneMiByte, algorithm: DefaultBitrotAlgorithm, shouldFail: false}, // 17
 	{dataBlocks: 6, disks: 8, offDisks: 1, badDisks: 0, badStaleDisks: 0, blocksize: int64(blockSizeV2), size: oneMiByte, algorithm: BLAKE2b512, shouldFail: false},               // 18
 	{dataBlocks: 2, disks: 4, offDisks: 1, badDisks: 0, badStaleDisks: 0, blocksize: int64(blockSizeV2), size: oneMiByte * 64, algorithm: SHA256, shouldFail: false},              // 19
+	{dataBlocks: 1, disks: 1, offDisks: 1, badDisks: 0, badStaleDisks: 0, blocksize: int64(blockSizeV2), size: oneMiByte, algorithm: DefaultBitrotAlgorithm, shouldFail: true},    // 20
+	{dataBlocks: 1, disks: 1, offDisks: 0, badDisks: 1, badStaleDisks: 0, blocksize: int64(blockSizeV2), size: oneMiByte, algorithm: DefaultBitrotAlgorithm, shouldFail: true},    // 21
 }
 
 func TestErasureHeal(t *testing.T) {
@@ -68,13 +70,22 @@ func TestErasureHeal(t *testing.T) {
 			t.Fatalf("Test %d: Bad test case - number of stale disks cannot be less than number of badstale disks", i)
 		}
 
+		// we now know the number of blocks this object needs for data and parity.
+		// writeQuorum is dataBlocks + 1
+		dataDrives := test.dataBlocks
+		parityDrives := test.disks - test.dataBlocks
+		writeQuorum := dataDrives
+		if dataDrives == parityDrives {
+			writeQuorum++
+		}
+
 		// create some test data
-		setup, err := newErasureTestSetup(test.dataBlocks, test.disks-test.dataBlocks, test.blocksize)
+		setup, err := newErasureTestSetup(dataDrives, parityDrives, test.blocksize)
 		if err != nil {
 			t.Fatalf("Test %d: failed to setup Erasure environment: %v", i, err)
 		}
 		disks := setup.disks
-		erasure, err := NewErasure(context.Background(), test.dataBlocks, test.disks-test.dataBlocks, test.blocksize)
+		erasure, err := NewErasure(context.Background(), dataDrives, parityDrives, test.blocksize)
 		if err != nil {
 			setup.Remove()
 			t.Fatalf("Test %d: failed to create ErasureStorage: %v", i, err)
@@ -90,7 +101,7 @@ func TestErasureHeal(t *testing.T) {
 			writers[i] = newBitrotWriter(disk, "testbucket", "testobject",
 				erasure.ShardFileSize(test.size), test.algorithm, erasure.ShardSize(), true)
 		}
-		_, err = erasure.Encode(context.Background(), bytes.NewReader(data), writers, buffer, erasure.dataBlocks+1)
+		_, err = erasure.Encode(context.Background(), bytes.NewReader(data), writers, buffer, writeQuorum)
 		closeBitrotWriters(writers)
 		if err != nil {
 			setup.Remove()

@@ -58,7 +58,7 @@ const (
 	schemePrefix = "EC"
 
 	// Min parity disks
-	minParityDisks = 2
+	minParityDisks = 0
 
 	// Default RRS parity is always minimum parity.
 	defaultRRSParity = minParityDisks

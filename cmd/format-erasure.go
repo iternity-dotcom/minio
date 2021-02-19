@@ -885,6 +885,9 @@ func initFormatErasure(ctx context.Context, storageDisks []StorageAPI, setCount,
 
 func getDefaultParityBlocks(drive int) int {
 	switch drive {
+	// EC10 Change: For 1 disk parity 0
+	case 1:
+		return 0
 	case 3, 2:
 		return 1
 	case 4, 5:

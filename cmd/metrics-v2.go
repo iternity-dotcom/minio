@@ -934,6 +934,7 @@ func getMinioHealingMetrics() MetricsGroup {
 		cachedRead: cachedRead,
 		read: func(_ context.Context) (metrics []Metric) {
 			metrics = make([]Metric, 0)
+			// TODO EC10 - We could support healing as well, but it must be delegated to the underlying DFS.
 			if !globalIsErasure {
 				return
 			}

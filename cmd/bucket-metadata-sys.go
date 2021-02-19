@@ -154,19 +154,18 @@ func (sys *BucketMetadataSys) Update(bucket string, configFile string, configDat
 	case bucketQuotaConfigFile:
 		meta.QuotaConfigJSON = configData
 	case objectLockConfig:
-		// TODO EC OL
-		if !globalIsErasure && !globalIsDistErasure {
+		// EC10 Change - Enable ObjectLock
+		if false && !globalIsErasure && !globalIsDistErasure {
 			return NotImplemented{}
 		}
 		meta.ObjectLockConfigXML = configData
 	case bucketVersioningConfig:
-		// TODO EC OL: Remove this for fs_v1 and try to enable versioning for bucket ("mc version enable minio/test3")
-		/*if !globalIsErasure && !globalIsDistErasure {
+		// EC10 Change - Enable Versioning
+		if false && !globalIsErasure && !globalIsDistErasure {
 			return NotImplemented{}
-		}*/
+		}
 		meta.VersioningConfigXML = configData
 	case bucketReplicationConfig:
-		// TODO EC OL?
 		if !globalIsErasure && !globalIsDistErasure {
 			return NotImplemented{}
 		}

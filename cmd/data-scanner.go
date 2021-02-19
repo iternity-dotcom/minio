@@ -213,6 +213,7 @@ func scanDataFolder(ctx context.Context, basePath string, cache dataUsageCache, 
 		}
 	}
 
+	// TODO EC10 - We could support healing as well, but it must be delegated to the underlying DFS.
 	// Enable healing in XL mode.
 	if globalIsErasure {
 		// Include a clean folder one in n cycles.
@@ -459,7 +460,8 @@ func (f *folderScanner) scanQueuedLevels(ctx context.Context, folders []cachedFo
 				objectName: path.Base(entName),
 				debug:      f.dataUsageScannerDebug,
 				lifeCycle:  activeLifeCycle,
-				heal:       thisHash.mod(f.oldCache.Info.NextCycle, f.healObjectSelect/folder.objectHealProbDiv) && globalIsErasure,
+				// TODO EC10 - We could support healing as well, but it must be delegated to the underlying DFS.
+				heal: thisHash.mod(f.oldCache.Info.NextCycle, f.healObjectSelect/folder.objectHealProbDiv) && globalIsErasure,
 			}
 
 			// if the drive belongs to an erasure set
@@ -721,7 +723,8 @@ func (f *folderScanner) deepScanFolder(ctx context.Context, folder cachedFolder,
 			objectName: path.Base(entName),
 			debug:      f.dataUsageScannerDebug,
 			lifeCycle:  activeLifeCycle,
-			heal:       hashPath(path.Join(prefix, entName)).mod(f.oldCache.Info.NextCycle, f.healObjectSelect/folder.objectHealProbDiv) && globalIsErasure,
+			// TODO EC10 - We could support healing as well, but it must be delegated to the underlying DFS.
+			heal: hashPath(path.Join(prefix, entName)).mod(f.oldCache.Info.NextCycle, f.healObjectSelect/folder.objectHealProbDiv) && globalIsErasure,
 		}
 
 		// if the drive belongs to an erasure set

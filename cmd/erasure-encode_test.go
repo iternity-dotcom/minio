@@ -82,16 +82,28 @@ var erasureEncodeTests = []struct {
 	{dataBlocks: 10, onDisks: 14, offDisks: 0, blocksize: int64(blockSizeV2), data: oneMiByte, offset: 17, algorithm: DefaultBitrotAlgorithm, shouldFail: false, shouldFailQuorum: false},              // 17
 	{dataBlocks: 2, onDisks: 6, offDisks: 2, blocksize: int64(oneMiByte), data: oneMiByte, offset: oneMiByte / 2, algorithm: DefaultBitrotAlgorithm, shouldFail: false, shouldFailQuorum: false},       // 18
 	{dataBlocks: 10, onDisks: 16, offDisks: 8, blocksize: int64(blockSizeV2), data: oneMiByte, offset: 0, algorithm: DefaultBitrotAlgorithm, shouldFail: false, shouldFailQuorum: true},                // 19
+	{dataBlocks: 1, onDisks: 1, offDisks: 0, blocksize: int64(blockSizeV2), data: oneMiByte, offset: 0, algorithm: DefaultBitrotAlgorithm, shouldFail: false, shouldFailQuorum: false},                 // 20
 }
 
 func TestErasureEncode(t *testing.T) {
 	for i, test := range erasureEncodeTests {
-		setup, err := newErasureTestSetup(test.dataBlocks, test.onDisks-test.dataBlocks, test.blocksize)
+
+		// we now know the number of blocks this object needs for data and parity.
+		// writeQuorum is dataBlocks + 1
+		dataDrives := test.dataBlocks
+		parityDrives := test.onDisks - test.dataBlocks
+		writeQuorum := dataDrives
+		if dataDrives == parityDrives {
+			writeQuorum++
+		}
+
+		setup, err := newErasureTestSetup(dataDrives, parityDrives, test.blocksize)
 		if err != nil {
 			t.Fatalf("Test %d: failed to create test setup: %v", i, err)
 		}
+
 		disks := setup.disks
-		erasure, err := NewErasure(context.Background(), test.dataBlocks, test.onDisks-test.dataBlocks, test.blocksize)
+		erasure, err := NewErasure(context.Background(), dataDrives, parityDrives, test.blocksize)
 		if err != nil {
 			setup.Remove()
 			t.Fatalf("Test %d: failed to create ErasureStorage: %v", i, err)
@@ -110,7 +122,7 @@ func TestErasureEncode(t *testing.T) {
 			}
 			writers[i] = newBitrotWriter(disk, "testbucket", "object", erasure.ShardFileSize(int64(len(data[test.offset:]))), test.algorithm, erasure.ShardSize(), false)
 		}
-		n, err := erasure.Encode(context.Background(), bytes.NewReader(data[test.offset:]), writers, buffer, erasure.dataBlocks+1)
+		n, err := erasure.Encode(context.Background(), bytes.NewReader(data[test.offset:]), writers, buffer, writeQuorum)
 		closeBitrotWriters(writers)
 		if err != nil && !test.shouldFail {
 			t.Errorf("Test %d: should pass but failed with: %v", i, err)
@@ -145,7 +157,7 @@ func TestErasureEncode(t *testing.T) {
 			if test.offDisks > 0 {
 				writers[0] = nil
 			}
-			n, err = erasure.Encode(context.Background(), bytes.NewReader(data[test.offset:]), writers, buffer, erasure.dataBlocks+1)
+			n, err = erasure.Encode(context.Background(), bytes.NewReader(data[test.offset:]), writers, buffer, writeQuorum)
 			closeBitrotWriters(writers)
 			if err != nil && !test.shouldFailQuorum {
 				t.Errorf("Test %d: should pass but failed with: %v", i, err)
@@ -166,10 +178,18 @@ func TestErasureEncode(t *testing.T) {
 // Benchmarks
 
 func benchmarkErasureEncode(data, parity, dataDown, parityDown int, size int64, b *testing.B) {
+	// we now know the number of blocks this object needs for data and parity.
+	// writeQuorum is dataBlocks + 1
+	writeQuorum := data
+	if data == parity {
+		writeQuorum++
+	}
+
 	setup, err := newErasureTestSetup(data, parity, blockSizeV2)
 	if err != nil {
 		b.Fatalf("failed to create test setup: %v", err)
 	}
+
 	defer setup.Remove()
 	erasure, err := NewErasure(context.Background(), data, parity, blockSizeV2)
 	if err != nil {
@@ -199,7 +219,7 @@ func benchmarkErasureEncode(data, parity, dataDown, parityDown int, size int64, 
 			writers[i] = newBitrotWriter(disk, "testbucket", "object",
 				erasure.ShardFileSize(size), DefaultBitrotAlgorithm, erasure.ShardSize(), false)
 		}
-		_, err := erasure.Encode(context.Background(), bytes.NewReader(content), writers, buffer, erasure.dataBlocks+1)
+		_, err := erasure.Encode(context.Background(), bytes.NewReader(content), writers, buffer, writeQuorum)
 		closeBitrotWriters(writers)
 		if err != nil {
 			panic(err)
