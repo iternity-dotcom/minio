@@ -18,11 +18,8 @@
 package cmd
 
 import (
-	"context"
 	"encoding/hex"
 	"encoding/json"
-	"io"
-	"io/ioutil"
 	"net/http"
 	"os"
 	pathutil "path"
@@ -30,8 +27,6 @@ import (
 
 	jsoniter "github.com/json-iterator/go"
 	xhttp "github.com/minio/minio/cmd/http"
-	"github.com/minio/minio/cmd/logger"
-	"github.com/minio/minio/pkg/lock"
 	"github.com/minio/minio/pkg/mimedb"
 )
 
@@ -130,7 +125,7 @@ func (m fsMetaV1) IsValid() bool {
 // Verifies if the backend format metadata is same by validating
 // the version string.
 func isFSMetaValid(version string) bool {
-	return (version == fsMetaVersion || version == fsMetaVersion100 || version == fsMetaVersion101)
+	return version == fsMetaVersion || version == fsMetaVersion100 || version == fsMetaVersion101
 }
 
 // Converts metadata to object info.
@@ -200,55 +195,64 @@ func (m fsMetaV1) ToObjectInfo(bucket, object string, fi os.FileInfo) ObjectInfo
 	return objInfo
 }
 
-func (m *fsMetaV1) WriteTo(lk *lock.LockedFile) (n int64, err error) {
-	if err = jsonSave(lk, m); err != nil {
-		return 0, err
+func (m fsMetaV1) ToFileInfo(bucket, object string, fi os.FileInfo) FileInfo {
+	if len(m.Meta) == 0 {
+		m.Meta = make(map[string]string)
 	}
-	fi, err := lk.Stat()
-	if err != nil {
-		return 0, err
+
+	// Guess content-type from the extension if possible.
+	if m.Meta["content-type"] == "" {
+		m.Meta["content-type"] = mimedb.TypeByExtension(pathutil.Ext(object))
 	}
-	return fi.Size(), nil
+
+	if HasSuffix(object, SlashSeparator) {
+		m.Meta["etag"] = emptyETag // For directories etag is d41d8cd98f00b204e9800998ecf8427e
+		m.Meta["content-type"] = "application/octet-stream"
+	}
+
+	fileInfo := FileInfo{
+		Volume:      bucket,
+		Name:        object,
+		IsLatest:    true,
+		Deleted:     false,
+		Parts:       m.Parts,
+		XLV1:        false,
+		Metadata:    m.Meta,
+		NumVersions: 1,
+	}
+
+	if fi != nil {
+		fileInfo.Mode = uint32(fi.Mode())
+		fileInfo.ModTime = fi.ModTime()
+		fileInfo.Size = fi.Size()
+		if fi.IsDir() {
+			// Directory is always 0 bytes in S3 API, treat it as such.
+			fileInfo.Size = 0
+		}
+	}
+
+	return fileInfo
 }
 
-func (m *fsMetaV1) ReadFrom(ctx context.Context, lk *lock.LockedFile) (n int64, err error) {
-	var fsMetaBuf []byte
-	fi, err := lk.Stat()
-	if err != nil {
-		logger.LogIf(ctx, err)
-		return 0, err
-	}
-
-	fsMetaBuf, err = ioutil.ReadAll(io.NewSectionReader(lk, 0, fi.Size()))
-	if err != nil {
-		logger.LogIf(ctx, err)
-		return 0, err
-	}
-
-	if len(fsMetaBuf) == 0 {
-		return 0, io.EOF
-	}
-
-	var json = jsoniter.ConfigCompatibleWithStandardLibrary
-	if err = json.Unmarshal(fsMetaBuf, m); err != nil {
-		return 0, err
-	}
-
-	// Verify if the format is valid, return corrupted format
-	// for unrecognized formats.
-	if !isFSMetaValid(m.Version) {
-		logger.GetReqInfo(ctx).AppendTags("file", lk.Name())
-		logger.LogIf(ctx, errCorruptedFormat)
-		return 0, errCorruptedFormat
-	}
-
-	// Success.
-	return int64(len(fsMetaBuf)), nil
+func (m *fsMetaV1) FromFileInfo(fi FileInfo) {
+	m.Version = fsMetaVersion
+	m.Parts = fi.Parts
+	m.Meta = fi.Metadata
 }
 
 // newFSMetaV1 - initializes new fsMetaV1.
 func newFSMetaV1() (fsMeta fsMetaV1) {
 	fsMeta = fsMetaV1{}
 	fsMeta.Version = fsMetaVersion
+	return fsMeta
+}
+
+// Used to return default etag values when a pre-existing object's meta data is queried.
+func defaultFsJSON(object string) fsMetaV1 {
+	fsMeta := newFSMetaV1()
+	fsMeta.Meta = map[string]string{
+		"etag":         defaultEtag,
+		"content-type": mimedb.TypeByExtension(pathutil.Ext(object)),
+	}
 	return fsMeta
 }

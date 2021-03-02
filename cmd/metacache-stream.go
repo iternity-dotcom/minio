@@ -526,7 +526,13 @@ func (r *metacacheReader) readN(n int, inclDeleted, inclDirs bool, prefix string
 		}
 		res = append(res, meta)
 	}
-	return metaCacheEntriesSorted{o: res}, nil
+
+	if r.nextEOF() {
+		err = io.EOF
+	}
+
+	return metaCacheEntriesSorted{o: res}, err
+
 }
 
 // readAll will return all remaining objects on the dst channel and close it when done.

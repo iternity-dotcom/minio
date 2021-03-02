@@ -55,13 +55,6 @@ var globalObjectAPI ObjectLayer
 //Global cacheObjects, only accessed by newCacheObjectsFn().
 var globalCacheObjectAPI CacheObjectLayer
 
-// Checks if the object is a directory, this logic uses
-// if size == 0 and object ends with SlashSeparator then
-// returns true.
-func isObjectDir(object string, size int64) bool {
-	return HasSuffix(object, SlashSeparator) && size == 0
-}
-
 func newStorageAPIWithoutHealthCheck(endpoint Endpoint) (storage StorageAPI, err error) {
 	if endpoint.IsLocal {
 		storage, err := newXLStorage(endpoint)
@@ -87,7 +80,7 @@ func newStorageAPI(endpoint Endpoint) (storage StorageAPI, err error) {
 	return newStorageRESTClient(endpoint, true), nil
 }
 
-func listObjectsNonSlash(ctx context.Context, bucket, prefix, marker, delimiter string, maxKeys int, tpool *TreeWalkPool, listDir ListDirFunc, isLeaf IsLeafFunc, isLeafDir IsLeafDirFunc, getObjInfo func(context.Context, string, string) (ObjectInfo, error), getObjectInfoDirs ...func(context.Context, string, string) (ObjectInfo, error)) (loi ListObjectsInfo, err error) {
+func listObjectsNonSlash(ctx context.Context, bucket, prefix, marker, delimiter string, maxKeys int, tpool *TreeWalkPool, listDir ListDirFunc, isLeaf IsLeafFunc, isLeafDir IsLeafDirFunc, getObjInfo func(context.Context, string, string) (ObjectInfo, error)) (loi ListObjectsInfo, err error) {
 	endWalkCh := make(chan struct{})
 	defer close(endWalkCh)
 	recursive := true
@@ -170,64 +163,9 @@ func listObjectsNonSlash(ctx context.Context, bucket, prefix, marker, delimiter 
 	return result, nil
 }
 
-// Walk a bucket, optionally prefix recursively, until we have returned
-// all the content to objectInfo channel, it is callers responsibility
-// to allocate a receive channel for ObjectInfo, upon any unhandled
-// error walker returns error. Optionally if context.Done() is received
-// then Walk() stops the walker.
-func fsWalk(ctx context.Context, obj ObjectLayer, bucket, prefix string, listDir ListDirFunc, isLeaf IsLeafFunc, isLeafDir IsLeafDirFunc, results chan<- ObjectInfo, getObjInfo func(context.Context, string, string) (ObjectInfo, error), getObjectInfoDirs ...func(context.Context, string, string) (ObjectInfo, error)) error {
-	if err := checkListObjsArgs(ctx, bucket, prefix, "", obj); err != nil {
-		// Upon error close the channel.
-		close(results)
-		return err
-	}
-
-	walkResultCh := startTreeWalk(ctx, bucket, prefix, "", true, listDir, isLeaf, isLeafDir, ctx.Done())
-
-	go func() {
-		defer close(results)
-
-		for {
-			walkResult, ok := <-walkResultCh
-			if !ok {
-				break
-			}
-
-			var objInfo ObjectInfo
-			var err error
-			if HasSuffix(walkResult.entry, SlashSeparator) {
-				for _, getObjectInfoDir := range getObjectInfoDirs {
-					objInfo, err = getObjectInfoDir(ctx, bucket, walkResult.entry)
-					if err == nil {
-						break
-					}
-					if err == errFileNotFound {
-						err = nil
-						objInfo = ObjectInfo{
-							Bucket: bucket,
-							Name:   walkResult.entry,
-							IsDir:  true,
-						}
-					}
-				}
-			} else {
-				objInfo, err = getObjInfo(ctx, bucket, walkResult.entry)
-			}
-			if err != nil {
-				continue
-			}
-			results <- objInfo
-			if walkResult.end {
-				break
-			}
-		}
-	}()
-	return nil
-}
-
-func listObjects(ctx context.Context, obj ObjectLayer, bucket, prefix, marker, delimiter string, maxKeys int, tpool *TreeWalkPool, listDir ListDirFunc, isLeaf IsLeafFunc, isLeafDir IsLeafDirFunc, getObjInfo func(context.Context, string, string) (ObjectInfo, error), getObjectInfoDirs ...func(context.Context, string, string) (ObjectInfo, error)) (loi ListObjectsInfo, err error) {
+func listObjects(ctx context.Context, obj ObjectLayer, bucket, prefix, marker, delimiter string, maxKeys int, tpool *TreeWalkPool, listDir ListDirFunc, isLeaf IsLeafFunc, isLeafDir IsLeafDirFunc, getObjInfo func(context.Context, string, string) (ObjectInfo, error)) (loi ListObjectsInfo, err error) {
 	if delimiter != SlashSeparator && delimiter != "" {
-		return listObjectsNonSlash(ctx, bucket, prefix, marker, delimiter, maxKeys, tpool, listDir, isLeaf, isLeafDir, getObjInfo, getObjectInfoDirs...)
+		return listObjectsNonSlash(ctx, bucket, prefix, marker, delimiter, maxKeys, tpool, listDir, isLeaf, isLeafDir, getObjInfo)
 	}
 
 	if err := checkListObjsArgs(ctx, bucket, prefix, marker, obj); err != nil {
@@ -291,48 +229,27 @@ func listObjects(ctx context.Context, obj ObjectLayer, bucket, prefix, marker, d
 			eof = true
 		}
 
-		if HasSuffix(walkResult.entry, SlashSeparator) {
-			g.Go(func() error {
-				for _, getObjectInfoDir := range getObjectInfoDirs {
-					objInfo, err := getObjectInfoDir(ctx, bucket, walkResult.entry)
-					if err == nil {
-						objInfoFound[i] = &objInfo
-						// Done...
-						return nil
-					}
-
-					// Add temp, may be overridden,
-					if err == errFileNotFound {
-						objInfoFound[i] = &ObjectInfo{
-							Bucket: bucket,
-							Name:   walkResult.entry,
-							IsDir:  true,
-						}
-						continue
-					}
-					return toObjectErr(err, bucket, prefix)
-				}
-				return nil
-			}, i)
-		} else {
-			g.Go(func() error {
-				objInfo, err := getObjInfo(ctx, bucket, walkResult.entry)
-				if err != nil {
-					// Ignore errFileNotFound as the object might have got
-					// deleted in the interim period of listing and getObjectInfo(),
-					// ignore quorum error as it might be an entry from an outdated disk.
-					if IsErrIgnored(err, []error{
-						errFileNotFound,
-						errErasureReadQuorum,
-					}...) {
-						return nil
-					}
-					return toObjectErr(err, bucket, prefix)
-				}
+		g.Go(func() error {
+			objInfo, err := getObjInfo(ctx, bucket, walkResult.entry)
+			if err == nil {
 				objInfoFound[i] = &objInfo
 				return nil
-			}, i)
-		}
+			}
+			// Ignore errFileNotFound as the object might have got
+			// deleted in the interim period of listing and getObjectInfo(),
+			// ignore quorum error as it might be an entry from an outdated disk.
+			if err == errFileNotFound {
+				if HasSuffix(walkResult.entry, SlashSeparator) {
+					objInfoFound[i] = &ObjectInfo{
+						Bucket: bucket,
+						Name:   walkResult.entry,
+						IsDir:  true,
+					}
+				}
+				return nil
+			}
+			return toObjectErr(err, bucket, prefix)
+		}, i)
 
 		if walkResult.end {
 			eof = true
