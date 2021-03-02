@@ -18,22 +18,24 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/url"
+	"os"
 )
 
 type fsv1Storage struct {
 	endpoint Endpoint
 }
 
-func newfsv1Storage(path string) *fsv1Storage {
+func newfsv1Storage(path string) (*fsv1Storage, error) {
 	u := url.URL{Path: path}
 	return &fsv1Storage{
 		endpoint: Endpoint{
 			URL:     &u,
 			IsLocal: true,
 		},
-	}
+	}, nil
 }
 
 func (s *fsv1Storage) String() string {
@@ -75,12 +77,26 @@ func (s *fsv1Storage) DiskInfo(ctx context.Context) (info DiskInfo, err error) {
 	return DiskInfo{}, NotImplemented{}
 }
 
+func (s *fsv1Storage) NSScanner(ctx context.Context, cache dataUsageCache) (dataUsageCache, error) {
+	return dataUsageCache{}, NotImplemented{}
+}
+
 func (s *fsv1Storage) MakeVolBulk(ctx context.Context, volumes ...string) (err error) {
-	return NotImplemented{}
+	for _, volume := range volumes {
+		if err := s.MakeVol(ctx, volume); err != nil {
+			if errors.Is(err, errDiskAccessDenied) {
+				return errDiskAccessDenied
+			}
+		}
+	}
+	return nil
 }
 
 func (s *fsv1Storage) MakeVol(ctx context.Context, volume string) (err error) {
-	return NotImplemented{}
+	if err := os.MkdirAll(volume, 0777); err != nil {
+		return errDiskAccessDenied
+	}
+	return nil
 }
 
 func (s *fsv1Storage) ListVols(ctx context.Context) (vols []VolInfo, err error) {
