@@ -27,20 +27,32 @@ import (
 // TestFSFormatFS - tests initFormatFS, formatMetaGetFormatBackendFS, formatFSGetVersion.
 func TestFSFormatFS(t *testing.T) {
 	// Prepare for testing
-	disk := filepath.Join(globalTestTmpDir, "minio-"+nextSuffix())
-	defer os.RemoveAll(disk)
+	fsPath := filepath.Join(globalTestTmpDir, "minio-"+nextSuffix())
+	defer os.RemoveAll(fsPath)
 
-	fsFormatPath := pathJoin(disk, minioMetaBucket, formatConfigFile)
+	fsFormatPath := pathJoin(fsPath, minioMetaBucket, formatConfigFile)
 
 	// Assign a new UUID.
 	uuid := mustGetUUID()
 
+	disk, _ := newfsv1Storage(fsPath)
+
+	fs := &FSObjects{
+		disk:          disk,
+		fsPath:        fsPath,
+		metaJSONFile:  fsMetaJSONFile,
+		fsUUID:        uuid,
+		nsMutex:       newNSLock(false),
+		listPool:      NewTreeWalkPool(globalLookupTimeout),
+		appendFileMap: make(map[string]*fsAppendFile),
+	}
+
 	// Initialize meta volume, if volume already exists ignores it.
-	if err := initMetaVolumeFS(disk, uuid); err != nil {
+	if err := fs.initMetaVolumeFS(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 
-	rlk, err := initFormatFS(context.Background(), disk)
+	rlk, err := initFormatFS(context.Background(), fsPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -83,7 +95,7 @@ func TestFSFormatFS(t *testing.T) {
 	if _, err = formatFSGetVersion(rlk); err == nil {
 		t.Fatal("expected to fail")
 	}
-	if _, err = initFormatFS(context.Background(), disk); err == nil {
+	if _, err = initFormatFS(context.Background(), fsPath); err == nil {
 		t.Fatal("expected to fail")
 	}
 
@@ -98,7 +110,7 @@ func TestFSFormatFS(t *testing.T) {
 	if _, err = formatMetaGetFormatBackendFS(f); err == nil {
 		t.Fatal("expected to fail")
 	}
-	if _, err = initFormatFS(context.Background(), disk); err == nil {
+	if _, err = initFormatFS(context.Background(), fsPath); err == nil {
 		t.Fatal("expected to fail")
 	}
 }

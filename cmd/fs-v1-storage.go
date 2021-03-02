@@ -18,22 +18,26 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/url"
+	"os"
 )
 
 type fsv1Storage struct {
 	endpoint Endpoint
+	// Indexes, will be -1 until assigned a set.
+	poolIndex, setIndex, diskIndex int
 }
 
-func newfsv1Storage(path string) *fsv1Storage {
+func newfsv1Storage(path string) (*fsv1Storage, error) {
 	u := url.URL{Path: path}
 	return &fsv1Storage{
 		endpoint: Endpoint{
 			URL:     &u,
 			IsLocal: true,
 		},
-	}
+	}, nil
 }
 
 func (s *fsv1Storage) String() string {
@@ -56,8 +60,8 @@ func (s *fsv1Storage) Endpoint() Endpoint {
 	return s.endpoint
 }
 
-func (s *fsv1Storage) Healing() bool {
-	return false
+func (s *fsv1Storage) Healing() *healingTracker {
+	return nil
 }
 
 func (s *fsv1Storage) CrawlAndGetDataUsage(ctx context.Context, cache dataUsageCache) (dataUsageCache, error) {
@@ -75,12 +79,26 @@ func (s *fsv1Storage) DiskInfo(ctx context.Context) (info DiskInfo, err error) {
 	return DiskInfo{}, NotImplemented{}
 }
 
+func (s *fsv1Storage) NSScanner(ctx context.Context, cache dataUsageCache) (dataUsageCache, error) {
+	return dataUsageCache{}, NotImplemented{}
+}
+
 func (s *fsv1Storage) MakeVolBulk(ctx context.Context, volumes ...string) (err error) {
-	return NotImplemented{}
+	for _, volume := range volumes {
+		if err := s.MakeVol(ctx, volume); err != nil {
+			if errors.Is(err, errDiskAccessDenied) {
+				return errDiskAccessDenied
+			}
+		}
+	}
+	return nil
 }
 
 func (s *fsv1Storage) MakeVol(ctx context.Context, volume string) (err error) {
-	return NotImplemented{}
+	if err := os.MkdirAll(volume, 0777); err != nil {
+		return errDiskAccessDenied
+	}
+	return nil
 }
 
 func (s *fsv1Storage) ListVols(ctx context.Context) (vols []VolInfo, err error) {
@@ -173,4 +191,14 @@ func (s *fsv1Storage) Close() error {
 
 func (s *fsv1Storage) WalkDir(ctx context.Context, opts WalkDirOptions, wr io.Writer) error {
 	return NotImplemented{}
+}
+
+func (s *fsv1Storage) GetDiskLoc() (poolIdx, setIdx, diskIdx int) {
+	return s.poolIndex, s.setIndex, s.diskIndex
+}
+
+func (s *fsv1Storage) SetDiskLoc(poolIdx, setIdx, diskIdx int) {
+	s.poolIndex = poolIdx
+	s.setIndex = setIdx
+	s.diskIndex = diskIdx
 }

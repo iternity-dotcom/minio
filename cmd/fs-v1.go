@@ -55,6 +55,9 @@ var defaultEtag = "00000000000000000000000000000000-1"
 type FSObjects struct {
 	GatewayUnsupported
 
+	// The storage backend behind this object layer
+	disk StorageAPI
+
 	// The count of concurrent calls on FSObjects API
 	activeIOCount int64
 
@@ -91,35 +94,20 @@ type fsAppendFile struct {
 	filePath string     // Absolute path of the file in the temp location.
 }
 
-// Initializes meta volume on all the fs path.
-func initMetaVolumeFS(fsPath, fsUUID string) error {
-	// This happens for the first time, but keep this here since this
-	// is the only place where it can be made less expensive
-	// optimizing all other calls. Create minio meta volume,
-	// if it doesn't exist yet.
-	metaBucketPath := pathJoin(fsPath, minioMetaBucket)
-
-	if err := os.MkdirAll(metaBucketPath, 0777); err != nil {
-		return err
-	}
-
-	metaTmpPath := pathJoin(fsPath, minioMetaTmpBucket, fsUUID)
-	if err := os.MkdirAll(metaTmpPath, 0777); err != nil {
-		return err
-	}
-
-	if err := os.MkdirAll(pathJoin(fsPath, dataUsageBucket), 0777); err != nil {
-		return err
-	}
-
-	metaMultipartPath := pathJoin(fsPath, minioMetaMultipartBucket)
-	return os.MkdirAll(metaMultipartPath, 0777)
-
-}
-
 // NewFSObjectLayer - initialize new fs object layer.
 func NewFSObjectLayer(fsPath string) (ObjectLayer, error) {
+	// disk, err := newLocalXLStorage(fsPath)
+	disk, err := newfsv1Storage(fsPath)
+	if err != nil {
+		return nil, err
+	}
+	return NewFSObjectLayerWithDisk(disk)
+}
+
+// NewFSObjectLayerWithDisk - initialize new fs object layer based on a given StorageAPI implementation.
+func NewFSObjectLayerWithDisk(disk StorageAPI) (ObjectLayer, error) {
 	ctx := GlobalContext
+	fsPath := disk.String()
 	if fsPath == "" {
 		return nil, errInvalidArgument
 	}
@@ -145,19 +133,9 @@ func NewFSObjectLayer(fsPath string) (ObjectLayer, error) {
 	// gets its own UUID for temporary file transaction.
 	fsUUID := mustGetUUID()
 
-	// Initialize meta volume, if volume already exists ignores it.
-	if err = initMetaVolumeFS(fsPath, fsUUID); err != nil {
-		return nil, err
-	}
-
-	// Initialize `format.json`, this function also returns.
-	rlk, err := initFormatFS(ctx, fsPath)
-	if err != nil {
-		return nil, err
-	}
-
 	// Initialize fs objects.
 	fs := &FSObjects{
+		disk:         disk,
 		fsPath:       fsPath,
 		metaJSONFile: fsMetaJSONFile,
 		fsUUID:       fsUUID,
@@ -168,6 +146,17 @@ func NewFSObjectLayer(fsPath string) (ObjectLayer, error) {
 		listPool:      NewTreeWalkPool(globalLookupTimeout),
 		appendFileMap: make(map[string]*fsAppendFile),
 		diskMount:     mountinfo.IsLikelyMountPoint(fsPath),
+	}
+
+	// Initialize meta volume, if volume already exists ignores it.
+	if err = fs.initMetaVolumeFS(ctx); err != nil {
+		return nil, err
+	}
+
+	// Initialize `format.json`, this function also returns.
+	rlk, err := initFormatFS(ctx, fsPath)
+	if err != nil {
+		return nil, err
 	}
 
 	// Once the filesystem has initialized hold the read lock for
@@ -181,6 +170,20 @@ func NewFSObjectLayer(fsPath string) (ObjectLayer, error) {
 
 	// Return successfully initialized object layer.
 	return fs, nil
+}
+
+// Initializes meta volume on all the fs path.
+func (fs *FSObjects) initMetaVolumeFS(ctx context.Context) error {
+	// This happens for the first time, but keep this here since this
+	// is the only place where it can be made less expensive
+	// optimizing all other calls. Create minio meta volume,
+	// if it doesn't exist yet.
+	metaBucketPath := pathJoin(fs.fsPath, minioMetaBucket)
+	metaTmpPath := pathJoin(fs.fsPath, minioMetaTmpBucket, fs.fsUUID)
+	metaMultipartPath := pathJoin(fs.fsPath, minioMetaMultipartBucket)
+	dataUsagePath := pathJoin(fs.fsPath, dataUsageBucket)
+
+	return fs.disk.MakeVolBulk(ctx, metaBucketPath, metaTmpPath, dataUsagePath, metaMultipartPath)
 }
 
 // NewNSLock - initialize a new namespace RWLocker instance.

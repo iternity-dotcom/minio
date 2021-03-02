@@ -183,6 +183,10 @@ func calculateStreamContentLength(dataLen, chunkSize int64) int64 {
 }
 
 func prepareFS() (ObjectLayer, string, error) {
+
+	// the globalBucketMetadataSys must be initialized. Else you get nil pointer errros
+	globalBucketMetadataSys = NewBucketMetadataSys()
+
 	nDisks := 1
 	fsDirs, err := getRandomDisks(nDisks)
 	if err != nil {
@@ -218,6 +222,7 @@ func prepareErasure16(ctx context.Context) (ObjectLayer, []string, error) {
 
 // Initialize FS objects.
 func initFSObjects(disk string, t *testing.T) (obj ObjectLayer) {
+	globalBucketMetadataSys = NewBucketMetadataSys()
 	var err error
 	obj, err = NewFSObjectLayer(disk)
 	if err != nil {
