@@ -20,18 +20,23 @@ package cmd
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"github.com/minio/minio-go/v7/pkg/set"
+	"github.com/minio/minio/internal/bucket/replication"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"os"
 	"os/user"
 	"path"
 	"sort"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	// "github.com/minio/minio-go/v7/pkg/set"
+	// "github.com/minio/minio/pkg/bucket/replication"
+	"github.com/minio/pkg/env"
 
 	jsoniter "github.com/json-iterator/go"
 	"github.com/minio/madmin-go"
@@ -40,10 +45,8 @@ import (
 	"github.com/minio/minio/internal/color"
 	"github.com/minio/minio/internal/config"
 	xhttp "github.com/minio/minio/internal/http"
-	xioutil "github.com/minio/minio/internal/ioutil"
 	"github.com/minio/minio/internal/lock"
 	"github.com/minio/minio/internal/logger"
-	"github.com/minio/minio/internal/mountinfo"
 	"github.com/minio/pkg/bucket/policy"
 	"github.com/minio/pkg/mimedb"
 )
@@ -55,119 +58,76 @@ var defaultEtag = "00000000000000000000000000000000-1"
 type FSObjects struct {
 	GatewayUnsupported
 
+	// The storage backend behind this object layer
+	disk fsStorageAPI
+
 	// The count of concurrent calls on FSObjects API
 	activeIOCount int64
 
-	// Path to be exported over S3 API.
-	fsPath string
-	// meta json filename, varies by fs / cache backend.
-	metaJSONFile string
-	// Unique value to be used for all
-	// temporary transactions.
-	fsUUID string
-
 	// This value shouldn't be touched, once initialized.
-	fsFormatRlk *lock.RLockedFile // Is a read lock on `format.json`.
-
-	// FS rw pool.
-	rwPool *fsIOPool
-
-	// ListObjects pool management.
-	listPool *TreeWalkPool
-
-	diskMount bool
-
+	fsFormatRlk     *lock.RLockedFile // Is a read lock on `format.json`.
 	appendFileMap   map[string]*fsAppendFile
 	appendFileMapMu sync.Mutex
 
 	// To manage the appendRoutine go-routines
 	nsMutex *nsLockMap
+
+	deletedCleanupSleeper *dynamicSleeper
 }
 
 // Represents the background append file.
 type fsAppendFile struct {
 	sync.Mutex
-	parts    []PartInfo // List of parts appended.
-	filePath string     // Absolute path of the file in the temp location.
+	parts    []int  // List of parts appended.
+	filePath string // Absolute path of the file in the temp location.
 }
 
-// Initializes meta volume on all the fs path.
-func initMetaVolumeFS(fsPath, fsUUID string) error {
-	// This happens for the first time, but keep this here since this
-	// is the only place where it can be made less expensive
-	// optimizing all other calls. Create minio meta volume,
-	// if it doesn't exist yet.
-	metaBucketPath := pathJoin(fsPath, minioMetaBucket)
-
-	if err := os.MkdirAll(metaBucketPath, 0777); err != nil {
-		return err
-	}
-
-	metaTmpPath := pathJoin(fsPath, minioMetaTmpBucket, fsUUID)
-	if err := os.MkdirAll(metaTmpPath, 0777); err != nil {
-		return err
-	}
-
-	if err := os.MkdirAll(pathJoin(fsPath, dataUsageBucket), 0777); err != nil {
-		return err
-	}
-
-	metaMultipartPath := pathJoin(fsPath, minioMetaMultipartBucket)
-	return os.MkdirAll(metaMultipartPath, 0777)
-
+type fsStorageAPI interface {
+	StorageAPI
+	MetaTmpBucket() string
+	ContextWithMetaLock(ctx context.Context, lockType LockType, volume string, path ...string) (context.Context, func(err ...error), error)
 }
 
 // NewFSObjectLayer - initialize new fs object layer.
 func NewFSObjectLayer(fsPath string) (ObjectLayer, error) {
+	return newFSObjectLayer(fsPath, newLocalFSV1Storage)
+}
+func newFSObjectLayer(fsPath string, createStorageAPI func(string) (fsStorageAPI, error)) (ObjectLayer, error) {
 	ctx := GlobalContext
-	if fsPath == "" {
-		return nil, errInvalidArgument
-	}
 
-	var err error
-	if fsPath, err = getValidPath(fsPath); err != nil {
+	disk, err := createStorageAPI(fsPath)
+
+	if err != nil {
 		if err == errMinDiskSize {
 			return nil, config.ErrUnableToWriteInBackend(err).Hint(err.Error())
 		}
 
-		// Show a descriptive error with a hint about how to fix it.
-		var username string
-		if u, err := user.Current(); err == nil {
-			username = u.Username
-		} else {
-			username = "<your-username>"
+		if os.IsPermission(err) {
+			// Show a descriptive error with a hint about how to fix it.
+			var username string
+			if u, err := user.Current(); err == nil {
+				username = u.Username
+			} else {
+				username = "<your-username>"
+			}
+			hint := fmt.Sprintf("Use 'sudo chown -R %s %s && sudo chmod u+rxw %s' to provide sufficient permissions.", username, fsPath, fsPath)
+			return nil, config.ErrUnableToWriteInBackend(err).Hint(hint)
 		}
-		hint := fmt.Sprintf("Use 'sudo chown -R %s %s && sudo chmod u+rxw %s' to provide sufficient permissions.", username, fsPath, fsPath)
-		return nil, config.ErrUnableToWriteInBackend(err).Hint(hint)
-	}
-
-	// Assign a new UUID for FS minio mode. Each server instance
-	// gets its own UUID for temporary file transaction.
-	fsUUID := mustGetUUID()
-
-	// Initialize meta volume, if volume already exists ignores it.
-	if err = initMetaVolumeFS(fsPath, fsUUID); err != nil {
-		return nil, err
-	}
-
-	// Initialize `format.json`, this function also returns.
-	rlk, err := initFormatFS(ctx, fsPath)
-	if err != nil {
 		return nil, err
 	}
 
 	// Initialize fs objects.
 	fs := &FSObjects{
-		fsPath:       fsPath,
-		metaJSONFile: fsMetaJSONFile,
-		fsUUID:       fsUUID,
-		rwPool: &fsIOPool{
-			readersMap: make(map[string]*lock.RLockedFile),
-		},
-		nsMutex:       newNSLock(false),
-		listPool:      NewTreeWalkPool(globalLookupTimeout),
-		appendFileMap: make(map[string]*fsAppendFile),
-		diskMount:     mountinfo.IsLikelyMountPoint(fsPath),
+		disk:                  disk,
+		nsMutex:               newNSLock(false),
+		appendFileMap:         make(map[string]*fsAppendFile),
+		deletedCleanupSleeper: newDynamicSleeper(10, 2*time.Second),
+	}
+
+	// Initialize `format.json`, this function also returns.
+	rlk, err := initFormatFS(ctx, disk)
+	if err != nil {
+		return nil, err
 	}
 
 	// Once the filesystem has initialized hold the read lock for
@@ -177,10 +137,44 @@ func NewFSObjectLayer(fsPath string) (ObjectLayer, error) {
 	fs.fsFormatRlk = rlk
 
 	go fs.cleanupStaleUploads(ctx, GlobalStaleUploadsCleanupInterval, GlobalStaleUploadsExpiry)
+
+	// cleanup ".trash/" folder every 5m minutes with sufficient sleep cycles, between each
+	// deletes a dynamic sleeper is used with a factor of 10 ratio with max delay between
+	// deletes to be 2 seconds.
+	deletedObjectsCleanupInterval, err := time.ParseDuration(env.Get(envMinioDeleteCleanupInterval, "5m"))
+	if err != nil {
+		return nil, err
+	}
+	// start cleanup of deleted objects.
+	go fs.cleanupDeletedObjects(ctx, deletedObjectsCleanupInterval)
 	go intDataUpdateTracker.start(ctx, fsPath)
 
 	// Return successfully initialized object layer.
 	return fs, nil
+}
+
+func (fs *FSObjects) cleanupDeletedObjects(ctx context.Context, cleanupInterval time.Duration) {
+	timer := time.NewTimer(cleanupInterval)
+	defer timer.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+			// Reset for the next interval
+			timer.Reset(cleanupInterval)
+
+			trashDirs, err := fs.disk.ListDir(ctx, minioMetaTmpDeletedBucket, "", -1)
+			if err == nil {
+				for _, trashDir := range trashDirs {
+					wait := fs.deletedCleanupSleeper.Timer(ctx)
+					fs.disk.DeleteVol(ctx, pathJoin(minioMetaTmpDeletedBucket, trashDir), true)
+					wait()
+				}
+			}
+		}
+	}
 }
 
 // NewNSLock - initialize a new namespace RWLocker instance.
@@ -197,9 +191,10 @@ func (fs *FSObjects) SetDriveCounts() []int {
 // Shutdown - should be called when process shuts down.
 func (fs *FSObjects) Shutdown(ctx context.Context) error {
 	fs.fsFormatRlk.Close()
-
 	// Cleanup and delete tmp uuid.
-	return fsRemoveAll(ctx, pathJoin(fs.fsPath, minioMetaTmpBucket, fs.fsUUID))
+	fs.disk.DeleteVol(ctx, fs.disk.MetaTmpBucket(), true)
+
+	return fs.disk.Close()
 }
 
 // BackendInfo - returns backend information
@@ -219,7 +214,7 @@ func (fs *FSObjects) StorageInfo(ctx context.Context) (StorageInfo, []error) {
 		atomic.AddInt64(&fs.activeIOCount, -1)
 	}()
 
-	di, err := getDiskInfo(fs.fsPath)
+	di, err := fs.disk.DiskInfo(ctx)
 	if err != nil {
 		return StorageInfo{}, []error{err}
 	}
@@ -229,7 +224,7 @@ func (fs *FSObjects) StorageInfo(ctx context.Context) (StorageInfo, []error) {
 				TotalSpace:     di.Total,
 				UsedSpace:      di.Used,
 				AvailableSpace: di.Free,
-				DrivePath:      fs.fsPath,
+				DrivePath:      fs.disk.String(),
 			},
 		},
 	}
@@ -288,8 +283,7 @@ func (fs *FSObjects) NSScanner(ctx context.Context, bf *bloomFilter, updates cha
 				updates <- cloned.dui(dataUsageRoot, buckets)
 			}
 		}()
-		bCache.Info.updates = upds
-		cache, err := fs.scanBucket(ctx, b.Name, bCache)
+		cache, err := fs.disk.NSScanner(ctx, bCache, upds)
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -329,89 +323,9 @@ func (fs *FSObjects) NSScanner(ctx context.Context, bf *bloomFilter, updates cha
 	return nil
 }
 
-// scanBucket scans a single bucket in FS mode.
-// The updated cache for the bucket is returned.
-// A partially updated bucket may be returned.
-func (fs *FSObjects) scanBucket(ctx context.Context, bucket string, cache dataUsageCache) (dataUsageCache, error) {
-	defer close(cache.Info.updates)
-
-	// Get bucket policy
-	// Check if the current bucket has a configured lifecycle policy
-	lc, err := globalLifecycleSys.Get(bucket)
-	if err == nil && lc.HasActiveRules("", true) {
-		if intDataUpdateTracker.debug {
-			logger.Info(color.Green("scanBucket:") + " lifecycle: Active rules found")
-		}
-		cache.Info.lifeCycle = lc
-	}
-
-	// Load bucket info.
-	cache, err = scanDataFolder(ctx, fs.fsPath, cache, func(item scannerItem) (sizeSummary, error) {
-		bucket, object := item.bucket, item.objectPath()
-		fsMetaBytes, err := xioutil.ReadFile(pathJoin(fs.fsPath, minioMetaBucket, bucketMetaPrefix, bucket, object, fs.metaJSONFile))
-		if err != nil && !osIsNotExist(err) {
-			if intDataUpdateTracker.debug {
-				logger.Info(color.Green("scanBucket:")+" object return unexpected error: %v/%v: %w", item.bucket, item.objectPath(), err)
-			}
-			return sizeSummary{}, errSkipFile
-		}
-
-		fsMeta := newFSMetaV1()
-		metaOk := false
-		if len(fsMetaBytes) > 0 {
-			var json = jsoniter.ConfigCompatibleWithStandardLibrary
-			if err = json.Unmarshal(fsMetaBytes, &fsMeta); err == nil {
-				metaOk = true
-			}
-		}
-		if !metaOk {
-			fsMeta = fs.defaultFsJSON(object)
-		}
-
-		// Stat the file.
-		fi, fiErr := os.Stat(item.Path)
-		if fiErr != nil {
-			if intDataUpdateTracker.debug {
-				logger.Info(color.Green("scanBucket:")+" object path missing: %v: %w", item.Path, fiErr)
-			}
-			return sizeSummary{}, errSkipFile
-		}
-
-		oi := fsMeta.ToObjectInfo(bucket, object, fi)
-		sz := item.applyActions(ctx, fs, actionMeta{oi: oi}, &sizeSummary{})
-		if sz >= 0 {
-			return sizeSummary{totalSize: sz, versions: 1}, nil
-		}
-
-		return sizeSummary{totalSize: fi.Size(), versions: 1}, nil
-	})
-
-	return cache, err
-}
-
-/// Bucket operations
-
-// getBucketDir - will convert incoming bucket names to
-// corresponding valid bucket names on the backend in a platform
-// compatible way for all operating systems.
-func (fs *FSObjects) getBucketDir(ctx context.Context, bucket string) (string, error) {
-	if bucket == "" || bucket == "." || bucket == ".." {
-		return "", errVolumeNotFound
-	}
-	bucketDir := pathJoin(fs.fsPath, bucket)
-	return bucketDir, nil
-}
-
-func (fs *FSObjects) statBucketDir(ctx context.Context, bucket string) (os.FileInfo, error) {
-	bucketDir, err := fs.getBucketDir(ctx, bucket)
-	if err != nil {
-		return nil, err
-	}
-	st, err := fsStatVolume(ctx, bucketDir)
-	if err != nil {
-		return nil, err
-	}
-	return st, nil
+// GetDisksID will return disk.
+func (fs *FSObjects) GetDisksID(_ ...string) []StorageAPI {
+	return []StorageAPI{fs.disk}
 }
 
 // MakeBucketWithLocation - create a new bucket, returns if it already exists.
@@ -432,12 +346,8 @@ func (fs *FSObjects) MakeBucketWithLocation(ctx context.Context, bucket string, 
 		atomic.AddInt64(&fs.activeIOCount, -1)
 	}()
 
-	bucketDir, err := fs.getBucketDir(ctx, bucket)
+	err := fs.disk.MakeVol(ctx, bucket)
 	if err != nil {
-		return toObjectErr(err, bucket)
-	}
-
-	if err = fsMkdir(ctx, bucketDir); err != nil {
 		return toObjectErr(err, bucket)
 	}
 
@@ -497,12 +407,12 @@ func (fs *FSObjects) GetBucketInfo(ctx context.Context, bucket string) (bi Bucke
 		atomic.AddInt64(&fs.activeIOCount, -1)
 	}()
 
-	st, err := fs.statBucketDir(ctx, bucket)
+	st, err := fs.disk.StatVol(ctx, bucket)
 	if err != nil {
 		return bi, toObjectErr(err, bucket)
 	}
 
-	createdTime := st.ModTime()
+	createdTime := st.Created
 	meta, err := globalBucketMetadataSys.Get(bucket)
 	if err == nil {
 		createdTime = meta.Created
@@ -516,54 +426,37 @@ func (fs *FSObjects) GetBucketInfo(ctx context.Context, bucket string) (bi Bucke
 
 // ListBuckets - list all s3 compatible buckets (directories) at fsPath.
 func (fs *FSObjects) ListBuckets(ctx context.Context) ([]BucketInfo, error) {
-	if err := checkPathLength(fs.fsPath); err != nil {
-		logger.LogIf(ctx, err)
-		return nil, err
-	}
-
 	atomic.AddInt64(&fs.activeIOCount, 1)
 	defer func() {
 		atomic.AddInt64(&fs.activeIOCount, -1)
 	}()
 
-	entries, err := readDir(fs.fsPath)
+	volsInfo, err := fs.disk.ListVols(ctx)
 	if err != nil {
-		logger.LogIf(ctx, errDiskNotFound)
-		return nil, toObjectErr(errDiskNotFound)
+		return nil, err
 	}
-
-	bucketInfos := make([]BucketInfo, 0, len(entries))
-	for _, entry := range entries {
-		// Ignore all reserved bucket names and invalid bucket names.
-		if isReservedOrInvalidBucket(entry, false) {
+	bucketInfos := make([]BucketInfo, 0, len(volsInfo))
+	for _, v := range volsInfo {
+		// StorageAPI can send volume names which are
+		// incompatible with buckets - these are
+		// skipped, like the meta-bucket.
+		if isReservedOrInvalidBucket(v.Name, false) {
 			continue
 		}
-		var fi os.FileInfo
-		fi, err = fsStatVolume(ctx, pathJoin(fs.fsPath, entry))
-		// There seems like no practical reason to check for errors
-		// at this point, if there are indeed errors we can simply
-		// just ignore such buckets and list only those which
-		// return proper Stat information instead.
-		if err != nil {
-			// Ignore any errors returned here.
-			continue
-		}
-		var created = fi.ModTime()
-		meta, err := globalBucketMetadataSys.Get(fi.Name())
-		if err == nil {
-			created = meta.Created
-		}
-
-		bucketInfos = append(bucketInfos, BucketInfo{
-			Name:    fi.Name(),
-			Created: created,
-		})
+		bucketInfos = append(bucketInfos, BucketInfo(v))
 	}
 
 	// Sort bucket infos by bucket name.
 	sort.Slice(bucketInfos, func(i, j int) bool {
 		return bucketInfos[i].Name < bucketInfos[j].Name
 	})
+
+	for idx, bInfo := range bucketInfos {
+		meta, err := globalBucketMetadataSys.Get(bInfo.Name)
+		if err == nil {
+			bucketInfos[idx].Created = meta.Created
+		}
+	}
 
 	// Succes.
 	return bucketInfos, nil
@@ -579,30 +472,14 @@ func (fs *FSObjects) DeleteBucket(ctx context.Context, bucket string, forceDelet
 		atomic.AddInt64(&fs.activeIOCount, -1)
 	}()
 
-	bucketDir, err := fs.getBucketDir(ctx, bucket)
-	if err != nil {
+	// Attempt to delete regular bucket.
+	if err := fs.disk.DeleteVol(ctx, bucket, forceDelete); err != nil {
 		return toObjectErr(err, bucket)
 	}
 
-	if !forceDelete {
-		// Attempt to delete regular bucket.
-		if err = fsRemoveDir(ctx, bucketDir); err != nil {
-			return toObjectErr(err, bucket)
-		}
-	} else {
-		tmpBucketPath := pathJoin(fs.fsPath, minioMetaTmpBucket, bucket+"."+mustGetUUID())
-		if err = fsSimpleRenameFile(ctx, bucketDir, tmpBucketPath); err != nil {
-			return toObjectErr(err, bucket)
-		}
-
-		go func() {
-			fsRemoveAll(ctx, tmpBucketPath) // ignore returned error if any.
-		}()
-	}
-
 	// Cleanup all the bucket metadata.
-	minioMetadataBucketDir := pathJoin(fs.fsPath, minioMetaBucket, bucketMetaPrefix, bucket)
-	if err = fsRemoveAll(ctx, minioMetadataBucketDir); err != nil {
+	minioMetadataBucket := pathJoin(minioMetaBucket, bucketMetaPrefix, bucket)
+	if err := fs.disk.DeleteVol(ctx, minioMetadataBucket, true); err != nil {
 		return toObjectErr(err, bucket)
 	}
 
@@ -617,9 +494,9 @@ func (fs *FSObjects) DeleteBucket(ctx context.Context, bucket string, forceDelet
 // CopyObject - copy object source object to destination object.
 // if source object and destination object are same we only
 // update metadata.
-func (fs *FSObjects) CopyObject(ctx context.Context, srcBucket, srcObject, dstBucket, dstObject string, srcInfo ObjectInfo, srcOpts, dstOpts ObjectOptions) (oi ObjectInfo, err error) {
+func (fs *FSObjects) CopyObject(ctx context.Context, srcBucket, srcObject, dstBucket, dstObject string, srcInfo ObjectInfo, srcOpts, dstOpts ObjectOptions) (ObjectInfo, error) {
 	if srcOpts.VersionID != "" && srcOpts.VersionID != nullVersionID {
-		return oi, VersionNotFound{
+		return ObjectInfo{}, VersionNotFound{
 			Bucket:    srcBucket,
 			Object:    srcObject,
 			VersionID: srcOpts.VersionID,
@@ -627,78 +504,116 @@ func (fs *FSObjects) CopyObject(ctx context.Context, srcBucket, srcObject, dstBu
 	}
 
 	cpSrcDstSame := isStringEqual(pathJoin(srcBucket, srcObject), pathJoin(dstBucket, dstObject))
-	defer NSUpdated(dstBucket, dstObject)
-
-	if !cpSrcDstSame {
-		objectDWLock := fs.NewNSLock(dstBucket, dstObject)
-		lkctx, err := objectDWLock.GetLock(ctx, globalOperationTimeout)
-		if err != nil {
-			return oi, err
-		}
-		ctx = lkctx.Context()
-		defer objectDWLock.Unlock(lkctx.Cancel)
-	}
 
 	atomic.AddInt64(&fs.activeIOCount, 1)
 	defer func() {
 		atomic.AddInt64(&fs.activeIOCount, -1)
 	}()
 
-	if _, err := fs.statBucketDir(ctx, srcBucket); err != nil {
-		return oi, toObjectErr(err, srcBucket)
+	if _, err := fs.disk.StatVol(ctx, srcBucket); err != nil {
+		return ObjectInfo{}, toObjectErr(err, srcBucket)
 	}
 
 	if cpSrcDstSame && srcInfo.metadataOnly {
-		fsMetaPath := pathJoin(fs.fsPath, minioMetaBucket, bucketMetaPrefix, srcBucket, srcObject, fs.metaJSONFile)
-		wlk, err := fs.rwPool.Write(fsMetaPath)
-		if err != nil {
-			wlk, err = fs.rwPool.Create(fsMetaPath)
-			if err != nil {
-				logger.LogIf(ctx, err)
-				return oi, toObjectErr(err, srcBucket, srcObject)
-			}
+		// Version ID is set for the destination and source == destination version ID.
+		// perform an in-place update.
+		if dstOpts.VersionID != "" && srcOpts.VersionID == dstOpts.VersionID {
+			return fs.updateMetaObject(ctx, srcBucket, srcObject, srcInfo, srcOpts, dstOpts)
 		}
-		// This close will allow for locks to be synchronized on `fs.json`.
-		defer wlk.Close()
-
-		// Save objects' metadata in `fs.json`.
-		fsMeta := newFSMetaV1()
-		if _, err = fsMeta.ReadFrom(ctx, wlk); err != nil {
-			// For any error to read fsMeta, set default ETag and proceed.
-			fsMeta = fs.defaultFsJSON(srcObject)
+		// Destination is not versioned and source version ID is empty
+		// perform an in-place update.
+		if !dstOpts.Versioned && srcOpts.VersionID == "" {
+			return fs.updateMetaObject(ctx, srcBucket, srcObject, srcInfo, srcOpts, dstOpts)
 		}
-
-		fsMeta.Meta = cloneMSS(srcInfo.UserDefined)
-		fsMeta.Meta["etag"] = srcInfo.ETag
-		if _, err = fsMeta.WriteTo(wlk); err != nil {
-			return oi, toObjectErr(err, srcBucket, srcObject)
+		// CopyObject optimization where we don't create an entire copy
+		// of the content, instead we add a reference, we disallow legacy
+		// objects to be self referenced in this manner so make sure
+		// that we actually create a new dataDir for legacy objects.
+		if dstOpts.Versioned && srcOpts.VersionID != dstOpts.VersionID && !srcInfo.Legacy {
+			srcInfo.versionOnly = true
+			return fs.updateMetaObject(ctx, srcBucket, srcObject, srcInfo, srcOpts, dstOpts)
 		}
-
-		// Stat the file to get file size.
-		fi, err := fsStatFile(ctx, pathJoin(fs.fsPath, srcBucket, srcObject))
-		if err != nil {
-			return oi, toObjectErr(err, srcBucket, srcObject)
-		}
-
-		// Return the new object info.
-		return fsMeta.ToObjectInfo(srcBucket, srcObject, fi), nil
 	}
 
-	if err := checkPutObjectArgs(ctx, dstBucket, dstObject, fs); err != nil {
+	putOpts := ObjectOptions{
+		ServerSideEncryption: dstOpts.ServerSideEncryption,
+		UserDefined:          srcInfo.UserDefined,
+		Versioned:            dstOpts.Versioned,
+		VersionID:            dstOpts.VersionID,
+		MTime:                dstOpts.MTime,
+	}
+
+	return fs.PutObject(ctx, dstBucket, dstObject, srcInfo.PutObjReader, putOpts)
+}
+
+func (fs *FSObjects) updateMetaObject(ctx context.Context, bucket, object string, info ObjectInfo, srcOpts, dstOpts ObjectOptions) (ObjectInfo, error) {
+	// This call shouldn't be used for anything other than metadata updates or adding self referential versions.
+	if !info.metadataOnly {
+		return ObjectInfo{}, NotImplemented{}
+	}
+
+	defer NSUpdated(bucket, object)
+
+	lk := fs.NewNSLock(bucket, object)
+	lkctx, err := lk.GetLock(ctx, globalOperationTimeout)
+	if err != nil {
 		return ObjectInfo{}, err
 	}
+	defer lk.Unlock(lkctx.Cancel)
+	ctx = lkctx.Context()
 
-	objInfo, err := fs.putObject(ctx, dstBucket, dstObject, srcInfo.PutObjReader, ObjectOptions{ServerSideEncryption: dstOpts.ServerSideEncryption, UserDefined: srcInfo.UserDefined})
+	ctx, cleanup, err := fs.disk.ContextWithMetaLock(ctx, writeLock, bucket, object)
 	if err != nil {
-		return oi, toObjectErr(err, dstBucket, dstObject)
+		return ObjectInfo{}, toObjectErr(err, bucket, object)
 	}
 
-	return objInfo, nil
+	defer func() {
+		cleanup(err)
+	}()
+	var fi FileInfo
+	fi, err = fs.disk.ReadVersion(ctx, bucket, object, srcOpts.VersionID, false)
+	if err != nil {
+		return ObjectInfo{}, toObjectErr(err, bucket, object)
+	}
+
+	if fi.Deleted {
+		if srcOpts.VersionID == "" {
+			err = errFileNotFound
+			return ObjectInfo{}, toObjectErr(err, bucket, object)
+		}
+		err = errMethodNotAllowed
+		return fi.ToObjectInfo(bucket, object), toObjectErr(err, bucket, object)
+	}
+
+	versionID := info.VersionID
+	if info.versionOnly {
+		versionID = dstOpts.VersionID
+		// preserve destination versionId if specified.
+		if versionID == "" {
+			versionID = mustGetUUID()
+		}
+		fi.ModTime = UTCNow()
+	}
+
+	fi.VersionID = versionID // set any new versionID we might have created
+	if !dstOpts.MTime.IsZero() {
+		fi.ModTime = dstOpts.MTime
+	}
+	fi.Metadata = info.UserDefined
+	info.UserDefined["etag"] = info.ETag
+
+	if err = fs.disk.WriteMetadata(ctx, bucket, object, fi); err != nil {
+		return ObjectInfo{}, toObjectErr(err, bucket, object)
+	}
+
+	return fi.ToObjectInfo(bucket, object), nil
 }
 
 // GetObjectNInfo - returns object info and a reader for object
 // content.
-func (fs *FSObjects) GetObjectNInfo(ctx context.Context, bucket, object string, rs *HTTPRangeSpec, h http.Header, lockType LockType, opts ObjectOptions) (gr *GetObjectReader, err error) {
+func (fs *FSObjects) GetObjectNInfo(ctx context.Context, bucket, object string, rs *HTTPRangeSpec, h http.Header, lockType LockType, opts ObjectOptions) (*GetObjectReader, error) {
+	var cleanup func(...error)
+	var err error
 	if opts.VersionID != "" && opts.VersionID != nullVersionID {
 		return nil, VersionNotFound{
 			Bucket:    bucket,
@@ -715,7 +630,7 @@ func (fs *FSObjects) GetObjectNInfo(ctx context.Context, bucket, object string, 
 		atomic.AddInt64(&fs.activeIOCount, -1)
 	}()
 
-	if _, err = fs.statBucketDir(ctx, bucket); err != nil {
+	if _, err = fs.disk.StatVol(ctx, bucket); err != nil {
 		return nil, toObjectErr(err, bucket)
 	}
 
@@ -742,45 +657,69 @@ func (fs *FSObjects) GetObjectNInfo(ctx context.Context, bucket, object string, 
 		}
 	}
 
-	// Otherwise we get the object info
-	var objInfo ObjectInfo
-	if objInfo, err = fs.getObjectInfo(ctx, bucket, object); err != nil {
+	ctx, cleanup, err = fs.disk.ContextWithMetaLock(ctx, lockType, bucket, object)
+	if err != nil {
+		return nil, toObjectErr(err, bucket, object)
+	}
+
+	cleanUpFn := func() {
+		cleanup(err)
+	}
+
+	fi, err := fs.disk.ReadVersion(ctx, bucket, object, opts.VersionID, false)
+
+	if err != nil {
+		cleanUpFn()
 		nsUnlocker()
 		return nil, toObjectErr(err, bucket, object)
 	}
-	// For a directory, we need to return a reader that returns no bytes.
-	if HasSuffix(object, SlashSeparator) {
+	objInfo := fi.ToObjectInfo(bucket, object)
+
+	if objInfo.DeleteMarker {
+		if opts.VersionID == "" {
+			err = errFileNotFound
+		} else {
+
+			err = errMethodNotAllowed
+		}
+		cleanUpFn()
+		nsUnlocker()
+		return &GetObjectReader{
+			ObjInfo: objInfo,
+		}, toObjectErr(err, bucket, object)
+	}
+
+	// For a directory or an empty file, we need to return a reader that returns no bytes.
+	if HasSuffix(object, slashSeparator) || fi.Size == 0 {
 		// The lock taken above is released when
 		// objReader.Close() is called by the caller.
-		return NewGetObjectReaderFromReader(bytes.NewBuffer(nil), objInfo, opts, nsUnlocker)
+		return NewGetObjectReaderFromReader(bytes.NewBuffer(nil), objInfo, opts, nsUnlocker, cleanUpFn)
 	}
-	// Take a rwPool lock for NFS gateway type deployment
-	rwPoolUnlocker := func() {}
-	if bucket != minioMetaBucket && lockType != noLock {
-		fsMetaPath := pathJoin(fs.fsPath, minioMetaBucket, bucketMetaPrefix, bucket, object, fs.metaJSONFile)
-		_, err = fs.rwPool.Open(fsMetaPath)
-		if err != nil && err != errFileNotFound {
-			logger.LogIf(ctx, err)
-			nsUnlocker()
-			return nil, toObjectErr(err, bucket, object)
-		}
-		// Need to clean up lock after getObject is
-		// completed.
-		rwPoolUnlocker = func() { fs.rwPool.Close(fsMetaPath) }
+
+	// If transitioned, stream from transition tier unless object is restored locally or restore date is past.
+	if objInfo.IsRemote() {
+		var transR *GetObjectReader
+		transR, err = getTransitionedObjectReader(ctx, bucket, object, rs, h, objInfo, opts)
+		cleanUpFn()
+		nsUnlocker()
+		return transR, err
 	}
 
 	objReaderFn, off, length, err := NewGetObjectReader(rs, objInfo, opts)
 	if err != nil {
-		rwPoolUnlocker()
+		cleanUpFn()
 		nsUnlocker()
 		return nil, err
 	}
 
+	objectPath := object
+	if fi.DataDir != "" {
+		objectPath = pathJoin(object, fi.DataDir, "part.1")
+	}
 	// Read the object, doesn't exist returns an s3 compatible error.
-	fsObjPath := pathJoin(fs.fsPath, bucket, object)
-	readCloser, size, err := fsOpenFile(ctx, fsObjPath, off)
+	readCloser, err := fs.disk.ReadFileStream(ctx, bucket, objectPath, off, length)
 	if err != nil {
-		rwPoolUnlocker()
+		cleanUpFn()
 		nsUnlocker()
 		return nil, toObjectErr(err, bucket, object)
 	}
@@ -791,178 +730,33 @@ func (fs *FSObjects) GetObjectNInfo(ctx context.Context, bucket, object string, 
 	reader := io.LimitReader(readCloser, length)
 
 	// Check if range is valid
-	if off > size || off+length > size {
-		err = InvalidRange{off, length, size}
+	if off > objInfo.Size || off+length > objInfo.Size {
+		err = InvalidRange{off, length, objInfo.Size}
 		logger.LogIf(ctx, err, logger.Application)
 		closeFn()
-		rwPoolUnlocker()
+		cleanUpFn()
 		nsUnlocker()
 		return nil, err
 	}
 
-	return objReaderFn(reader, h, opts.CheckPrecondFn, closeFn, rwPoolUnlocker, nsUnlocker)
-}
-
-// Create a new fs.json file, if the existing one is corrupt. Should happen very rarely.
-func (fs *FSObjects) createFsJSON(object, fsMetaPath string) error {
-	fsMeta := newFSMetaV1()
-	fsMeta.Meta = map[string]string{
-		"etag":         GenETag(),
-		"content-type": mimedb.TypeByExtension(path.Ext(object)),
-	}
-	wlk, werr := fs.rwPool.Create(fsMetaPath)
-	if werr == nil {
-		_, err := fsMeta.WriteTo(wlk)
-		wlk.Close()
-		return err
-	}
-	return werr
-}
-
-// Used to return default etag values when a pre-existing object's meta data is queried.
-func (fs *FSObjects) defaultFsJSON(object string) fsMetaV1 {
-	fsMeta := newFSMetaV1()
-	fsMeta.Meta = map[string]string{
-		"etag":         defaultEtag,
-		"content-type": mimedb.TypeByExtension(path.Ext(object)),
-	}
-	return fsMeta
-}
-
-func (fs *FSObjects) getObjectInfoNoFSLock(ctx context.Context, bucket, object string) (oi ObjectInfo, e error) {
-	fsMeta := fsMetaV1{}
-	if HasSuffix(object, SlashSeparator) {
-		fi, err := fsStatDir(ctx, pathJoin(fs.fsPath, bucket, object))
-		if err != nil {
-			return oi, err
-		}
-		return fsMeta.ToObjectInfo(bucket, object, fi), nil
-	}
-
-	fsMetaPath := pathJoin(fs.fsPath, minioMetaBucket, bucketMetaPrefix, bucket, object, fs.metaJSONFile)
-	// Read `fs.json` to perhaps contend with
-	// parallel Put() operations.
-
-	rc, _, err := fsOpenFile(ctx, fsMetaPath, 0)
-	if err == nil {
-		fsMetaBuf, rerr := ioutil.ReadAll(rc)
-		rc.Close()
-		if rerr == nil {
-			var json = jsoniter.ConfigCompatibleWithStandardLibrary
-			if rerr = json.Unmarshal(fsMetaBuf, &fsMeta); rerr != nil {
-				// For any error to read fsMeta, set default ETag and proceed.
-				fsMeta = fs.defaultFsJSON(object)
-			}
-		} else {
-			// For any error to read fsMeta, set default ETag and proceed.
-			fsMeta = fs.defaultFsJSON(object)
-		}
-	}
-
-	// Return a default etag and content-type based on the object's extension.
-	if err == errFileNotFound {
-		fsMeta = fs.defaultFsJSON(object)
-	}
-
-	// Ignore if `fs.json` is not available, this is true for pre-existing data.
-	if err != nil && err != errFileNotFound {
-		logger.LogIf(ctx, err)
-		return oi, err
-	}
-
-	// Stat the file to get file size.
-	fi, err := fsStatFile(ctx, pathJoin(fs.fsPath, bucket, object))
-	if err != nil {
-		return oi, err
-	}
-
-	return fsMeta.ToObjectInfo(bucket, object, fi), nil
-}
-
-// getObjectInfo - wrapper for reading object metadata and constructs ObjectInfo.
-func (fs *FSObjects) getObjectInfo(ctx context.Context, bucket, object string) (oi ObjectInfo, e error) {
-	if strings.HasSuffix(object, SlashSeparator) && !fs.isObjectDir(bucket, object) {
-		return oi, errFileNotFound
-	}
-
-	fsMeta := fsMetaV1{}
-	if HasSuffix(object, SlashSeparator) {
-		fi, err := fsStatDir(ctx, pathJoin(fs.fsPath, bucket, object))
-		if err != nil {
-			return oi, err
-		}
-		return fsMeta.ToObjectInfo(bucket, object, fi), nil
-	}
-
-	fsMetaPath := pathJoin(fs.fsPath, minioMetaBucket, bucketMetaPrefix, bucket, object, fs.metaJSONFile)
-	// Read `fs.json` to perhaps contend with
-	// parallel Put() operations.
-
-	rlk, err := fs.rwPool.Open(fsMetaPath)
-	if err == nil {
-		// Read from fs metadata only if it exists.
-		_, rerr := fsMeta.ReadFrom(ctx, rlk.LockedFile)
-		fs.rwPool.Close(fsMetaPath)
-		if rerr != nil {
-			// For any error to read fsMeta, set default ETag and proceed.
-			fsMeta = fs.defaultFsJSON(object)
-		}
-	}
-
-	// Return a default etag and content-type based on the object's extension.
-	if err == errFileNotFound {
-		fsMeta = fs.defaultFsJSON(object)
-	}
-
-	// Ignore if `fs.json` is not available, this is true for pre-existing data.
-	if err != nil && err != errFileNotFound {
-		logger.LogIf(ctx, err)
-		return oi, err
-	}
-
-	// Stat the file to get file size.
-	fi, err := fsStatFile(ctx, pathJoin(fs.fsPath, bucket, object))
-	if err != nil {
-		return oi, err
-	}
-
-	return fsMeta.ToObjectInfo(bucket, object, fi), nil
-}
-
-// getObjectInfoWithLock - reads object metadata and replies back ObjectInfo.
-func (fs *FSObjects) getObjectInfoWithLock(ctx context.Context, bucket, object string) (oi ObjectInfo, err error) {
-	// Lock the object before reading.
-	lk := fs.NewNSLock(bucket, object)
-	lkctx, err := lk.GetRLock(ctx, globalOperationTimeout)
-	if err != nil {
-		return oi, err
-	}
-	ctx = lkctx.Context()
-	defer lk.RUnlock(lkctx.Cancel)
-
-	if err := checkGetObjArgs(ctx, bucket, object); err != nil {
-		return oi, err
-	}
-
-	if _, err := fs.statBucketDir(ctx, bucket); err != nil {
-		return oi, err
-	}
-
-	if strings.HasSuffix(object, SlashSeparator) && !fs.isObjectDir(bucket, object) {
-		return oi, errFileNotFound
-	}
-
-	return fs.getObjectInfo(ctx, bucket, object)
+	return objReaderFn(reader, h, opts.CheckPrecondFn, closeFn, cleanUpFn, nsUnlocker)
 }
 
 // GetObjectInfo - reads object metadata and replies back ObjectInfo.
-func (fs *FSObjects) GetObjectInfo(ctx context.Context, bucket, object string, opts ObjectOptions) (oi ObjectInfo, e error) {
+func (fs *FSObjects) GetObjectInfo(ctx context.Context, bucket, object string, opts ObjectOptions) (ObjectInfo, error) {
+
+	var cleanup func(...error)
 	if opts.VersionID != "" && opts.VersionID != nullVersionID {
-		return oi, VersionNotFound{
+		return ObjectInfo{}, VersionNotFound{
 			Bucket:    bucket,
 			Object:    object,
 			VersionID: opts.VersionID,
 		}
+	}
+
+	var err error
+	if err = checkGetObjArgs(ctx, bucket, object); err != nil {
+		return ObjectInfo{}, err
 	}
 
 	atomic.AddInt64(&fs.activeIOCount, 1)
@@ -970,68 +764,136 @@ func (fs *FSObjects) GetObjectInfo(ctx context.Context, bucket, object string, o
 		atomic.AddInt64(&fs.activeIOCount, -1)
 	}()
 
-	oi, err := fs.getObjectInfoWithLock(ctx, bucket, object)
+	var lk RWLocker
+	var lkctx LockContext
+	lockType := noLock
+	if !opts.NoLock {
+		// Lock the object before reading.
+		lk = fs.NewNSLock(bucket, object)
+		lkctx, err = lk.GetRLock(ctx, globalOperationTimeout)
+		if err != nil {
+			return ObjectInfo{}, err
+		}
+		ctx = lkctx.Context()
+
+		lockType = readLock
+	}
+
+	// save the old context in case we need to re-lock using write lock
+	// this happens when we need to write a new meta file,
+	// if the old is corrupted/missing
+	oldCtx := ctx
+	ctx, cleanup, err = fs.disk.ContextWithMetaLock(oldCtx, lockType, bucket, object)
+	if err != nil {
+		if lk != nil {
+			lk.RUnlock(lkctx.Cancel)
+		}
+		return ObjectInfo{}, toObjectErr(err, bucket, object)
+	}
+
+	fi, err := fs.disk.ReadVersion(ctx, bucket, object, opts.VersionID, false)
+
 	if err == errCorruptedFormat || err == io.EOF {
-		lk := fs.NewNSLock(bucket, object)
-		lkctx, err := lk.GetLock(ctx, globalOperationTimeout)
-		if err != nil {
-			return oi, toObjectErr(err, bucket, object)
+		// release the old locks and acquire write locks
+		cleanup(err)
+		if lk != nil {
+			lk.RUnlock(lkctx.Cancel)
 		}
 
-		fsMetaPath := pathJoin(fs.fsPath, minioMetaBucket, bucketMetaPrefix, bucket, object, fs.metaJSONFile)
-		err = fs.createFsJSON(object, fsMetaPath)
-		lk.Unlock(lkctx.Cancel)
+		lk = fs.NewNSLock(bucket, object)
+		lkctx, err = lk.GetLock(oldCtx, globalOperationTimeout)
 		if err != nil {
-			return oi, toObjectErr(err, bucket, object)
+			return ObjectInfo{}, toObjectErr(err, bucket, object)
+		}
+		defer lk.Unlock(lkctx.Cancel)
+		ctx = lkctx.Context()
+
+		ctx, cleanup, err = fs.disk.ContextWithMetaLock(ctx, writeLock, bucket, object)
+		if err != nil {
+			return ObjectInfo{}, toObjectErr(err, bucket, object)
+		}
+		defer func() {
+			cleanup(err)
+		}()
+		fi = FileInfo{
+			Metadata: map[string]string{
+				"etag":         defaultEtag,
+				"content-type": mimedb.TypeByExtension(path.Ext(object)),
+			},
+		}
+		err = fs.disk.WriteMetadata(ctx, bucket, object, fi)
+		if err != nil {
+			return ObjectInfo{}, toObjectErr(err, bucket, object)
 		}
 
-		oi, err = fs.getObjectInfoWithLock(ctx, bucket, object)
+		fi, err = fs.disk.ReadVersion(ctx, bucket, object, opts.VersionID, false)
+	} else {
+		defer func() {
+			cleanup(err)
+		}()
+		if lk != nil {
+			defer lk.RUnlock(lkctx.Cancel)
+		}
+	}
+
+	if err != nil {
+		return ObjectInfo{}, toObjectErr(err, bucket, object)
+	}
+
+	oi := fi.ToObjectInfo(bucket, object)
+	if !fi.VersionPurgeStatus.Empty() {
+		// Make sure to return object info to provide extra information.
+		err = errMethodNotAllowed
 		return oi, toObjectErr(err, bucket, object)
 	}
-	return oi, toObjectErr(err, bucket, object)
+
+	if fi.Deleted {
+		if opts.VersionID == "" || opts.DeleteMarker {
+			err = errFileNotFound
+			return oi, toObjectErr(err, bucket, object)
+		}
+		// Make sure to return object info to provide extra information.
+		err = errMethodNotAllowed
+		return oi, toObjectErr(err, bucket, object)
+	}
+
+	return oi, nil
 }
 
 // This function does the following check, suppose
 // object is "a/b/c/d", stat makes sure that objects ""a/b/c""
 // "a/b" and "a" do not exist.
 func (fs *FSObjects) parentDirIsObject(ctx context.Context, bucket, parent string) bool {
-	var isParentDirObject func(string) bool
-	isParentDirObject = func(p string) bool {
-		if p == "." || p == SlashSeparator {
-			return false
-		}
-		if fsIsFile(ctx, pathJoin(fs.fsPath, bucket, p)) {
-			// If there is already a file at prefix "p", return true.
-			return true
-		}
-
-		// Check if there is a file as one of the parent paths.
-		return isParentDirObject(path.Dir(p))
-	}
-	return isParentDirObject(parent)
+	return fs.disk.CheckFile(ctx, bucket, parent) == nil
 }
 
 // PutObject - creates an object upon reading from the input stream
 // until EOF, writes data directly to configured filesystem path.
 // Additionally writes `fs.json` which carries the necessary metadata
 // for future object operations.
-func (fs *FSObjects) PutObject(ctx context.Context, bucket string, object string, r *PutObjReader, opts ObjectOptions) (objInfo ObjectInfo, err error) {
+func (fs *FSObjects) PutObject(ctx context.Context, bucket string, object string, r *PutObjReader, opts ObjectOptions) (ObjectInfo, error) {
 	if opts.Versioned {
-		return objInfo, NotImplemented{}
+		return ObjectInfo{}, NotImplemented{}
 	}
-
-	if err := checkPutObjectArgs(ctx, bucket, object, fs); err != nil {
+	var err error
+	if err = checkPutObjectArgs(ctx, bucket, object, fs); err != nil {
 		return ObjectInfo{}, err
 	}
 
-	defer NSUpdated(bucket, object)
+	di, err := fs.disk.DiskInfo(ctx)
+	if err != nil {
+		return ObjectInfo{}, err
+	}
+	if !isMinioMetaBucketName(bucket) && !hasSpaceFor([]*DiskInfo{&di}, r.Size()) {
+		return ObjectInfo{}, toObjectErr(errDiskFull)
+	}
 
 	// Lock the object.
 	lk := fs.NewNSLock(bucket, object)
 	lkctx, err := lk.GetLock(ctx, globalOperationTimeout)
 	if err != nil {
 		logger.LogIf(ctx, err)
-		return objInfo, err
+		return ObjectInfo{}, err
 	}
 	ctx = lkctx.Context()
 	defer lk.Unlock(lkctx.Cancel)
@@ -1041,42 +903,42 @@ func (fs *FSObjects) PutObject(ctx context.Context, bucket string, object string
 		atomic.AddInt64(&fs.activeIOCount, -1)
 	}()
 
-	return fs.putObject(ctx, bucket, object, r, opts)
-}
+	cleanup := func(err ...error) {}
+	if bucket != minioMetaBucket {
+		ctx, cleanup, err = fs.disk.ContextWithMetaLock(ctx, writeLock, bucket, object)
+	}
 
-// putObject - wrapper for PutObject
-func (fs *FSObjects) putObject(ctx context.Context, bucket string, object string, r *PutObjReader, opts ObjectOptions) (objInfo ObjectInfo, retErr error) {
-	data := r.Reader
+	if err != nil {
+		return ObjectInfo{}, toObjectErr(err, bucket, object)
+	}
 
-	// No metadata is set, allocate a new one.
-	meta := cloneMSS(opts.UserDefined)
-	var err error
+	defer func() {
+		cleanup(err)
+	}()
 
 	// Validate if bucket name is valid and exists.
-	if _, err = fs.statBucketDir(ctx, bucket); err != nil {
+	if _, err = fs.disk.StatVol(ctx, bucket); err != nil {
 		return ObjectInfo{}, toObjectErr(err, bucket)
 	}
 
-	fsMeta := newFSMetaV1()
-	fsMeta.Meta = meta
+	cReader := newCountingReader(r)
 
-	// This is a special case with size as '0' and object ends
-	// with a slash separator, we treat it like a valid operation
-	// and return success.
-	if isObjectDir(object, data.Size()) {
-		// Check if an object is present as one of the parent dir.
-		if fs.parentDirIsObject(ctx, bucket, path.Dir(object)) {
-			return ObjectInfo{}, toObjectErr(errFileParentIsFile, bucket, object)
-		}
-		if err = mkdirAll(pathJoin(fs.fsPath, bucket, object), 0777); err != nil {
-			logger.LogIf(ctx, err)
-			return ObjectInfo{}, toObjectErr(err, bucket, object)
-		}
-		var fi os.FileInfo
-		if fi, err = fsStatDir(ctx, pathJoin(fs.fsPath, bucket, object)); err != nil {
-			return ObjectInfo{}, toObjectErr(err, bucket, object)
-		}
-		return fsMeta.ToObjectInfo(bucket, object, fi), nil
+	uniqueID := mustGetUUID()
+	tempObjFolder := uniqueID
+
+	// No metadata is set, allocate a new one.
+	if opts.UserDefined == nil {
+		opts.UserDefined = make(map[string]string)
+	}
+
+	// Validate input data size and it can never be less than zero.
+	if cReader.Size() < -1 {
+		logger.LogIf(ctx, errInvalidArgument, logger.Application)
+		return ObjectInfo{}, toObjectErr(errInvalidArgument)
+	}
+
+	fi := FileInfo{
+		Metadata: cloneMSS(opts.UserDefined),
 	}
 
 	// Check if an object is present as one of the parent dir.
@@ -1084,125 +946,272 @@ func (fs *FSObjects) putObject(ctx context.Context, bucket string, object string
 		return ObjectInfo{}, toObjectErr(errFileParentIsFile, bucket, object)
 	}
 
-	// Validate input data size and it can never be less than zero.
-	if data.Size() < -1 {
-		logger.LogIf(ctx, errInvalidArgument, logger.Application)
-		return ObjectInfo{}, errInvalidArgument
+	fi.VersionID = opts.VersionID
+	if opts.Versioned && fi.VersionID == "" {
+		fi.VersionID = mustGetUUID()
 	}
 
-	var wlk *lock.LockedFile
-	if bucket != minioMetaBucket {
-		bucketMetaDir := pathJoin(fs.fsPath, minioMetaBucket, bucketMetaPrefix)
-		fsMetaPath := pathJoin(bucketMetaDir, bucket, object, fs.metaJSONFile)
-		wlk, err = fs.rwPool.Write(fsMetaPath)
-		var freshFile bool
-		if err != nil {
-			wlk, err = fs.rwPool.Create(fsMetaPath)
-			if err != nil {
-				logger.LogIf(ctx, err)
-				return ObjectInfo{}, toObjectErr(err, bucket, object)
-			}
-			freshFile = true
-		}
-		// This close will allow for locks to be synchronized on `fs.json`.
-		defer wlk.Close()
-		defer func() {
-			// Remove meta file when PutObject encounters
-			// any error and it is a fresh file.
-			//
-			// We should preserve the `fs.json` of any
-			// existing object
-			if retErr != nil && freshFile {
-				tmpDir := pathJoin(fs.fsPath, minioMetaTmpBucket, fs.fsUUID)
-				fsRemoveMeta(ctx, bucketMetaDir, fsMetaPath, tmpDir)
-			}
-		}()
-	}
-
-	// Uploaded object will first be written to the temporary location which will eventually
-	// be renamed to the actual location. It is first written to the temporary location
-	// so that cleaning it up will be easy if the server goes down.
-	tempObj := mustGetUUID()
-
-	fsTmpObjPath := pathJoin(fs.fsPath, minioMetaTmpBucket, fs.fsUUID, tempObj)
-	bytesWritten, err := fsCreateFile(ctx, fsTmpObjPath, data, data.Size())
+	fi.DataDir = mustGetUUID()
+	partName := "part.1"
 
 	// Delete the temporary object in the case of a
 	// failure. If PutObject succeeds, then there would be
 	// nothing to delete.
-	defer fsRemoveFile(ctx, fsTmpObjPath)
+	defer func() {
+		fs.deleteObject(context.Background(), fs.disk.MetaTmpBucket(), tempObjFolder)
+	}()
 
-	if err != nil {
-		return ObjectInfo{}, toObjectErr(err, bucket, object)
-	}
-	fsMeta.Meta["etag"] = r.MD5CurrentHexString()
-
-	// Should return IncompleteBody{} error when reader has fewer
-	// bytes than specified in request header.
-	if bytesWritten < data.Size() {
-		return ObjectInfo{}, IncompleteBody{Bucket: bucket, Object: object}
-	}
-
-	// Entire object was written to the temp location, now it's safe to rename it to the actual location.
-	fsNSObjPath := pathJoin(fs.fsPath, bucket, object)
-	if err = fsRenameFile(ctx, fsTmpObjPath, fsNSObjPath); err != nil {
-		return ObjectInfo{}, toObjectErr(err, bucket, object)
-	}
-
-	if bucket != minioMetaBucket {
-		// Write FS metadata after a successful namespace operation.
-		if _, err = fsMeta.WriteTo(wlk); err != nil {
+	if !HasSuffix(object, slashSeparator) {
+		// Uploaded object will first be written to the temporary location which will eventually
+		// be renamed to the actual location. It is first written to the temporary location
+		// so that cleaning it up will be easy if the server goes down.
+		err = fs.disk.CreateFile(ctx, fs.disk.MetaTmpBucket(), pathJoin(tempObjFolder, fi.DataDir, partName), cReader.Size(), cReader)
+		if err != nil {
+			// Should return IncompleteBody{} error when reader has fewer
+			// bytes than specified in request header.
+			if err == errLessData || err == errMoreData {
+				return ObjectInfo{}, IncompleteBody{Bucket: bucket, Object: object}
+			}
 			return ObjectInfo{}, toObjectErr(err, bucket, object)
 		}
 	}
 
-	// Stat the file to fetch timestamp, size.
-	fi, err := fsStatFile(ctx, pathJoin(fs.fsPath, bucket, object))
+	fi.AddObjectPart(1, "", cReader.bytesRead, cReader.ActualSize())
+
+	if opts.UserDefined["etag"] == "" {
+		fi.Metadata["etag"] = cReader.MD5CurrentHexString()
+	}
+
+	// Guess content-type from the extension if possible.
+	if opts.UserDefined["content-type"] == "" {
+		fi.Metadata["content-type"] = mimedb.TypeByExtension(path.Ext(object))
+	}
+
+	modTime := opts.MTime
+	if opts.MTime.IsZero() {
+		modTime = UTCNow()
+	}
+
+	fi.Size = cReader.bytesRead
+	fi.ModTime = modTime
+
+	// rename
+	defer NSUpdated(fs.disk.MetaTmpBucket(), tempObjFolder)
+	defer NSUpdated(bucket, object)
+	err = fs.disk.RenameData(ctx, fs.disk.MetaTmpBucket(), pathJoin(tempObjFolder), fi, bucket, object)
+
 	if err != nil {
 		return ObjectInfo{}, toObjectErr(err, bucket, object)
 	}
 
 	// Success.
-	return fsMeta.ToObjectInfo(bucket, object, fi), nil
+	return fi.ToObjectInfo(bucket, object), nil
+}
+
+func (fs *FSObjects) deleteObject(ctx context.Context, bucket, object string) error {
+	var err error
+	defer NSUpdated(bucket, object)
+
+	tmpObj := mustGetUUID()
+	if bucket == fs.disk.MetaTmpBucket() {
+		tmpObj = object
+	} else {
+		err = fs.disk.RenameFile(ctx, bucket, object, fs.disk.MetaTmpBucket(), tmpObj)
+		if err != nil {
+			return toObjectErr(err, bucket, object)
+		}
+	}
+
+	return fs.disk.Delete(ctx, fs.disk.MetaTmpBucket(), tmpObj, true)
 }
 
 // DeleteObjects - deletes an object from a bucket, this operation is destructive
 // and there are no rollbacks supported.
 func (fs *FSObjects) DeleteObjects(ctx context.Context, bucket string, objects []ObjectToDelete, opts ObjectOptions) ([]DeletedObject, []error) {
-	errs := make([]error, len(objects))
 	dobjects := make([]DeletedObject, len(objects))
-	for idx, object := range objects {
-		if object.VersionID != "" {
-			errs[idx] = VersionNotFound{
+	errs := make([]error, len(objects))
+	objSets := set.NewStringSet()
+	for i := range objects {
+		if objects[i].VersionID != "" {
+			errs[i] = VersionNotFound{
 				Bucket:    bucket,
-				Object:    object.ObjectName,
-				VersionID: object.VersionID,
+				Object:    objects[i].ObjectName,
+				VersionID: objects[i].VersionID,
 			}
 			continue
 		}
-		_, errs[idx] = fs.DeleteObject(ctx, bucket, object.ObjectName, opts)
-		if errs[idx] == nil || isErrObjectNotFound(errs[idx]) {
-			dobjects[idx] = DeletedObject{
-				ObjectName: object.ObjectName,
-			}
-			errs[idx] = nil
+
+		errs[i] = checkDelObjArgs(ctx, bucket, objects[i].ObjectName)
+		if errs[i] == nil {
+			objSets.Add(objects[i].ObjectName)
 		}
 	}
+
+	// Acquire a bulk write lock across 'objects'
+	objLockSlice := objSets.ToSlice()
+	multiDeleteLock := fs.NewNSLock(bucket, objLockSlice...)
+	lkctx, err := multiDeleteLock.GetLock(ctx, globalOperationTimeout)
+	if err != nil {
+		for i := range errs {
+			errs[i] = toObjectErr(err, bucket, objects[i].ObjectName)
+		}
+		return dobjects, errs
+	}
+	defer multiDeleteLock.Unlock(lkctx.Cancel)
+	ctx = lkctx.Context()
+
+	versions := make([]FileInfo, 0)
+	objIdxToVerIdx := make(map[int]int, len(objects))
+	for i := range objects {
+		if errs[i] != nil {
+			continue
+		}
+		objIdxToVerIdx[i] = len(versions)
+		if objects[i].VersionID == "" {
+			modTime := opts.MTime
+			if opts.MTime.IsZero() {
+				modTime = UTCNow()
+			}
+			uuid := opts.VersionID
+			if uuid == "" {
+				uuid = mustGetUUID()
+			}
+			if opts.Versioned || opts.VersionSuspended {
+				version := FileInfo{
+					Name:                          objects[i].ObjectName,
+					ModTime:                       modTime,
+					Deleted:                       true, // delete marker
+					DeleteMarkerReplicationStatus: objects[i].DeleteMarkerReplicationStatus,
+					VersionPurgeStatus:            objects[i].VersionPurgeStatus,
+				}
+				if opts.Versioned {
+					version.VersionID = uuid
+				}
+				versions = append(versions, version)
+				continue
+			}
+		}
+		versions = append(versions, FileInfo{
+			Name:                          objects[i].ObjectName,
+			VersionID:                     objects[i].VersionID,
+			DeleteMarkerReplicationStatus: objects[i].DeleteMarkerReplicationStatus,
+			VersionPurgeStatus:            objects[i].VersionPurgeStatus,
+		})
+	}
+
+	ctx, cleanup, err := fs.disk.ContextWithMetaLock(ctx, writeLock, bucket, objLockSlice...)
+	if err != nil {
+		for i := range errs {
+			errs[i] = err
+		}
+		return dobjects, errs
+	}
+
+	cleanupErrs := make([]error, len(objSets))
+	defer func() {
+		cleanup(cleanupErrs...)
+	}()
+
+	// Initialize list of errors.
+	delObjErrs := fs.disk.DeleteVersions(ctx, bucket, versions)
+
+	// Reduce errors for each object
+
+	for objIndex := range objects {
+		verIdx := objIdxToVerIdx[objIndex]
+
+		var err error
+		if errs[objIndex] != nil {
+			err = errs[objIndex]
+		} else if delObjErrs[verIdx] != errFileNotFound {
+			err = delObjErrs[verIdx]
+		}
+
+		if delObjErrs[verIdx] != nil {
+			lockPos, ok := findFirst(objLockSlice, versions[verIdx].Name)
+			if ok {
+				cleanupErrs[lockPos] = delObjErrs[verIdx]
+			}
+		}
+
+		if objects[objIndex].VersionID != "" {
+			errs[objIndex] = toObjectErr(err, bucket, objects[objIndex].ObjectName, objects[objIndex].VersionID)
+		} else {
+			errs[objIndex] = toObjectErr(err, bucket, objects[objIndex].ObjectName)
+		}
+
+		if errs[objIndex] != nil {
+			continue
+		}
+		NSUpdated(bucket, objects[objIndex].ObjectName)
+
+		if versions[verIdx].Deleted {
+			dobjects[objIndex] = DeletedObject{
+				DeleteMarker:                  versions[verIdx].Deleted,
+				DeleteMarkerVersionID:         versions[verIdx].VersionID,
+				DeleteMarkerMTime:             DeleteMarkerMTime{versions[verIdx].ModTime},
+				DeleteMarkerReplicationStatus: versions[verIdx].DeleteMarkerReplicationStatus,
+				ObjectName:                    versions[verIdx].Name,
+				VersionPurgeStatus:            versions[verIdx].VersionPurgeStatus,
+			}
+		} else {
+			dobjects[objIndex] = DeletedObject{
+				ObjectName:                    versions[verIdx].Name,
+				VersionID:                     versions[verIdx].VersionID,
+				VersionPurgeStatus:            versions[verIdx].VersionPurgeStatus,
+				DeleteMarkerReplicationStatus: versions[verIdx].DeleteMarkerReplicationStatus,
+			}
+		}
+	}
+
 	return dobjects, errs
+}
+
+func findFirst(strSlice []string, name string) (int, bool) {
+	for idx, element := range strSlice {
+		if element == name {
+			return idx, true
+		}
+	}
+
+	return 0, false
 }
 
 // DeleteObject - deletes an object from a bucket, this operation is destructive
 // and there are no rollbacks supported.
-func (fs *FSObjects) DeleteObject(ctx context.Context, bucket, object string, opts ObjectOptions) (objInfo ObjectInfo, err error) {
+func (fs *FSObjects) DeleteObject(ctx context.Context, bucket, object string, opts ObjectOptions) (ObjectInfo, error) {
 	if opts.VersionID != "" && opts.VersionID != nullVersionID {
-		return objInfo, VersionNotFound{
+		return ObjectInfo{}, VersionNotFound{
 			Bucket:    bucket,
 			Object:    object,
 			VersionID: opts.VersionID,
 		}
 	}
+	var err error
+	if err = checkDelObjArgs(ctx, bucket, object); err != nil {
+		return ObjectInfo{}, err
+	}
 
-	defer NSUpdated(bucket, object)
+	atomic.AddInt64(&fs.activeIOCount, 1)
+	defer func() {
+		atomic.AddInt64(&fs.activeIOCount, -1)
+	}()
+
+	versionFound := true
+	objInfo := ObjectInfo{VersionID: opts.VersionID} // version id needed in Delete API response.
+	oi, err := fs.GetObjectInfo(ctx, bucket, object, opts)
+	if err != nil && oi.Name == "" {
+		switch err.(type) {
+		case InsufficientReadQuorum:
+			return objInfo, InsufficientWriteQuorum{}
+		}
+		// For delete marker replication, versionID being replicated will not exist on disk
+		if opts.DeleteMarker {
+			versionFound = false
+		} else {
+			return objInfo, err
+		}
+	}
 
 	// Acquire a write lock before deleting the object.
 	lk := fs.NewNSLock(bucket, object)
@@ -1213,94 +1222,99 @@ func (fs *FSObjects) DeleteObject(ctx context.Context, bucket, object string, op
 	ctx = lkctx.Context()
 	defer lk.Unlock(lkctx.Cancel)
 
-	if err = checkDelObjArgs(ctx, bucket, object); err != nil {
-		return objInfo, err
+	ctx, cleanup, err := fs.disk.ContextWithMetaLock(ctx, writeLock, bucket, object)
+	if err != nil {
+		return ObjectInfo{}, toObjectErr(err, bucket, object)
 	}
 
-	atomic.AddInt64(&fs.activeIOCount, 1)
 	defer func() {
-		atomic.AddInt64(&fs.activeIOCount, -1)
+		cleanup(err)
 	}()
+	defer NSUpdated(bucket, object)
 
-	if _, err = fs.statBucketDir(ctx, bucket); err != nil {
-		return objInfo, toObjectErr(err, bucket)
+	var markDelete bool
+	// Determine whether to mark object deleted for replication
+	if oi.VersionID != "" {
+		markDelete = true
 	}
 
-	var rwlk *lock.LockedFile
+	// Default deleteMarker to true if object is under versioning
+	deleteMarker := opts.Versioned
 
-	minioMetaBucketDir := pathJoin(fs.fsPath, minioMetaBucket)
-	fsMetaPath := pathJoin(minioMetaBucketDir, bucketMetaPrefix, bucket, object, fs.metaJSONFile)
-	if bucket != minioMetaBucket {
-		rwlk, err = fs.rwPool.Write(fsMetaPath)
-		if err != nil && err != errFileNotFound {
-			logger.LogIf(ctx, err)
-			return objInfo, toObjectErr(err, bucket, object)
+	if opts.VersionID != "" {
+		// case where replica version needs to be deleted on target cluster
+		if versionFound && opts.DeleteMarkerReplicationStatus == replication.Replica.String() {
+			markDelete = false
+		}
+		if opts.VersionPurgeStatus.Empty() && opts.DeleteMarkerReplicationStatus == "" {
+			markDelete = false
+		}
+		if opts.VersionPurgeStatus == Complete {
+			markDelete = false
+		}
+		// determine if the version represents an object delete
+		// deleteMarker = true
+		if versionFound && !oi.DeleteMarker { // implies a versioned delete of object
+			deleteMarker = false
 		}
 	}
 
-	// Delete the object.
-	if err = fsDeleteFile(ctx, pathJoin(fs.fsPath, bucket), pathJoin(fs.fsPath, bucket, object)); err != nil {
-		if rwlk != nil {
-			rwlk.Close()
+	modTime := opts.MTime
+	if opts.MTime.IsZero() {
+		modTime = UTCNow()
+	}
+	if markDelete {
+		if opts.Versioned || opts.VersionSuspended {
+			fi := FileInfo{
+				Name:                          object,
+				Deleted:                       deleteMarker,
+				MarkDeleted:                   markDelete,
+				ModTime:                       modTime,
+				DeleteMarkerReplicationStatus: opts.DeleteMarkerReplicationStatus,
+				VersionPurgeStatus:            opts.VersionPurgeStatus,
+				TransitionStatus:              opts.Transition.Status,
+				ExpireRestored:                opts.Transition.ExpireRestored,
+			}
+			if opts.Versioned {
+				fi.VersionID = mustGetUUID()
+				if opts.VersionID != "" {
+					fi.VersionID = opts.VersionID
+				}
+			}
+
+			// versioning suspended means we add `null`
+			// version as delete marker
+			// Add delete marker, since we don't have any version specified explicitly.
+			// Or if a particular version id needs to be replicated.
+			if err = fs.disk.DeleteVersion(ctx, bucket, object, fi, opts.DeleteMarker); err != nil {
+				return objInfo, toObjectErr(err, bucket, object)
+			}
+			return fi.ToObjectInfo(bucket, object), nil
 		}
+	}
+
+	// Delete the object version on all disks.
+	if err = fs.disk.DeleteVersion(ctx, bucket, object, FileInfo{
+		Name:                          object,
+		VersionID:                     opts.VersionID,
+		MarkDeleted:                   markDelete,
+		Deleted:                       deleteMarker,
+		ModTime:                       modTime,
+		DeleteMarkerReplicationStatus: opts.DeleteMarkerReplicationStatus,
+		VersionPurgeStatus:            opts.VersionPurgeStatus,
+		TransitionStatus:              opts.Transition.Status,
+		ExpireRestored:                opts.Transition.ExpireRestored,
+	}, opts.DeleteMarker); err != nil {
 		return objInfo, toObjectErr(err, bucket, object)
 	}
 
-	// Close fsMetaPath before deletion
-	if rwlk != nil {
-		rwlk.Close()
-	}
-
-	if bucket != minioMetaBucket {
-		// Delete the metadata object.
-		err = fsDeleteFile(ctx, minioMetaBucketDir, fsMetaPath)
-		if err != nil && err != errFileNotFound {
-			return objInfo, toObjectErr(err, bucket, object)
-		}
-	}
-	return ObjectInfo{Bucket: bucket, Name: object}, nil
-}
-
-func (fs *FSObjects) isLeafDir(bucket string, leafPath string) bool {
-	return fs.isObjectDir(bucket, leafPath)
-}
-
-func (fs *FSObjects) isLeaf(bucket string, leafPath string) bool {
-	return !strings.HasSuffix(leafPath, slashSeparator)
-}
-
-// Returns function "listDir" of the type listDirFunc.
-// isLeaf - is used by listDir function to check if an entry
-// is a leaf or non-leaf entry.
-func (fs *FSObjects) listDirFactory() ListDirFunc {
-	// listDir - lists all the entries at a given prefix and given entry in the prefix.
-	listDir := func(bucket, prefixDir, prefixEntry string) (emptyDir bool, entries []string, delayIsLeaf bool) {
-		var err error
-		entries, err = readDir(pathJoin(fs.fsPath, bucket, prefixDir))
-		if err != nil && err != errFileNotFound {
-			logger.LogIf(GlobalContext, err)
-			return false, nil, false
-		}
-		if len(entries) == 0 {
-			return true, nil, false
-		}
-		entries, delayIsLeaf = filterListEntries(bucket, prefixDir, entries, prefixEntry, fs.isLeaf)
-		return false, entries, delayIsLeaf
-	}
-
-	// Return list factory instance.
-	return listDir
-}
-
-// isObjectDir returns true if the specified bucket & prefix exists
-// and the prefix represents an empty directory. An S3 empty directory
-// is also an empty directory in the FS backend.
-func (fs *FSObjects) isObjectDir(bucket, prefix string) bool {
-	entries, err := readDirN(pathJoin(fs.fsPath, bucket, prefix), 1)
-	if err != nil {
-		return false
-	}
-	return len(entries) == 0
+	return ObjectInfo{
+		Bucket:             bucket,
+		Name:               object,
+		VersionID:          opts.VersionID,
+		VersionPurgeStatus: opts.VersionPurgeStatus,
+		ReplicationStatus:  replication.StatusType(opts.DeleteMarkerReplicationStatus),
+	}, nil
 }
 
 // ListObjectVersions not implemented for FS mode.
@@ -1310,14 +1324,128 @@ func (fs *FSObjects) ListObjectVersions(ctx context.Context, bucket, prefix, mar
 
 // ListObjects - list all objects at prefix upto maxKeys., optionally delimited by '/'. Maintains the list pool
 // state for future re-entrant list requests.
-func (fs *FSObjects) ListObjects(ctx context.Context, bucket, prefix, marker, delimiter string, maxKeys int) (loi ListObjectsInfo, e error) {
+func (fs *FSObjects) ListObjects(ctx context.Context, bucket, prefix, marker, delimiter string, maxKeys int) (ListObjectsInfo, error) {
 	atomic.AddInt64(&fs.activeIOCount, 1)
 	defer func() {
 		atomic.AddInt64(&fs.activeIOCount, -1)
 	}()
 
-	return listObjects(ctx, fs, bucket, prefix, marker, delimiter, maxKeys, fs.listPool,
-		fs.listDirFactory(), fs.isLeaf, fs.isLeafDir, fs.getObjectInfoNoFSLock, fs.getObjectInfoNoFSLock)
+	// Default is recursive, if delimiter is set then list non recursive.
+	recursive := true
+	if delimiter == SlashSeparator {
+		recursive = false
+	}
+	opts := listPathOptions{
+		Bucket:             bucket,
+		Prefix:             prefix,
+		Separator:          delimiter,
+		Limit:              maxKeysPlusOne(maxKeys, marker != ""),
+		Marker:             marker,
+		Recursive:          recursive,
+		InclDeleted:        false,
+		IncludeDirectories: delimiter == SlashSeparator,
+	}
+
+	entries, err := fs.fsListObjects(ctx, opts)
+
+	var eof bool
+	if err != nil {
+		if err == io.EOF {
+			eof = true
+		} else {
+			return ListObjectsInfo{}, err
+		}
+	}
+
+	if opts.Limit > 0 && entries.len() > opts.Limit {
+		entries.truncate(opts.Limit)
+		eof = false
+	}
+
+	if opts.Marker != "" && len(entries.o) > 0 && entries.o[0].name == opts.Marker {
+		entries.o = entries.o[1:]
+	}
+
+	objInfos := entries.fileInfos(bucket, prefix, delimiter)
+
+	result := ListObjectsInfo{}
+	for _, objInfo := range objInfos {
+		if objInfo.IsDir && opts.Separator != "" {
+			result.Prefixes = append(result.Prefixes, objInfo.Name)
+			continue
+		}
+		result.Objects = append(result.Objects, objInfo)
+	}
+
+	if !eof && len(objInfos) > 0 {
+		result.IsTruncated = true
+		if len(objInfos) > 0 {
+			result.NextMarker = objInfos[len(objInfos)-1].Name
+		}
+	}
+
+	return result, nil
+}
+
+func (fs *FSObjects) fsListObjects(ctx context.Context, opts listPathOptions) (metaCacheEntriesSorted, error) {
+	var m metaCacheEntriesSorted
+
+	// Cancel upstream if we finish before we expect.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	if err := checkListObjsArgs(ctx, opts.Bucket, opts.Prefix, opts.Marker, fs); err != nil {
+		return m, err
+	}
+
+	// Marker is set validate pre-condition.
+	if opts.Marker != "" && opts.Prefix != "" {
+		// Marker not common with prefix is not implemented. Send an empty response
+		if !HasPrefix(opts.Marker, opts.Prefix) {
+			return m, io.EOF
+		}
+	}
+
+	// With max keys of zero we have reached eof, return right here.
+	if opts.Limit == 0 {
+		return m, io.EOF
+	}
+
+	// For delimiter and prefix as '/' we do not list anything at all
+	// since according to s3 spec we stop at the 'delimiter'
+	// along // with the prefix. On a flat namespace with 'prefix'
+	// as '/' we don't have any entries, since all the keys are
+	// of form 'keyName/...'
+	if opts.Separator == SlashSeparator && opts.Prefix == SlashSeparator {
+		return m, io.EOF
+	}
+
+	r, w := io.Pipe()
+	metaR := newMetacacheReader(r)
+
+	// Make sure we close the pipe so blocked writes doesn't stay around.
+	defer r.CloseWithError(context.Canceled)
+
+	opts.BaseDir = baseDirFromPrefix(opts.Prefix)
+	opts.SetFilter()
+	go func() {
+		werr := fs.disk.WalkDir(ctx, WalkDirOptions{
+			Bucket:         opts.Bucket,
+			BaseDir:        opts.BaseDir,
+			Recursive:      opts.Recursive,
+			ReportNotFound: false,
+			FilterPrefix:   opts.FilterPrefix,
+		}, w)
+		w.CloseWithError(werr)
+		if werr != io.EOF && werr != nil &&
+			werr.Error() != errFileNotFound.Error() &&
+			werr.Error() != errVolumeNotFound.Error() &&
+			!errors.Is(werr, context.Canceled) {
+			logger.LogIf(ctx, werr)
+		}
+	}()
+
+	return metaR.filter(opts)
 }
 
 // GetObjectTags - get object tags from an existing object
@@ -1329,7 +1457,8 @@ func (fs *FSObjects) GetObjectTags(ctx context.Context, bucket, object string, o
 			VersionID: opts.VersionID,
 		}
 	}
-	oi, err := fs.GetObjectInfo(ctx, bucket, object, ObjectOptions{})
+
+	oi, err := fs.GetObjectInfo(ctx, bucket, object, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -1347,44 +1476,47 @@ func (fs *FSObjects) PutObjectTags(ctx context.Context, bucket, object string, t
 		}
 	}
 
-	fsMetaPath := pathJoin(fs.fsPath, minioMetaBucket, bucketMetaPrefix, bucket, object, fs.metaJSONFile)
-	fsMeta := fsMetaV1{}
-	wlk, err := fs.rwPool.Write(fsMetaPath)
-	if err != nil {
-		wlk, err = fs.rwPool.Create(fsMetaPath)
-		if err != nil {
-			logger.LogIf(ctx, err)
-			return ObjectInfo{}, toObjectErr(err, bucket, object)
-		}
-	}
-	// This close will allow for locks to be synchronized on `fs.json`.
-	defer wlk.Close()
-
-	// Read objects' metadata in `fs.json`.
-	if _, err = fsMeta.ReadFrom(ctx, wlk); err != nil {
-		// For any error to read fsMeta, set default ETag and proceed.
-		fsMeta = fs.defaultFsJSON(object)
-	}
-
-	// clean fsMeta.Meta of tag key, before updating the new tags
-	delete(fsMeta.Meta, xhttp.AmzObjectTagging)
-
-	// Do not update for empty tags
-	if tags != "" {
-		fsMeta.Meta[xhttp.AmzObjectTagging] = tags
-	}
-
-	if _, err = fsMeta.WriteTo(wlk); err != nil {
-		return ObjectInfo{}, toObjectErr(err, bucket, object)
-	}
-
-	// Stat the file to get file size.
-	fi, err := fsStatFile(ctx, pathJoin(fs.fsPath, bucket, object))
+	var err error
+	// Lock the object before updating tags.
+	lk := fs.NewNSLock(bucket, object)
+	lkctx, err := lk.GetLock(ctx, globalOperationTimeout)
 	if err != nil {
 		return ObjectInfo{}, err
 	}
+	defer lk.Unlock(lkctx.Cancel)
+	ctx = lkctx.Context()
 
-	return fsMeta.ToObjectInfo(bucket, object, fi), nil
+	ctx, cleanup, err := fs.disk.ContextWithMetaLock(ctx, writeLock, bucket, object)
+	if err != nil {
+		return ObjectInfo{}, toObjectErr(err, bucket, object)
+	}
+
+	defer func() {
+		cleanup(err)
+	}()
+
+	fi, err := fs.disk.ReadVersion(ctx, bucket, object, opts.VersionID, false)
+	if err != nil {
+		return ObjectInfo{}, toObjectErr(err, bucket, object)
+	}
+
+	if fi.Deleted {
+		if opts.VersionID == "" {
+			return ObjectInfo{}, toObjectErr(errFileNotFound, bucket, object)
+		}
+		return ObjectInfo{}, toObjectErr(errMethodNotAllowed, bucket, object)
+	}
+
+	fi.Metadata[xhttp.AmzObjectTagging] = tags
+	for k, v := range opts.UserDefined {
+		fi.Metadata[k] = v
+	}
+
+	if err = fs.disk.UpdateMetadata(ctx, bucket, object, fi); err != nil {
+		return ObjectInfo{}, toObjectErr(err, bucket, object)
+	}
+
+	return fi.ToObjectInfo(bucket, object), nil
 }
 
 // DeleteObjectTags - delete object tags from an existing object
@@ -1415,7 +1547,61 @@ func (fs *FSObjects) HealBucket(ctx context.Context, bucket string, opts madmin.
 // error walker returns error. Optionally if context.Done() is received
 // then Walk() stops the walker.
 func (fs *FSObjects) Walk(ctx context.Context, bucket, prefix string, results chan<- ObjectInfo, opts ObjectOptions) error {
-	return fsWalk(ctx, fs, bucket, prefix, fs.listDirFactory(), fs.isLeaf, fs.isLeafDir, results, fs.getObjectInfoNoFSLock, fs.getObjectInfoNoFSLock)
+	if err := checkListObjsArgs(ctx, bucket, prefix, "", fs); err != nil {
+		// Upon error close the channel.
+		close(results)
+		return err
+	}
+
+	if opts.WalkVersions {
+		go func() {
+			defer close(results)
+
+			var marker, versionIDMarker string
+			for {
+				loi, err := fs.ListObjectVersions(ctx, bucket, prefix, marker, versionIDMarker, "", 1000)
+				if err != nil {
+					break
+				}
+
+				for _, obj := range loi.Objects {
+					results <- obj
+				}
+
+				if !loi.IsTruncated {
+					break
+				}
+
+				marker = loi.NextMarker
+				versionIDMarker = loi.NextVersionIDMarker
+			}
+		}()
+		return nil
+	}
+
+	go func() {
+		defer close(results)
+
+		var marker string
+		for {
+			loi, err := fs.ListObjects(ctx, bucket, prefix, marker, "", 1000)
+			if err != nil {
+				break
+			}
+
+			for _, obj := range loi.Objects {
+				results <- obj
+			}
+
+			if !loi.IsTruncated {
+				break
+			}
+
+			marker = loi.NextMarker
+		}
+	}()
+
+	return nil
 }
 
 // HealObjects - no-op for fs. Valid only for Erasure.
@@ -1479,7 +1665,7 @@ func (fs *FSObjects) IsTaggingSupported() bool {
 
 // Health returns health of the object layer
 func (fs *FSObjects) Health(ctx context.Context, opts HealthOptions) HealthResult {
-	if _, err := os.Stat(fs.fsPath); err != nil {
+	if _, err := fs.disk.StatVol(ctx, minioMetaBucket); err != nil {
 		return HealthResult{}
 	}
 	return HealthResult{
@@ -1489,7 +1675,7 @@ func (fs *FSObjects) Health(ctx context.Context, opts HealthOptions) HealthResul
 
 // ReadHealth returns "read" health of the object layer
 func (fs *FSObjects) ReadHealth(ctx context.Context) bool {
-	_, err := os.Stat(fs.fsPath)
+	_, err := fs.disk.StatVol(ctx, minioMetaBucket)
 	return err == nil
 }
 

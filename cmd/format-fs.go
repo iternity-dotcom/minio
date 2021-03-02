@@ -23,7 +23,6 @@ import (
 	"io"
 	"math/rand"
 	"os"
-	"path"
 	"time"
 
 	"github.com/minio/minio/internal/config"
@@ -99,7 +98,7 @@ func formatFSGetVersion(r io.ReadSeeker) (string, error) {
 
 // Migrate from V1 to V2. V2 implements new backend format for multipart
 // uploads. Delete the previous multipart directory.
-func formatFSMigrateV1ToV2(ctx context.Context, wlk *lock.LockedFile, fsPath string) error {
+func formatFSMigrateV1ToV2(ctx context.Context, wlk *lock.LockedFile, disk StorageAPI) error {
 	version, err := formatFSGetVersion(wlk)
 	if err != nil {
 		return err
@@ -109,11 +108,11 @@ func formatFSMigrateV1ToV2(ctx context.Context, wlk *lock.LockedFile, fsPath str
 		return fmt.Errorf(`format.json version expected %s, found %s`, formatFSVersionV1, version)
 	}
 
-	if err = fsRemoveAll(ctx, path.Join(fsPath, minioMetaMultipartBucket)); err != nil {
+	if err = disk.DeleteVol(ctx, minioMetaMultipartBucket, true); err != nil {
 		return err
 	}
 
-	if err = os.MkdirAll(path.Join(fsPath, minioMetaMultipartBucket), 0755); err != nil {
+	if err = disk.MakeVol(ctx, minioMetaMultipartBucket); err != nil {
 		return err
 	}
 
@@ -133,7 +132,7 @@ func formatFSMigrateV1ToV2(ctx context.Context, wlk *lock.LockedFile, fsPath str
 // Migration should happen when formatFSV1.FS.Version changes. This version
 // can change when there is a change to the struct formatFSV1.FS or if there
 // is any change in the backend file system tree structure.
-func formatFSMigrate(ctx context.Context, wlk *lock.LockedFile, fsPath string) error {
+func formatFSMigrate(ctx context.Context, wlk *lock.LockedFile, disk StorageAPI) error {
 	// Add any migration code here in case we bump format.FS.Version
 	version, err := formatFSGetVersion(wlk)
 	if err != nil {
@@ -142,7 +141,7 @@ func formatFSMigrate(ctx context.Context, wlk *lock.LockedFile, fsPath string) e
 
 	switch version {
 	case formatFSVersionV1:
-		if err = formatFSMigrateV1ToV2(ctx, wlk, fsPath); err != nil {
+		if err = formatFSMigrateV1ToV2(ctx, wlk, disk); err != nil {
 			return err
 		}
 		fallthrough
@@ -188,8 +187,8 @@ func createFormatFS(fsFormatPath string) error {
 // The file descriptor should be kept open throughout the life
 // of the process so that another minio process does not try to
 // migrate the backend when we are actively working on the backend.
-func initFormatFS(ctx context.Context, fsPath string) (rlk *lock.RLockedFile, err error) {
-	fsFormatPath := pathJoin(fsPath, minioMetaBucket, formatConfigFile)
+func initFormatFS(ctx context.Context, disk StorageAPI) (rlk *lock.RLockedFile, err error) {
+	fsFormatPath := pathJoin(disk.String(), minioMetaBucket, formatConfigFile)
 
 	// Add a deployment ID, if it does not exist.
 	if err := formatFSFixDeploymentID(ctx, fsFormatPath); err != nil {
@@ -262,7 +261,7 @@ func initFormatFS(ctx context.Context, fsPath string) (rlk *lock.RLockedFile, er
 			if err != nil {
 				return nil, err
 			}
-			err = formatFSMigrate(ctx, wlk, fsPath)
+			err = formatFSMigrate(ctx, wlk, disk)
 			wlk.Close()
 			if err != nil {
 				// Migration failed, bail out so that the user can observe what happened.
@@ -289,7 +288,7 @@ func formatFSGetDeploymentID(rlk *lock.RLockedFile) (id string, err error) {
 	return format.ID, nil
 }
 
-// Generate a deployment ID if one does not exist already.
+// Generate a deployment ID if a non-empty fsFormat file without deployment ID exists.
 func formatFSFixDeploymentID(ctx context.Context, fsFormatPath string) error {
 	rlk, err := lock.RLockedOpenFile(fsFormatPath)
 	if err == nil {

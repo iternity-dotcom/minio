@@ -196,6 +196,10 @@ type folderScanner struct {
 	lastUpdate time.Time
 }
 
+type diskPool interface {
+	GetDisksID(ids ...string) []StorageAPI
+}
+
 // Cache structure and compaction:
 //
 // A cache structure will be kept with a tree of usages.
@@ -269,9 +273,9 @@ func scanDataFolder(ctx context.Context, basePath string, cache dataUsageCache, 
 
 	// Add disks for set healing.
 	if len(cache.Disks) > 0 {
-		objAPI, ok := newObjectLayerFn().(*erasureServerPools)
+		diskPool, ok := newObjectLayerFn().(diskPool)
 		if ok {
-			s.disks = objAPI.GetDisksID(cache.Disks...)
+			s.disks = diskPool.GetDisksID(cache.Disks...)
 			if len(s.disks) != len(cache.Disks) {
 				console.Debugf(logPrefix+"Missing disks, want %d, found %d. Cannot heal. %s\n", len(cache.Disks), len(s.disks), logSuffix)
 				s.disks = s.disks[:0]

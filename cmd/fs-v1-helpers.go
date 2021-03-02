@@ -273,6 +273,33 @@ func fsOpenFile(ctx context.Context, readPath string, offset int64) (io.ReadClos
 	return fr, st.Size(), nil
 }
 
+func createFile(filePath string, mode int) (f *os.File, err error) {
+	// Create top level directories if they don't exist.
+	// with mode 0777 mkdir honors system umask.
+	if err = mkdirAll(pathutil.Dir(filePath), 0777); err != nil {
+		return nil, osErrToFileErr(err)
+	}
+
+	w, err := OpenFile(filePath, mode, 0666)
+	if err != nil {
+		// File path cannot be verified since one of the parents is a file.
+		switch {
+		case isSysErrIsDir(err):
+			return nil, errIsNotRegular
+		case osIsPermission(err):
+			return nil, errFileAccessDenied
+		case isSysErrIO(err):
+			return nil, errFaultyDisk
+		case isSysErrTooManyFiles(err):
+			return nil, errTooManyOpenFiles
+		default:
+			return nil, err
+		}
+	}
+
+	return w, nil
+}
+
 // Creates a file and copies data from incoming reader.
 func fsCreateFile(ctx context.Context, filePath string, reader io.Reader, fallocSize int64) (int64, error) {
 	if filePath == "" || reader == nil {

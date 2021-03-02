@@ -18,6 +18,9 @@
 package cmd
 
 import (
+	"context"
+	"io"
+	"io/fs"
 	"os"
 	pathutil "path"
 	"sync"
@@ -31,6 +34,99 @@ import (
 type fsIOPool struct {
 	sync.Mutex
 	readersMap map[string]*lock.RLockedFile
+}
+
+type truncatingFileWriter interface {
+	FileWriter
+	Truncate(int64) error
+}
+
+// FileWriter is a wrapper interface, which mimics *os.File
+type FileWriter interface {
+	io.ReadWriteSeeker
+	io.ReaderAt
+	io.Closer
+	Fd() uintptr
+	Stat() (fs.FileInfo, error)
+}
+
+type lockPaths struct {
+	volume   string
+	object   string
+	lockPath string
+}
+
+func (lp *lockPaths) Volume() string {
+	return lp.volume
+}
+
+func (lp *lockPaths) Object() string {
+	return lp.object
+}
+
+func (lp *lockPaths) LockPath() string {
+	return lp.lockPath
+}
+
+type rwLock struct {
+	*lockPaths
+	*lock.LockedFile
+}
+
+func (l *rwLock) Close() error {
+	return nil
+}
+func (l *rwLock) LockType() LockType {
+	return writeLock
+}
+
+type rLock struct {
+	*lockPaths
+	*lock.RLockedFile
+}
+
+func (l *rLock) Close() error {
+	return nil
+}
+func (l *rLock) LockType() LockType {
+	return readLock
+}
+
+type nLock struct {
+	*lockPaths
+}
+
+func (l *nLock) LockType() LockType {
+	return noLock
+}
+
+type metaLock interface {
+	Volume() string
+	Object() string
+	LockPath() string
+	LockType() LockType
+}
+type locks map[string]metaLock
+
+func getLocks(ctx context.Context) locks {
+	var l interface{}
+	var fl locks
+	var ok bool
+	if l = ctx.Value(objectLock); l == nil {
+		return nil
+	}
+
+	if fl, ok = l.(locks); !ok {
+		return nil
+	}
+	return fl
+}
+
+type storageFunctions interface {
+	getLockPath(volume string, path string) (string, string, error)
+	checkPathInObject(path string, object string) bool
+	getVolDir(volume string) (string, error)
+	deleteFile(volDir string, filePath string, recurse bool) error
 }
 
 // lookupToRead - looks up an fd from readers map and
@@ -227,4 +323,277 @@ func (fsi *fsIOPool) Close(path string) error {
 
 	// Success.
 	return nil
+}
+
+func (ls locks) metaLocker(s storageFunctions, volume string, path string, flag int, perm os.FileMode) (FileWriter, error) {
+
+	readLock := false
+	metaVolDir, err := s.getVolDir(minioMetaBucket)
+	if err != nil {
+		return nil, err
+	}
+
+	volDir, err := s.getVolDir(volume)
+	if err != nil {
+		return nil, err
+	}
+	fsPath := pathJoin(volDir, path)
+
+	var f FileWriter
+	if flag&os.O_WRONLY == 0 && flag&os.O_RDWR == 0 {
+		readLock = true
+		f, err = ls.rMetaLocker(s, fsPath, volume, path, flag, perm)
+	} else {
+		f, err = ls.rwMetaLocker(s, fsPath, volume, path, flag, perm)
+	}
+
+	if err != nil {
+		return nil, err
+	}
+	if f != nil {
+		return f, nil
+	}
+
+	// it is in the meta bucket, but it is not in the meta path
+	if ls == nil || (HasPrefix(fsPath, metaVolDir) && !HasPrefix(fsPath, pathJoin(metaVolDir, bucketMetaPrefix))) {
+		if readLock {
+			return OpenFile(pathJoin(volDir, path), flag, perm)
+		}
+		return createFile(pathJoin(volDir, path), flag)
+	}
+	return nil, errFileNotFound
+}
+
+func (ls locks) rMetaLocker(s storageFunctions, fsPath string, volume string, path string, flag int, perm os.FileMode) (FileWriter, error) {
+	if l, ok := ls[fsPath]; ok {
+		if l.LockType() == writeLock || l.LockType() == readLock {
+
+			rl, ok := l.(FileWriter)
+			if !ok {
+				return nil, errInvalidArgument
+			}
+
+			return rl, nil
+
+		} else if l.LockType() == noLock {
+
+			return OpenFile(fsPath, flag, perm)
+		}
+
+		return nil, errInvalidArgument
+	}
+
+	for _, l := range ls {
+		if l.Volume() == volume && s.checkPathInObject(path, l.Object()) {
+			return OpenFile(fsPath, flag, perm)
+		}
+	}
+	return nil, nil
+}
+
+func (ls locks) rwMetaLocker(s storageFunctions, fsPath string, volume string, path string, flag int, perm os.FileMode) (FileWriter, error) {
+
+	truncate := false
+	append := false
+	if (flag & os.O_TRUNC) > 0 {
+		truncate = true
+	}
+	if (flag & os.O_APPEND) > 0 {
+		append = true
+	}
+
+	if l, ok := ls[fsPath]; ok {
+		if l.LockType() == writeLock {
+			flag = flag | os.O_SYNC
+			wl, ok := l.(truncatingFileWriter)
+			if !ok {
+				return nil, errInvalidArgument
+			}
+			if truncate {
+				wl.Seek(0, io.SeekStart)
+				wl.Truncate(0)
+			} else if append {
+				wl.Seek(0, io.SeekEnd)
+			} else {
+				wl.Seek(0, io.SeekStart)
+			}
+
+			return wl, nil
+		}
+
+		return nil, errInvalidArgument
+	}
+
+	for _, l := range ls {
+		if l.LockType() != writeLock {
+			continue
+		}
+
+		if l.Volume() == volume && s.checkPathInObject(path, l.Object()) {
+			return createFile(fsPath, flag)
+		}
+	}
+
+	return nil, nil
+}
+
+func (fsi *fsIOPool) newNMetaLock(s storageFunctions, volume string, paths ...string) (locks, func(err ...error), error) {
+
+	fLocks := make(locks, len(paths))
+	errs := make([]error, len(paths))
+	cleanups := make([]func(error), len(paths))
+	cleanup := func(errs ...error) {
+		for i, cleanupFunction := range cleanups {
+			if cleanupFunction != nil {
+				cleanupFunction(errs[i])
+			}
+		}
+	}
+	for i, path := range paths {
+		if HasSuffix(path, slashSeparator) {
+			continue
+		}
+		lockVolDir, lockFile, err := s.getLockPath(volume, path)
+		if err != nil {
+			errs[i] = err
+			cleanup(errs...)
+			return nil, nil, err
+		}
+		lockPath := pathJoin(lockVolDir, lockFile)
+
+		if _, ok := fLocks[lockPath]; ok {
+			continue
+		}
+		fLocks[lockPath] = &nLock{
+			lockPaths: &lockPaths{
+				volume:   volume,
+				object:   path,
+				lockPath: lockPath,
+			},
+		}
+		cleanups[i] = func(err error) {}
+	}
+
+	return fLocks, cleanup, nil
+}
+
+func (fsi *fsIOPool) newRMetaLock(s storageFunctions, volume string, paths ...string) (locks, func(err ...error), error) {
+
+	fLocks := make(locks, len(paths))
+	errs := make([]error, len(paths))
+	cleanups := make([]func(error), len(paths))
+	cleanup := func(errs ...error) {
+		for i, cleanupFunction := range cleanups {
+			if cleanupFunction != nil {
+				cleanupFunction(errs[i])
+			}
+		}
+	}
+	for i, path := range paths {
+		if HasSuffix(path, slashSeparator) {
+			continue
+		}
+		lockVolDir, lockFile, err := s.getLockPath(volume, path)
+		if err != nil {
+			errs[i] = err
+			cleanup(errs...)
+			return nil, nil, err
+		}
+		lockPath := pathJoin(lockVolDir, lockFile)
+
+		if _, ok := fLocks[lockPath]; ok {
+			continue
+		}
+		var rlk *lock.RLockedFile
+		rlk, err = fsi.Open(lockPath)
+		if err != nil {
+			if err == errFileNotFound {
+				fLocks[lockPath] = &nLock{
+					lockPaths: &lockPaths{
+						volume:   volume,
+						object:   path,
+						lockPath: lockPath,
+					},
+				}
+				cleanups[i] = func(err error) {}
+			} else {
+				errs[i] = err
+				cleanup(errs...)
+				return nil, nil, err
+			}
+		} else {
+			fLocks[lockPath] = &rLock{
+				lockPaths: &lockPaths{
+					volume:   volume,
+					object:   path,
+					lockPath: lockPath,
+				},
+				RLockedFile: rlk,
+			}
+			cleanups[i] = func(err error) {
+				fsi.Close(lockPath)
+
+			}
+		}
+
+	}
+	return fLocks, cleanup, nil
+}
+
+func (fsi *fsIOPool) newRWMetaLock(s storageFunctions, volume string, paths ...string) (locks, func(err ...error), error) {
+
+	fLocks := make(locks, len(paths))
+	errs := make([]error, len(paths))
+	cleanups := make([]func(error), len(paths))
+	cleanup := func(errs ...error) {
+		for i, cleanupFunction := range cleanups {
+			if cleanupFunction != nil {
+				cleanupFunction(errs[i])
+			}
+		}
+	}
+	for i, path := range paths {
+		if HasSuffix(path, slashSeparator) {
+			continue
+		}
+		lockVolDir, lockFile, err := s.getLockPath(volume, path)
+		if err != nil {
+			errs[i] = err
+			cleanup(errs...)
+			return nil, nil, err
+		}
+		lockPath := pathJoin(lockVolDir, lockFile)
+
+		if _, ok := fLocks[lockPath]; ok {
+			continue
+		}
+		var wlk *lock.LockedFile
+		wlk, err = fsi.Write(lockPath)
+		var freshFile bool
+		if err != nil {
+			wlk, err = fsi.Create(lockPath)
+			if err != nil {
+				errs[i] = err
+				cleanup(errs...)
+				return nil, nil, err
+			}
+			freshFile = true
+		}
+		fLocks[lockPath] = &rwLock{
+			lockPaths: &lockPaths{
+				volume:   volume,
+				object:   path,
+				lockPath: lockPath,
+			},
+			LockedFile: wlk,
+		}
+		cleanups[i] = func(err error) {
+			wlk.Close()
+			if err != nil && freshFile {
+				s.deleteFile(lockVolDir, lockPath, true)
+			}
+		}
+	}
+
+	return fLocks, cleanup, nil
 }

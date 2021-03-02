@@ -357,10 +357,10 @@ func TestFSListBuckets(t *testing.T) {
 	}
 
 	// Create a bucket with invalid name
-	if err := os.MkdirAll(pathJoin(fs.fsPath, "vo^"), 0777); err != nil {
+	if err := os.MkdirAll(pathJoin(fs.disk.String(), "vo^"), 0777); err != nil {
 		t.Fatal("Unexpected error: ", err)
 	}
-	f, err := os.Create(pathJoin(fs.fsPath, "test"))
+	f, err := os.Create(pathJoin(fs.disk.String(), "test"))
 	if err != nil {
 		t.Fatal("Unexpected error: ", err)
 	}

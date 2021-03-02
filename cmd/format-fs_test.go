@@ -27,16 +27,14 @@ import (
 // TestFSFormatFS - tests initFormatFS, formatMetaGetFormatBackendFS, formatFSGetVersion.
 func TestFSFormatFS(t *testing.T) {
 	// Prepare for testing
-	disk := filepath.Join(globalTestTmpDir, "minio-"+nextSuffix())
-	defer os.RemoveAll(disk)
+	fsPath := filepath.Join(globalTestTmpDir, "minio-"+nextSuffix())
+	defer os.RemoveAll(fsPath)
 
-	fsFormatPath := pathJoin(disk, minioMetaBucket, formatConfigFile)
+	fsFormatPath := pathJoin(fsPath, minioMetaBucket, formatConfigFile)
 
-	// Assign a new UUID.
-	uuid := mustGetUUID()
-
-	// Initialize meta volume, if volume already exists ignores it.
-	if err := initMetaVolumeFS(disk, uuid); err != nil {
+	var err error
+	disk, err := newLocalFSV1Storage(fsPath)
+	if err != nil {
 		t.Fatal(err)
 	}
 

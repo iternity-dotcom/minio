@@ -48,7 +48,7 @@ func TestRWPoolLongPath(t *testing.T) {
 // Tests all RWPool methods.
 func TestRWPool(t *testing.T) {
 	// create xlStorage test setup
-	_, path, err := newXLStorageTestSetup()
+	_, path, err := newFSStorageTestSetup()
 	if err != nil {
 		t.Fatalf("Unable to create xlStorage test setup, %s", err)
 	}

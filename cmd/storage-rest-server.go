@@ -50,7 +50,7 @@ var errDiskStale = errors.New("disk stale")
 
 // To abstract a disk over network.
 type storageRESTServer struct {
-	storage *xlStorage
+	storage StorageAPI
 }
 
 func (s *storageRESTServer) writeErrorResponse(w http.ResponseWriter, err error) {

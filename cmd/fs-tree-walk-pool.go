@@ -26,7 +26,6 @@ import (
 
 // Global lookup timeout.
 const (
-	globalLookupTimeout    = time.Minute * 30 // 30minutes.
 	treeWalkEntryLimit     = 50
 	treeWalkSameEntryLimit = 4
 )

@@ -30,7 +30,7 @@ import (
 
 func TestFSRenameFile(t *testing.T) {
 	// create xlStorage test setup
-	_, path, err := newXLStorageTestSetup()
+	_, path, err := newFSStorageTestSetup()
 	if err != nil {
 		t.Fatalf("Unable to create xlStorage test setup, %s", err)
 	}
@@ -55,7 +55,7 @@ func TestFSRenameFile(t *testing.T) {
 
 func TestFSStats(t *testing.T) {
 	// create xlStorage test setup
-	_, path, err := newXLStorageTestSetup()
+	_, path, err := newFSStorageTestSetup()
 	if err != nil {
 		t.Fatalf("Unable to create xlStorage test setup, %s", err)
 	}
@@ -183,7 +183,7 @@ func TestFSStats(t *testing.T) {
 
 func TestFSCreateAndOpen(t *testing.T) {
 	// Setup test environment.
-	_, path, err := newXLStorageTestSetup()
+	_, path, err := newFSStorageTestSetup()
 	if err != nil {
 		t.Fatalf("Unable to create xlStorage test setup, %s", err)
 	}
@@ -248,7 +248,7 @@ func TestFSCreateAndOpen(t *testing.T) {
 
 func TestFSDeletes(t *testing.T) {
 	// create xlStorage test setup
-	_, path, err := newXLStorageTestSetup()
+	_, path, err := newFSStorageTestSetup()
 	if err != nil {
 		t.Fatalf("Unable to create xlStorage test setup, %s", err)
 	}
@@ -350,7 +350,7 @@ func TestFSDeletes(t *testing.T) {
 
 func BenchmarkFSDeleteFile(b *testing.B) {
 	// create xlStorage test setup
-	_, path, err := newXLStorageTestSetup()
+	_, path, err := newFSStorageTestSetup()
 	if err != nil {
 		b.Fatalf("Unable to create xlStorage test setup, %s", err)
 	}
@@ -384,7 +384,7 @@ func BenchmarkFSDeleteFile(b *testing.B) {
 // Tests fs removes.
 func TestFSRemoves(t *testing.T) {
 	// create xlStorage test setup
-	_, path, err := newXLStorageTestSetup()
+	_, path, err := newFSStorageTestSetup()
 	if err != nil {
 		t.Fatalf("Unable to create xlStorage test setup, %s", err)
 	}
@@ -501,7 +501,7 @@ func TestFSRemoves(t *testing.T) {
 
 func TestFSRemoveMeta(t *testing.T) {
 	// create xlStorage test setup
-	_, fsPath, err := newXLStorageTestSetup()
+	_, fsPath, err := newFSStorageTestSetup()
 	if err != nil {
 		t.Fatalf("Unable to create xlStorage test setup, %s", err)
 	}

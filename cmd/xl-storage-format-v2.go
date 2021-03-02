@@ -127,7 +127,8 @@ const (
 	ObjectType         VersionType = 1
 	DeleteType         VersionType = 2
 	LegacyType         VersionType = 3
-	lastVersionType    VersionType = 4
+	FSType             VersionType = 4
+	lastVersionType    VersionType = 5
 )
 
 func (e VersionType) valid() bool {
@@ -223,6 +224,9 @@ func (j xlMetaV2Version) Valid() bool {
 			j.ObjectV2.ErasureAlgorithm.valid() &&
 			j.ObjectV2.BitrotChecksumAlgo.valid() &&
 			isXLMetaErasureInfoValid(j.ObjectV2.ErasureM, j.ObjectV2.ErasureN) &&
+			j.ObjectV2.ModTime > 0
+	case FSType:
+		return j.ObjectV2 != nil &&
 			j.ObjectV2.ModTime > 0
 	case DeleteType:
 		return j.DeleteMarker != nil &&
@@ -764,7 +768,7 @@ func (z *xlMetaV2) UpdateObjectVersion(fi FileInfo) error {
 			if version.ObjectV1.VersionID == fi.VersionID {
 				return errMethodNotAllowed
 			}
-		case ObjectType:
+		case ObjectType, FSType:
 			if version.ObjectV2.VersionID == uv {
 				for k, v := range fi.Metadata {
 					if strings.HasPrefix(strings.ToLower(k), ReservedMetadataPrefixLower) {
@@ -900,7 +904,7 @@ func (z *xlMetaV2) AddVersion(fi FileInfo) error {
 				z.Versions[i] = ventry
 				return nil
 			}
-		case ObjectType:
+		case ObjectType, FSType:
 			if version.ObjectV2.VersionID == uv {
 				z.Versions[i] = ventry
 				return nil
@@ -957,7 +961,15 @@ func (j *xlMetaV2Object) UsesDataDir() bool {
 	return isRestoredObjectOnDisk(j.MetaUser)
 }
 
+func (j xlMetaV2Object) ToFileInfoNoChecksum(volume, path string) (FileInfo, error) {
+	return j.toFileInfo(volume, path, false)
+}
+
 func (j xlMetaV2Object) ToFileInfo(volume, path string) (FileInfo, error) {
+	return j.toFileInfo(volume, path, true)
+}
+
+func (j xlMetaV2Object) toFileInfo(volume, path string, withChecksum bool) (FileInfo, error) {
 	versionID := ""
 	var uv uuid.UUID
 	// check if the version is not "null"
@@ -979,14 +991,16 @@ func (j xlMetaV2Object) ToFileInfo(volume, path string) (FileInfo, error) {
 		fi.Parts[i].ActualSize = j.PartActualSizes[i]
 	}
 	fi.Erasure.Checksums = make([]ChecksumInfo, len(j.PartSizes))
-	for i := range fi.Parts {
-		fi.Erasure.Checksums[i].PartNumber = fi.Parts[i].Number
-		switch j.BitrotChecksumAlgo {
-		case HighwayHash:
-			fi.Erasure.Checksums[i].Algorithm = HighwayHash256S
-			fi.Erasure.Checksums[i].Hash = []byte{}
-		default:
-			return FileInfo{}, fmt.Errorf("unknown BitrotChecksumAlgo: %v", j.BitrotChecksumAlgo)
+	if withChecksum {
+		for i := range fi.Parts {
+			fi.Erasure.Checksums[i].PartNumber = fi.Parts[i].Number
+			switch j.BitrotChecksumAlgo {
+			case HighwayHash:
+				fi.Erasure.Checksums[i].Algorithm = HighwayHash256S
+				fi.Erasure.Checksums[i].Hash = []byte{}
+			default:
+				return FileInfo{}, fmt.Errorf("unknown BitrotChecksumAlgo: %v", j.BitrotChecksumAlgo)
+			}
 		}
 	}
 	fi.Metadata = make(map[string]string, len(j.MetaUser)+len(j.MetaSys))
@@ -1062,7 +1076,7 @@ func (z *xlMetaV2) SharedDataDirCount(versionID [16]byte, dataDir [16]byte) int 
 	var sameDataDirCount int
 	for _, version := range z.Versions {
 		switch version.Type {
-		case ObjectType:
+		case ObjectType, FSType:
 			if version.ObjectV2.VersionID == versionID {
 				continue
 			}
@@ -1171,7 +1185,7 @@ func (z *xlMetaV2) DeleteVersion(fi FileInfo) (string, bool, error) {
 				}
 				return "", len(z.Versions) == 0, nil
 			}
-		case ObjectType:
+		case ObjectType, FSType:
 			if version.ObjectV2.VersionID == uv && updateVersion {
 				z.Versions[i].ObjectV2.MetaSys[VersionPurgeStatusKey] = []byte(fi.VersionPurgeStatus)
 				return "", len(z.Versions) == 0, nil
@@ -1184,7 +1198,7 @@ func (z *xlMetaV2) DeleteVersion(fi FileInfo) (string, bool, error) {
 			return "", false, errFileCorrupt
 		}
 		switch version.Type {
-		case ObjectType:
+		case ObjectType, FSType:
 			if version.ObjectV2.VersionID == uv {
 				switch {
 				case fi.ExpireRestored:
@@ -1225,7 +1239,7 @@ func (z xlMetaV2) TotalSize() int64 {
 	var total int64
 	for i := range z.Versions {
 		switch z.Versions[i].Type {
-		case ObjectType:
+		case ObjectType, FSType:
 			total += z.Versions[i].ObjectV2.Size
 		case LegacyType:
 			total += z.Versions[i].ObjectV1.Stat.Size
@@ -1250,6 +1264,8 @@ func (z xlMetaV2) ListVersions(volume, path string) ([]FileInfo, time.Time, erro
 		switch version.Type {
 		case ObjectType:
 			fi, err = version.ObjectV2.ToFileInfo(volume, path)
+		case FSType:
+			fi, err = version.ObjectV2.ToFileInfoNoChecksum(volume, path)
 		case DeleteType:
 			fi, err = version.DeleteMarker.ToFileInfo(volume, path)
 		case LegacyType:
@@ -1276,7 +1292,7 @@ func (z xlMetaV2) ListVersions(volume, path string) ([]FileInfo, time.Time, erro
 
 func getModTimeFromVersion(v xlMetaV2Version) time.Time {
 	switch v.Type {
-	case ObjectType:
+	case ObjectType, FSType:
 		return time.Unix(0, v.ObjectV2.ModTime)
 	case DeleteType:
 		return time.Unix(0, v.DeleteMarker.ModTime)
@@ -1323,6 +1339,8 @@ func (z xlMetaV2) ToFileInfo(volume, path, versionID string) (fi FileInfo, err e
 			switch orderedVersions[0].Type {
 			case ObjectType:
 				fi, err = orderedVersions[0].ObjectV2.ToFileInfo(volume, path)
+			case FSType:
+				fi, err = orderedVersions[0].ObjectV2.ToFileInfoNoChecksum(volume, path)
 			case DeleteType:
 				fi, err = orderedVersions[0].DeleteMarker.ToFileInfo(volume, path)
 			case LegacyType:
@@ -1342,6 +1360,12 @@ func (z xlMetaV2) ToFileInfo(volume, path, versionID string) (fi FileInfo, err e
 		case ObjectType:
 			if bytes.Equal(orderedVersions[i].ObjectV2.VersionID[:], uv[:]) {
 				fi, err = orderedVersions[i].ObjectV2.ToFileInfo(volume, path)
+				foundIndex = i
+				break
+			}
+		case FSType:
+			if bytes.Equal(orderedVersions[i].ObjectV2.VersionID[:], uv[:]) {
+				fi, err = orderedVersions[i].ObjectV2.ToFileInfoNoChecksum(volume, path)
 				foundIndex = i
 				break
 			}
