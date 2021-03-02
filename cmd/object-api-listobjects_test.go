@@ -1401,3 +1401,52 @@ func BenchmarkListObjects(b *testing.B) {
 		}
 	}
 }
+
+// Initialize FSXL backend for the benchmark.
+func initFSXLObjectsB(disk string, t *testing.B) (obj ObjectLayer) {
+	var err error
+	obj, err = NewFSXLObjectLayer(disk)
+	if err != nil {
+		t.Fatal("Unexpected err: ", err)
+	}
+	return obj
+}
+
+// BenchmarkXLListObjects - Run ListObject Repeatedly and benchmark.
+func BenchmarkXLListObjects(b *testing.B) {
+	// Make a temporary directory to use as the obj.
+	directory, err := ioutil.TempDir(globalTestTmpDir, "minio-list-benchmark")
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer os.RemoveAll(directory)
+
+	// Create the obj.
+	obj := initFSXLObjectsB(directory, b)
+
+	bucket := "ls-benchmark-bucket"
+	// Create a bucket.
+	err = obj.MakeBucketWithLocation(context.Background(), bucket, BucketOptions{})
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	// Insert objects to be listed and benchmarked later.
+	for i := 0; i < 20000; i++ {
+		key := "obj" + strconv.Itoa(i)
+		_, err = obj.PutObject(context.Background(), bucket, key, mustGetPutObjReader(b, bytes.NewBufferString(key), int64(len(key)), "", ""), ObjectOptions{})
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+
+	b.ResetTimer()
+
+	// List the buckets over and over and over.
+	for i := 0; i < b.N; i++ {
+		_, err = obj.ListObjects(context.Background(), bucket, "", "obj9000", "", -1)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}

@@ -312,7 +312,7 @@ func StartGateway(ctx *cli.Context, gw Gateway) {
 	globalObjectAPI = newObject
 	globalObjLayerMutex.Unlock()
 
-	if gatewayName == NASBackendGateway {
+	if gatewayName == NASBackendGateway || gatewayName == NASXLBackendGateway {
 		buckets, err := newObject.ListBuckets(GlobalContext)
 		if err != nil {
 			logger.Fatal(err, "Unable to list buckets")

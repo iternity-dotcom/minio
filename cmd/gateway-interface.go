@@ -26,6 +26,7 @@ const (
 	GCSBackendGateway   = "gcs"
 	HDFSBackendGateway  = "hdfs"
 	NASBackendGateway   = "nas"
+	NASXLBackendGateway = "nasxl"
 	S3BackendGateway    = "s3"
 )
 

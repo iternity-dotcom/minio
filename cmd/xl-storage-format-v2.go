@@ -790,8 +790,8 @@ func (z *xlMetaV2) UpdateObjectVersion(fi FileInfo) error {
 	return errFileVersionNotFound
 }
 
-// AddVersion adds a new version
-func (z *xlMetaV2) AddVersion(fi FileInfo) error {
+// AddErasureVersion adds a new version
+func (z *xlMetaV2) AddErasureVersion(fi FileInfo) error {
 	if fi.VersionID == "" {
 		// this means versioning is not yet
 		// enabled or suspend i.e all versions
@@ -881,6 +881,126 @@ func (z *xlMetaV2) AddVersion(fi FileInfo) error {
 		}
 		if fi.TransitionVersionID != "" {
 			ventry.ObjectV2.MetaSys[ReservedMetadataPrefixLower+TransitionedVersionID] = []byte(fi.TransitionVersionID)
+		}
+		if fi.TransitionTier != "" {
+			ventry.ObjectV2.MetaSys[ReservedMetadataPrefixLower+TransitionTier] = []byte(fi.TransitionTier)
+		}
+	}
+
+	if !ventry.Valid() {
+		return errors.New("internal error: invalid version entry generated")
+	}
+
+	for i, version := range z.Versions {
+		if !version.Valid() {
+			return errFileCorrupt
+		}
+		switch version.Type {
+		case LegacyType:
+			// This would convert legacy type into new ObjectType
+			// this means that we are basically purging the `null`
+			// version of the object.
+			if version.ObjectV1.VersionID == fi.VersionID {
+				z.Versions[i] = ventry
+				return nil
+			}
+		case ObjectType, FSType:
+			if version.ObjectV2.VersionID == uv {
+				z.Versions[i] = ventry
+				return nil
+			}
+		case DeleteType:
+			// Allowing delete marker to replaced with an proper
+			// object data type as well, this is not S3 complaint
+			// behavior but kept here for future flexibility.
+			if version.DeleteMarker.VersionID == uv {
+				z.Versions[i] = ventry
+				return nil
+			}
+		}
+	}
+
+	z.Versions = append(z.Versions, ventry)
+	return nil
+}
+
+// AddFSVersion adds a new version
+func (z *xlMetaV2) AddFSVersion(fi FileInfo) error {
+	if fi.VersionID == "" {
+		// this means versioning is not yet
+		// enabled or suspend i.e all versions
+		// are basically default value i.e "null"
+		fi.VersionID = nullVersionID
+	}
+
+	var uv uuid.UUID
+	var err error
+	if fi.VersionID != "" && fi.VersionID != nullVersionID {
+		uv, err = uuid.Parse(fi.VersionID)
+		if err != nil {
+			return err
+		}
+	}
+
+	var dd uuid.UUID
+	if fi.DataDir != "" {
+		dd, err = uuid.Parse(fi.DataDir)
+		if err != nil {
+			return err
+		}
+	}
+
+	ventry := xlMetaV2Version{}
+
+	if fi.Deleted {
+		ventry.Type = DeleteType
+		ventry.DeleteMarker = &xlMetaV2DeleteMarker{
+			VersionID: uv,
+			ModTime:   fi.ModTime.UnixNano(),
+			MetaSys:   make(map[string][]byte),
+		}
+	} else {
+		ventry.Type = FSType
+		ventry.ObjectV2 = &xlMetaV2Object{
+			VersionID:          uv,
+			DataDir:            dd,
+			Size:               fi.Size,
+			ModTime:            fi.ModTime.UnixNano(),
+			PartNumbers:        make([]int, len(fi.Parts)),
+			PartETags:          make([]string, len(fi.Parts)),
+			PartSizes:          make([]int64, len(fi.Parts)),
+			PartActualSizes:    make([]int64, len(fi.Parts)),
+			MetaSys:            make(map[string][]byte),
+			MetaUser:           make(map[string]string, len(fi.Metadata)),
+		}
+
+		for i := range fi.Parts {
+			ventry.ObjectV2.PartSizes[i] = fi.Parts[i].Size
+			if fi.Parts[i].ETag != "" {
+				ventry.ObjectV2.PartETags[i] = fi.Parts[i].ETag
+			}
+			ventry.ObjectV2.PartNumbers[i] = fi.Parts[i].Number
+			ventry.ObjectV2.PartActualSizes[i] = fi.Parts[i].ActualSize
+		}
+
+		for k, v := range fi.Metadata {
+			if strings.HasPrefix(strings.ToLower(k), ReservedMetadataPrefixLower) {
+				ventry.ObjectV2.MetaSys[k] = []byte(v)
+			} else {
+				ventry.ObjectV2.MetaUser[k] = v
+			}
+		}
+
+		// If asked to save data.
+		if len(fi.Data) > 0 || fi.Size == 0 {
+			z.data.replace(fi.VersionID, fi.Data)
+		}
+
+		if fi.TransitionStatus != "" {
+			ventry.ObjectV2.MetaSys[ReservedMetadataPrefixLower+TransitionStatus] = []byte(fi.TransitionStatus)
+		}
+		if fi.TransitionedObjName != "" {
+			ventry.ObjectV2.MetaSys[ReservedMetadataPrefixLower+TransitionedObjectName] = []byte(fi.TransitionedObjName)
 		}
 		if fi.TransitionTier != "" {
 			ventry.ObjectV2.MetaSys[ReservedMetadataPrefixLower+TransitionTier] = []byte(fi.TransitionTier)

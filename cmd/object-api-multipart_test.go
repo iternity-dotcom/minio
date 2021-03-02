@@ -1838,6 +1838,11 @@ func BenchmarkPutObjectPart5MbFS(b *testing.B) {
 	benchmarkPutObjectPart(b, "FS", 5*humanize.MiByte)
 }
 
+// BenchmarkPutObjectPart5MbFSXL - Benchmark FSXL.PutObjectPart() for object size of 5MB.
+func BenchmarkPutObjectPart5MbFSXL(b *testing.B) {
+	benchmarkPutObjectPart(b, "FSXL", 5*humanize.MiByte)
+}
+
 // BenchmarkPutObjectPart5MbErasure - Benchmark Erasure.PutObjectPart() for object size of 5MB.
 func BenchmarkPutObjectPart5MbErasure(b *testing.B) {
 	benchmarkPutObjectPart(b, "Erasure", 5*humanize.MiByte)
@@ -1846,6 +1851,11 @@ func BenchmarkPutObjectPart5MbErasure(b *testing.B) {
 // BenchmarkPutObjectPart10MbFS - Benchmark FS.PutObjectPart() for object size of 10MB.
 func BenchmarkPutObjectPart10MbFS(b *testing.B) {
 	benchmarkPutObjectPart(b, "FS", 10*humanize.MiByte)
+}
+
+// BenchmarkPutObjectPart10MbFSXL - Benchmark FSXL.PutObjectPart() for object size of 10MB.
+func BenchmarkPutObjectPart10MbFSXL(b *testing.B) {
+	benchmarkPutObjectPart(b, "FSXL", 10*humanize.MiByte)
 }
 
 // BenchmarkPutObjectPart10MbErasure - Benchmark Erasure.PutObjectPart() for object size of 10MB.
@@ -1859,6 +1869,12 @@ func BenchmarkPutObjectPart25MbFS(b *testing.B) {
 
 }
 
+// BenchmarkPutObjectPart25MbFSXL - Benchmark FSXL.PutObjectPart() for object size of 25MB.
+func BenchmarkPutObjectPart25MbFSXL(b *testing.B) {
+	benchmarkPutObjectPart(b, "FSXL", 25*humanize.MiByte)
+
+}
+
 // BenchmarkPutObjectPart25MbErasure - Benchmark Erasure.PutObjectPart() for object size of 25MB.
 func BenchmarkPutObjectPart25MbErasure(b *testing.B) {
 	benchmarkPutObjectPart(b, "Erasure", 25*humanize.MiByte)
@@ -1867,6 +1883,11 @@ func BenchmarkPutObjectPart25MbErasure(b *testing.B) {
 // BenchmarkPutObjectPart50MbFS - Benchmark FS.PutObjectPart() for object size of 50MB.
 func BenchmarkPutObjectPart50MbFS(b *testing.B) {
 	benchmarkPutObjectPart(b, "FS", 50*humanize.MiByte)
+}
+
+// BenchmarkPutObjectPart50MbFSXL - Benchmark FSXL.PutObjectPart() for object size of 50MB.
+func BenchmarkPutObjectPart50MbFSXL(b *testing.B) {
+	benchmarkPutObjectPart(b, "FSXL", 50*humanize.MiByte)
 }
 
 // BenchmarkPutObjectPart50MbErasure - Benchmark Erasure.PutObjectPart() for object size of 50MB.

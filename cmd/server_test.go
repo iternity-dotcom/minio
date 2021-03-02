@@ -127,6 +127,12 @@ func TestServerSuite(t *testing.T) {
 		{serverType: "FS", signer: signerV2},
 		// Init and run test on FS backend, with tls enabled.
 		{serverType: "FS", signer: signerV4, secure: true},
+		// Init and run test on FS XL backend with signature v4.
+		{serverType: "FSXL", signer: signerV4},
+		// Init and run test on FS XL backend with signature v2.
+		{serverType: "FSXL", signer: signerV2},
+		// Init and run test on FS XL backend, with tls enabled.
+		{serverType: "FSXL", signer: signerV4, secure: true},
 		// Init and run test on Erasure backend.
 		{serverType: "Erasure", signer: signerV4},
 		// Init and run test on ErasureSet backend.

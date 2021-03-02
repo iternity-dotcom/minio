@@ -73,12 +73,12 @@ func TestXLV2FormatData(t *testing.T) {
 		SuccessorModTime:              time.Time{},
 	}
 
-	failOnErr(xl.AddVersion(fi))
+	failOnErr(xl.AddErasureVersion(fi))
 
 	fi.VersionID = mustGetUUID()
 	fi.DataDir = mustGetUUID()
 	fi.Data = data2
-	failOnErr(xl.AddVersion(fi))
+	failOnErr(xl.AddErasureVersion(fi))
 
 	serialized, err := xl.AppendTo(nil)
 	failOnErr(err)
@@ -345,7 +345,7 @@ func TestDeleteVersionWithSharedDataDir(t *testing.T) {
 			}
 		}
 		fi.TransitionStatus = tc.transitionStatus
-		failOnErr(i+1, xl.AddVersion(fi))
+		failOnErr(i+1, xl.AddErasureVersion(fi))
 		fi.ExpireRestored = tc.expireRestored
 		fileInfos = append(fileInfos, fi)
 	}

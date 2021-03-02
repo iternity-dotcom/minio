@@ -216,6 +216,22 @@ func (s *fsv1Storage) MetaTmpBucket() string {
 	return s.metaTmpBucket
 }
 
+func (s *fsv1Storage) EncodeDirObject(object string) string {
+	return object
+}
+
+func (s *fsv1Storage) DecodeDirObject(object string) string {
+	return object
+}
+
+func (s *fsv1Storage) IsDirObject(object string) bool {
+	return HasSuffix(object, slashSeparator)
+}
+
+func (s *fsv1Storage) VersioningSupported() bool {
+	return false
+}
+
 func (s *fsv1Storage) String() string {
 	return s.diskPath
 }
@@ -701,7 +717,7 @@ func (s *fsv1Storage) RenameData(ctx context.Context, srcVolume, srcPath string,
 		return err
 	}
 
-	if HasSuffix(dstPath, slashSeparator) {
+	if s.IsDirObject(dstPath) {
 		err = s.MakeVol(ctx, pathJoin(dstVolume, dstPath))
 		if err != nil && err != errVolumeExists {
 			return err
@@ -1248,12 +1264,12 @@ func (s *fsv1Storage) getXLMetaV2NoFSLock(bucket, object string) (xlMetaV2, erro
 			{
 				Type: FSType,
 				ObjectV2: &xlMetaV2Object{
-					PartNumbers:     []int{1},
-					Size:            0,
-					PartActualSizes: []int64{0},
-					PartSizes:       []int64{0},
-					PartETags:       []string{""},
-					ModTime:         fi.ModTime().UnixNano(),
+					PartNumbers:        []int{1},
+					Size:               0,
+					PartActualSizes:    []int64{0},
+					PartSizes:          []int64{0},
+					PartETags:          []string{""},
+					ModTime:            fi.ModTime().UnixNano(),
 				},
 			},
 		}
@@ -1302,13 +1318,13 @@ func (s *fsv1Storage) getXLMetaV2NoFSLock(bucket, object string) (xlMetaV2, erro
 		{
 			Type: FSType,
 			ObjectV2: &xlMetaV2Object{
-				PartNumbers:     []int{1},
-				MetaUser:        fsMeta.Meta,
-				Size:            fsMeta.Parts[0].Size,
-				PartActualSizes: []int64{fsMeta.Parts[0].ActualSize},
-				PartSizes:       []int64{fsMeta.Parts[0].Size},
-				PartETags:       []string{""},
-				ModTime:         fi.ModTime().UnixNano(),
+				PartNumbers:        []int{1},
+				MetaUser:           fsMeta.Meta,
+				Size:               fsMeta.Parts[0].Size,
+				PartActualSizes:    []int64{fsMeta.Parts[0].ActualSize},
+				PartSizes:          []int64{fsMeta.Parts[0].Size},
+				PartETags:          []string{""},
+				ModTime:            fi.ModTime().UnixNano(),
 			},
 		},
 	}
