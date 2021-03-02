@@ -23,7 +23,7 @@ import (
 
 // Detects change in underlying disk.
 type xlStorageDiskIDCheck struct {
-	storage *xlStorage
+	storage StorageAPI
 	diskID  string
 }
 
