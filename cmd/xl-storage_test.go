@@ -1735,7 +1735,9 @@ func TestXLStorageVerifyFile(t *testing.T) {
 	// 4) Streaming bitrot check on corrupted file
 
 	// create xlStorage test setup
-	storage, path, err := newXLStorageTestSetup()
+	xlStore, path, err := newXLStorageTestSetup()
+	xlStorageDelegate := xlStore.storage.(*xlStorage)
+
 	if err != nil {
 		t.Fatalf("Unable to create xlStorage test setup, %s", err)
 	}
@@ -1743,7 +1745,7 @@ func TestXLStorageVerifyFile(t *testing.T) {
 
 	volName := "testvol"
 	fileName := "testfile"
-	if err := storage.MakeVol(context.Background(), volName); err != nil {
+	if err := xlStore.MakeVol(context.Background(), volName); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1757,29 +1759,29 @@ func TestXLStorageVerifyFile(t *testing.T) {
 	h := algo.New()
 	h.Write(data)
 	hashBytes := h.Sum(nil)
-	if err := storage.WriteAll(context.Background(), volName, fileName, data); err != nil {
+	if err := xlStore.WriteAll(context.Background(), volName, fileName, data); err != nil {
 		t.Fatal(err)
 	}
-	if err := storage.storage.(*xlStorage).bitrotVerify(pathJoin(path, volName, fileName), size, algo, hashBytes, 0); err != nil {
+	if err := xlStorageDelegate.bitrotVerify(pathJoin(path, volName, fileName), size, algo, hashBytes, 0); err != nil {
 		t.Fatal(err)
 	}
 
 	// 2) Whole-file bitrot check on corrupted file
-	if err := storage.AppendFile(context.Background(), volName, fileName, []byte("a")); err != nil {
+	if err := xlStore.AppendFile(context.Background(), volName, fileName, []byte("a")); err != nil {
 		t.Fatal(err)
 	}
 
 	// Check if VerifyFile reports the incorrect file length (the correct length is `size+1`)
-	if err := storage.storage.(*xlStorage).bitrotVerify(pathJoin(path, volName, fileName), size, algo, hashBytes, 0); err == nil {
+	if err := xlStorageDelegate.bitrotVerify(pathJoin(path, volName, fileName), size, algo, hashBytes, 0); err == nil {
 		t.Fatal("expected to fail bitrot check")
 	}
 
 	// Check if bitrot fails
-	if err := storage.storage.(*xlStorage).bitrotVerify(pathJoin(path, volName, fileName), size+1, algo, hashBytes, 0); err == nil {
+	if err := xlStorageDelegate.bitrotVerify(pathJoin(path, volName, fileName), size+1, algo, hashBytes, 0); err == nil {
 		t.Fatal("expected to fail bitrot check")
 	}
 
-	if err := storage.Delete(context.Background(), volName, fileName, false); err != nil {
+	if err := xlStore.Delete(context.Background(), volName, fileName, false); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1787,7 +1789,7 @@ func TestXLStorageVerifyFile(t *testing.T) {
 	algo = HighwayHash256S
 	shardSize := int64(1024 * 1024)
 	shard := make([]byte, shardSize)
-	w := newStreamingBitrotWriter(storage, volName, fileName, size, algo, shardSize, false)
+	w := newStreamingBitrotWriter(xlStore, volName, fileName, size, algo, shardSize)
 	reader := bytes.NewReader(data)
 	for {
 		// Using io.Copy instead of this loop will not work for us as io.Copy
@@ -1804,12 +1806,12 @@ func TestXLStorageVerifyFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	w.(io.Closer).Close()
-	if err := storage.storage.(*xlStorage).bitrotVerify(pathJoin(path, volName, fileName), size, algo, nil, shardSize); err != nil {
+	if err := xlStorageDelegate.bitrotVerify(pathJoin(path, volName, fileName), size, algo, nil, shardSize); err != nil {
 		t.Fatal(err)
 	}
 
 	// 4) Streaming bitrot check on corrupted file
-	filePath := pathJoin(storage.String(), volName, fileName)
+	filePath := pathJoin(xlStore.String(), volName, fileName)
 	f, err := os.OpenFile(filePath, os.O_WRONLY|os.O_SYNC, 0644)
 	if err != nil {
 		t.Fatal(err)
@@ -1819,10 +1821,10 @@ func TestXLStorageVerifyFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.Close()
-	if err := storage.storage.(*xlStorage).bitrotVerify(pathJoin(path, volName, fileName), size, algo, nil, shardSize); err == nil {
+	if err := xlStorageDelegate.bitrotVerify(pathJoin(path, volName, fileName), size, algo, nil, shardSize); err == nil {
 		t.Fatal("expected to fail bitrot check")
 	}
-	if err := storage.storage.(*xlStorage).bitrotVerify(pathJoin(path, volName, fileName), size+1, algo, nil, shardSize); err == nil {
+	if err := xlStorageDelegate.bitrotVerify(pathJoin(path, volName, fileName), size+1, algo, nil, shardSize); err == nil {
 		t.Fatal("expected to fail bitrot check")
 	}
 }
