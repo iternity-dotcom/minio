@@ -1,5 +1,6 @@
 // +build testrunmain
 
+<<<<<<< HEAD
 /*
  * MinIO Cloud Storage, (C) 2021 MinIO, Inc.
  *
@@ -16,6 +17,8 @@
  * limitations under the License.
  */
 
+=======
+>>>>>>> 71ed402f3... Add main_test.go to run system tests with coverage
 package main
 
 import (
