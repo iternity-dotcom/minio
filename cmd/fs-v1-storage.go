@@ -95,11 +95,41 @@ func (s *fsv1Storage) MakeVolBulk(ctx context.Context, volumes ...string) (err e
 }
 
 func (s *fsv1Storage) MakeVol(ctx context.Context, volume string) (err error) {
-	if err := os.MkdirAll(volume, 0777); err != nil {
-		return errDiskAccessDenied
+	if !isValidVolname(volume) {
+		return errInvalidArgument
 	}
-	return nil
+
+	volumeDir, err := s.getVolDir(volume)
+	if err != nil {
+		return err
+	}
+
+	if _, err := os.Lstat(volumeDir); err != nil {
+		// Volume does not exist we proceed to create.
+		if osIsNotExist(err) {
+			// Make a volume entry, with mode 0777 mkdir honors system umask.
+			err = reliableMkdirAll(volumeDir, 0777)
+		}
+		if osIsPermission(err) {
+			return errDiskAccessDenied
+		} else if isSysErrIO(err) {
+			return errFaultyDisk
+		}
+		return err
+	}
+
+	// Stat succeeds we return errVolumeExists.
+	return errVolumeExists
 }
+
+func (s *fsv1Storage) getVolDir(volume string) (string, error) {
+	if volume == "" || volume == "." || volume == ".." {
+		return "", errVolumeNotFound
+	}
+	volumeDir := pathJoin(s.String(), volume)
+	return volumeDir, nil
+}
+
 
 func (s *fsv1Storage) ListVols(ctx context.Context) (vols []VolInfo, err error) {
 	return nil, NotImplemented{}
@@ -110,7 +140,33 @@ func (s *fsv1Storage) StatVol(ctx context.Context, volume string) (vol VolInfo, 
 }
 
 func (s *fsv1Storage) DeleteVol(ctx context.Context, volume string, forceDelete bool) (err error) {
-	return NotImplemented{}
+	// Verify if volume is valid and it exists.
+	volumeDir, err := s.getVolDir(volume)
+	if err != nil {
+		return err
+	}
+
+	if forceDelete {
+		err = os.RemoveAll(volumeDir)
+	} else {
+		err = os.Remove(volumeDir)
+	}
+
+	if err != nil {
+		switch {
+		case osIsNotExist(err):
+			return errVolumeNotFound
+		case isSysErrNotEmpty(err):
+			return errVolumeNotEmpty
+		case osIsPermission(err):
+			return errDiskAccessDenied
+		case isSysErrIO(err):
+			return errFaultyDisk
+		default:
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *fsv1Storage) AppendFile(ctx context.Context, volume string, path string, buf []byte) error {

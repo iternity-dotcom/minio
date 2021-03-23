@@ -39,7 +39,6 @@ func TestFSFormatFS(t *testing.T) {
 
 	fs := &FSObjects{
 		disk:          disk,
-		fsPath:        fsPath,
 		metaJSONFile:  fsMetaJSONFile,
 		fsUUID:        uuid,
 		nsMutex:       newNSLock(false),

@@ -61,8 +61,6 @@ type FSObjects struct {
 	// The count of concurrent calls on FSObjects API
 	activeIOCount int64
 
-	// Path to be exported over S3 API.
-	fsPath string
 	// meta json filename, varies by fs / cache backend.
 	metaJSONFile string
 	// Unique value to be used for all
@@ -136,7 +134,6 @@ func NewFSObjectLayerWithDisk(disk StorageAPI) (ObjectLayer, error) {
 	// Initialize fs objects.
 	fs := &FSObjects{
 		disk:         disk,
-		fsPath:       fsPath,
 		metaJSONFile: fsMetaJSONFile,
 		fsUUID:       fsUUID,
 		rwPool: &fsIOPool{
@@ -154,7 +151,7 @@ func NewFSObjectLayerWithDisk(disk StorageAPI) (ObjectLayer, error) {
 	}
 
 	// Initialize `format.json`, this function also returns.
-	rlk, err := initFormatFS(ctx, fsPath)
+	rlk, err := initFormatFS(ctx, disk)
 	if err != nil {
 		return nil, err
 	}
@@ -178,13 +175,15 @@ func (fs *FSObjects) initMetaVolumeFS(ctx context.Context) error {
 	// is the only place where it can be made less expensive
 	// optimizing all other calls. Create minio meta volume,
 	// if it doesn't exist yet.
-	metaBucketPath := pathJoin(fs.fsPath, minioMetaBucket)
-	metaTmpPath := pathJoin(fs.fsPath, minioMetaTmpBucket, fs.fsUUID)
-	metaMultipartPath := pathJoin(fs.fsPath, minioMetaMultipartBucket)
-	dataUsagePath := pathJoin(fs.fsPath, dataUsageBucket)
+	metaBucketPath := pathJoin(minioMetaBucket)
+	metaTmpPath := pathJoin(minioMetaTmpBucket, fs.fsUUID)
+	metaMultipartPath := pathJoin(minioMetaMultipartBucket)
+	dataUsagePath := pathJoin(dataUsageBucket)
 
 	return fs.disk.MakeVolBulk(ctx, metaBucketPath, metaTmpPath, dataUsagePath, metaMultipartPath)
 }
+
+
 
 // NewNSLock - initialize a new namespace RWLocker instance.
 func (fs *FSObjects) NewNSLock(bucket string, objects ...string) RWLocker {
@@ -202,7 +201,7 @@ func (fs *FSObjects) Shutdown(ctx context.Context) error {
 	fs.fsFormatRlk.Close()
 
 	// Cleanup and delete tmp uuid.
-	return fsRemoveAll(ctx, pathJoin(fs.fsPath, minioMetaTmpBucket, fs.fsUUID))
+	return fs.disk.DeleteVol(ctx, pathJoin(minioMetaTmpBucket, fs.fsUUID), true)
 }
 
 // BackendInfo - returns backend information
@@ -222,7 +221,7 @@ func (fs *FSObjects) StorageInfo(ctx context.Context) (StorageInfo, []error) {
 		atomic.AddInt64(&fs.activeIOCount, -1)
 	}()
 
-	di, err := getDiskInfo(fs.fsPath)
+	di, err := getDiskInfo(fs.disk.String())
 	if err != nil {
 		return StorageInfo{}, []error{err}
 	}
@@ -232,7 +231,7 @@ func (fs *FSObjects) StorageInfo(ctx context.Context) (StorageInfo, []error) {
 				TotalSpace:     di.Total,
 				UsedSpace:      di.Used,
 				AvailableSpace: di.Free,
-				DrivePath:      fs.fsPath,
+				DrivePath:      fs.disk.String(),
 			},
 		},
 	}
@@ -331,9 +330,9 @@ func (fs *FSObjects) scanBucket(ctx context.Context, bucket string, cache dataUs
 	}
 
 	// Load bucket info.
-	cache, err = scanDataFolder(ctx, fs.fsPath, cache, func(item scannerItem) (sizeSummary, error) {
+	cache, err = scanDataFolder(ctx, fs.disk.String(), cache, func(item scannerItem) (sizeSummary, error) {
 		bucket, object := item.bucket, item.objectPath()
-		fsMetaBytes, err := xioutil.ReadFile(pathJoin(fs.fsPath, minioMetaBucket, bucketMetaPrefix, bucket, object, fs.metaJSONFile))
+		fsMetaBytes, err := xioutil.ReadFile(pathJoin(fs.disk.String(), minioMetaBucket, bucketMetaPrefix, bucket, object, fs.metaJSONFile))
 		if err != nil && !osIsNotExist(err) {
 			if intDataUpdateTracker.debug {
 				logger.Info(color.Green("scanBucket:")+" object return unexpected error: %v/%v: %w", item.bucket, item.objectPath(), err)
@@ -383,7 +382,7 @@ func (fs *FSObjects) getBucketDir(ctx context.Context, bucket string) (string, e
 	if bucket == "" || bucket == "." || bucket == ".." {
 		return "", errVolumeNotFound
 	}
-	bucketDir := pathJoin(fs.fsPath, bucket)
+	bucketDir := pathJoin(fs.disk.String(), bucket)
 	return bucketDir, nil
 }
 
@@ -500,7 +499,7 @@ func (fs *FSObjects) GetBucketInfo(ctx context.Context, bucket string) (bi Bucke
 
 // ListBuckets - list all s3 compatible buckets (directories) at fsPath.
 func (fs *FSObjects) ListBuckets(ctx context.Context) ([]BucketInfo, error) {
-	if err := checkPathLength(fs.fsPath); err != nil {
+	if err := checkPathLength(fs.disk.String()); err != nil {
 		logger.LogIf(ctx, err)
 		return nil, err
 	}
@@ -510,7 +509,7 @@ func (fs *FSObjects) ListBuckets(ctx context.Context) ([]BucketInfo, error) {
 		atomic.AddInt64(&fs.activeIOCount, -1)
 	}()
 
-	entries, err := readDir(fs.fsPath)
+	entries, err := readDir(fs.disk.String())
 	if err != nil {
 		logger.LogIf(ctx, errDiskNotFound)
 		return nil, toObjectErr(errDiskNotFound)
@@ -523,7 +522,7 @@ func (fs *FSObjects) ListBuckets(ctx context.Context) ([]BucketInfo, error) {
 			continue
 		}
 		var fi os.FileInfo
-		fi, err = fsStatVolume(ctx, pathJoin(fs.fsPath, entry))
+		fi, err = fsStatVolume(ctx, pathJoin(fs.disk.String(), entry))
 		// There seems like no practical reason to check for errors
 		// at this point, if there are indeed errors we can simply
 		// just ignore such buckets and list only those which
@@ -572,7 +571,7 @@ func (fs *FSObjects) DeleteBucket(ctx context.Context, bucket string, forceDelet
 			return toObjectErr(err, bucket)
 		}
 	} else {
-		tmpBucketPath := pathJoin(fs.fsPath, minioMetaTmpBucket, bucket+"."+mustGetUUID())
+		tmpBucketPath := pathJoin(fs.disk.String(), minioMetaTmpBucket, bucket+"."+mustGetUUID())
 		if err = fsSimpleRenameFile(ctx, bucketDir, tmpBucketPath); err != nil {
 			return toObjectErr(err, bucket)
 		}
@@ -583,7 +582,7 @@ func (fs *FSObjects) DeleteBucket(ctx context.Context, bucket string, forceDelet
 	}
 
 	// Cleanup all the bucket metadata.
-	minioMetadataBucketDir := pathJoin(fs.fsPath, minioMetaBucket, bucketMetaPrefix, bucket)
+	minioMetadataBucketDir := pathJoin(fs.disk.String(), minioMetaBucket, bucketMetaPrefix, bucket)
 	if err = fsRemoveAll(ctx, minioMetadataBucketDir); err != nil {
 		return toObjectErr(err, bucket)
 	}
@@ -630,7 +629,7 @@ func (fs *FSObjects) CopyObject(ctx context.Context, srcBucket, srcObject, dstBu
 	}
 
 	if cpSrcDstSame && srcInfo.metadataOnly {
-		fsMetaPath := pathJoin(fs.fsPath, minioMetaBucket, bucketMetaPrefix, srcBucket, srcObject, fs.metaJSONFile)
+		fsMetaPath := pathJoin(fs.disk.String(), minioMetaBucket, bucketMetaPrefix, srcBucket, srcObject, fs.metaJSONFile)
 		wlk, err := fs.rwPool.Write(fsMetaPath)
 		if err != nil {
 			wlk, err = fs.rwPool.Create(fsMetaPath)
@@ -656,7 +655,7 @@ func (fs *FSObjects) CopyObject(ctx context.Context, srcBucket, srcObject, dstBu
 		}
 
 		// Stat the file to get file size.
-		fi, err := fsStatFile(ctx, pathJoin(fs.fsPath, srcBucket, srcObject))
+		fi, err := fsStatFile(ctx, pathJoin(fs.disk.String(), srcBucket, srcObject))
 		if err != nil {
 			return oi, toObjectErr(err, srcBucket, srcObject)
 		}
@@ -736,7 +735,7 @@ func (fs *FSObjects) GetObjectNInfo(ctx context.Context, bucket, object string, 
 	// Take a rwPool lock for NFS gateway type deployment
 	rwPoolUnlocker := func() {}
 	if bucket != minioMetaBucket && lockType != noLock {
-		fsMetaPath := pathJoin(fs.fsPath, minioMetaBucket, bucketMetaPrefix, bucket, object, fs.metaJSONFile)
+		fsMetaPath := pathJoin(fs.disk.String(), minioMetaBucket, bucketMetaPrefix, bucket, object, fs.metaJSONFile)
 		_, err = fs.rwPool.Open(fsMetaPath)
 		if err != nil && err != errFileNotFound {
 			logger.LogIf(ctx, err)
@@ -754,7 +753,7 @@ func (fs *FSObjects) GetObjectNInfo(ctx context.Context, bucket, object string, 
 	}
 
 	// Read the object, doesn't exist returns an s3 compatible error.
-	fsObjPath := pathJoin(fs.fsPath, bucket, object)
+	fsObjPath := pathJoin(fs.disk.String(), bucket, object)
 	readCloser, size, err := fsOpenFile(ctx, fsObjPath, off)
 	if err != nil {
 		rwPoolUnlocker()
@@ -806,7 +805,7 @@ func (fs *FSObjects) getObject(ctx context.Context, bucket, object string, offse
 	}
 
 	if bucket != minioMetaBucket {
-		fsMetaPath := pathJoin(fs.fsPath, minioMetaBucket, bucketMetaPrefix, bucket, object, fs.metaJSONFile)
+		fsMetaPath := pathJoin(fs.disk.String(), minioMetaBucket, bucketMetaPrefix, bucket, object, fs.metaJSONFile)
 		if lock {
 			_, err = fs.rwPool.Open(fsMetaPath)
 			if err != nil && err != errFileNotFound {
@@ -829,7 +828,7 @@ func (fs *FSObjects) getObject(ctx context.Context, bucket, object string, offse
 	}
 
 	// Read the object, doesn't exist returns an s3 compatible error.
-	fsObjPath := pathJoin(fs.fsPath, bucket, object)
+	fsObjPath := pathJoin(fs.disk.String(), bucket, object)
 	reader, size, err := fsOpenFile(ctx, fsObjPath, offset)
 	if err != nil {
 		return toObjectErr(err, bucket, object)
@@ -885,14 +884,14 @@ func (fs *FSObjects) defaultFsJSON(object string) fsMetaV1 {
 func (fs *FSObjects) getObjectInfoNoFSLock(ctx context.Context, bucket, object string) (oi ObjectInfo, e error) {
 	fsMeta := fsMetaV1{}
 	if HasSuffix(object, SlashSeparator) {
-		fi, err := fsStatDir(ctx, pathJoin(fs.fsPath, bucket, object))
+		fi, err := fsStatDir(ctx, pathJoin(fs.disk.String(), bucket, object))
 		if err != nil {
 			return oi, err
 		}
 		return fsMeta.ToObjectInfo(bucket, object, fi), nil
 	}
 
-	fsMetaPath := pathJoin(fs.fsPath, minioMetaBucket, bucketMetaPrefix, bucket, object, fs.metaJSONFile)
+	fsMetaPath := pathJoin(fs.disk.String(), minioMetaBucket, bucketMetaPrefix, bucket, object, fs.metaJSONFile)
 	// Read `fs.json` to perhaps contend with
 	// parallel Put() operations.
 
@@ -924,7 +923,7 @@ func (fs *FSObjects) getObjectInfoNoFSLock(ctx context.Context, bucket, object s
 	}
 
 	// Stat the file to get file size.
-	fi, err := fsStatFile(ctx, pathJoin(fs.fsPath, bucket, object))
+	fi, err := fsStatFile(ctx, pathJoin(fs.disk.String(), bucket, object))
 	if err != nil {
 		return oi, err
 	}
@@ -940,14 +939,14 @@ func (fs *FSObjects) getObjectInfo(ctx context.Context, bucket, object string) (
 
 	fsMeta := fsMetaV1{}
 	if HasSuffix(object, SlashSeparator) {
-		fi, err := fsStatDir(ctx, pathJoin(fs.fsPath, bucket, object))
+		fi, err := fsStatDir(ctx, pathJoin(fs.disk.String(), bucket, object))
 		if err != nil {
 			return oi, err
 		}
 		return fsMeta.ToObjectInfo(bucket, object, fi), nil
 	}
 
-	fsMetaPath := pathJoin(fs.fsPath, minioMetaBucket, bucketMetaPrefix, bucket, object, fs.metaJSONFile)
+	fsMetaPath := pathJoin(fs.disk.String(), minioMetaBucket, bucketMetaPrefix, bucket, object, fs.metaJSONFile)
 	// Read `fs.json` to perhaps contend with
 	// parallel Put() operations.
 
@@ -974,7 +973,7 @@ func (fs *FSObjects) getObjectInfo(ctx context.Context, bucket, object string) (
 	}
 
 	// Stat the file to get file size.
-	fi, err := fsStatFile(ctx, pathJoin(fs.fsPath, bucket, object))
+	fi, err := fsStatFile(ctx, pathJoin(fs.disk.String(), bucket, object))
 	if err != nil {
 		return oi, err
 	}
@@ -1030,7 +1029,7 @@ func (fs *FSObjects) GetObjectInfo(ctx context.Context, bucket, object string, o
 			return oi, toObjectErr(err, bucket, object)
 		}
 
-		fsMetaPath := pathJoin(fs.fsPath, minioMetaBucket, bucketMetaPrefix, bucket, object, fs.metaJSONFile)
+		fsMetaPath := pathJoin(fs.disk.String(), minioMetaBucket, bucketMetaPrefix, bucket, object, fs.metaJSONFile)
 		err = fs.createFsJSON(object, fsMetaPath)
 		lk.Unlock()
 		if err != nil {
@@ -1051,7 +1050,7 @@ func (fs *FSObjects) parentDirIsObject(ctx context.Context, bucket, parent strin
 		if p == "." || p == SlashSeparator {
 			return false
 		}
-		if fsIsFile(ctx, pathJoin(fs.fsPath, bucket, p)) {
+		if fsIsFile(ctx, pathJoin(fs.disk.String(), bucket, p)) {
 			// If there is already a file at prefix "p", return true.
 			return true
 		}
@@ -1117,12 +1116,12 @@ func (fs *FSObjects) putObject(ctx context.Context, bucket string, object string
 		if fs.parentDirIsObject(ctx, bucket, path.Dir(object)) {
 			return ObjectInfo{}, toObjectErr(errFileParentIsFile, bucket, object)
 		}
-		if err = mkdirAll(pathJoin(fs.fsPath, bucket, object), 0777); err != nil {
+		if err = mkdirAll(pathJoin(fs.disk.String(), bucket, object), 0777); err != nil {
 			logger.LogIf(ctx, err)
 			return ObjectInfo{}, toObjectErr(err, bucket, object)
 		}
 		var fi os.FileInfo
-		if fi, err = fsStatDir(ctx, pathJoin(fs.fsPath, bucket, object)); err != nil {
+		if fi, err = fsStatDir(ctx, pathJoin(fs.disk.String(), bucket, object)); err != nil {
 			return ObjectInfo{}, toObjectErr(err, bucket, object)
 		}
 		return fsMeta.ToObjectInfo(bucket, object, fi), nil
@@ -1141,7 +1140,7 @@ func (fs *FSObjects) putObject(ctx context.Context, bucket string, object string
 
 	var wlk *lock.LockedFile
 	if bucket != minioMetaBucket {
-		bucketMetaDir := pathJoin(fs.fsPath, minioMetaBucket, bucketMetaPrefix)
+		bucketMetaDir := pathJoin(fs.disk.String(), minioMetaBucket, bucketMetaPrefix)
 		fsMetaPath := pathJoin(bucketMetaDir, bucket, object, fs.metaJSONFile)
 		wlk, err = fs.rwPool.Write(fsMetaPath)
 		var freshFile bool
@@ -1162,7 +1161,7 @@ func (fs *FSObjects) putObject(ctx context.Context, bucket string, object string
 			// We should preserve the `fs.json` of any
 			// existing object
 			if retErr != nil && freshFile {
-				tmpDir := pathJoin(fs.fsPath, minioMetaTmpBucket, fs.fsUUID)
+				tmpDir := pathJoin(fs.disk.String(), minioMetaTmpBucket, fs.fsUUID)
 				fsRemoveMeta(ctx, bucketMetaDir, fsMetaPath, tmpDir)
 			}
 		}()
@@ -1173,7 +1172,7 @@ func (fs *FSObjects) putObject(ctx context.Context, bucket string, object string
 	// so that cleaning it up will be easy if the server goes down.
 	tempObj := mustGetUUID()
 
-	fsTmpObjPath := pathJoin(fs.fsPath, minioMetaTmpBucket, fs.fsUUID, tempObj)
+	fsTmpObjPath := pathJoin(fs.disk.String(), minioMetaTmpBucket, fs.fsUUID, tempObj)
 	bytesWritten, err := fsCreateFile(ctx, fsTmpObjPath, data, data.Size())
 
 	// Delete the temporary object in the case of a
@@ -1193,7 +1192,7 @@ func (fs *FSObjects) putObject(ctx context.Context, bucket string, object string
 	}
 
 	// Entire object was written to the temp location, now it's safe to rename it to the actual location.
-	fsNSObjPath := pathJoin(fs.fsPath, bucket, object)
+	fsNSObjPath := pathJoin(fs.disk.String(), bucket, object)
 	if err = fsRenameFile(ctx, fsTmpObjPath, fsNSObjPath); err != nil {
 		return ObjectInfo{}, toObjectErr(err, bucket, object)
 	}
@@ -1206,7 +1205,7 @@ func (fs *FSObjects) putObject(ctx context.Context, bucket string, object string
 	}
 
 	// Stat the file to fetch timestamp, size.
-	fi, err := fsStatFile(ctx, pathJoin(fs.fsPath, bucket, object))
+	fi, err := fsStatFile(ctx, pathJoin(fs.disk.String(), bucket, object))
 	if err != nil {
 		return ObjectInfo{}, toObjectErr(err, bucket, object)
 	}
@@ -1276,7 +1275,7 @@ func (fs *FSObjects) DeleteObject(ctx context.Context, bucket, object string, op
 
 	var rwlk *lock.LockedFile
 
-	minioMetaBucketDir := pathJoin(fs.fsPath, minioMetaBucket)
+	minioMetaBucketDir := pathJoin(fs.disk.String(), minioMetaBucket)
 	fsMetaPath := pathJoin(minioMetaBucketDir, bucketMetaPrefix, bucket, object, fs.metaJSONFile)
 	if bucket != minioMetaBucket {
 		rwlk, err = fs.rwPool.Write(fsMetaPath)
@@ -1287,7 +1286,7 @@ func (fs *FSObjects) DeleteObject(ctx context.Context, bucket, object string, op
 	}
 
 	// Delete the object.
-	if err = fsDeleteFile(ctx, pathJoin(fs.fsPath, bucket), pathJoin(fs.fsPath, bucket, object)); err != nil {
+	if err = fsDeleteFile(ctx, pathJoin(fs.disk.String(), bucket), pathJoin(fs.disk.String(), bucket, object)); err != nil {
 		if rwlk != nil {
 			rwlk.Close()
 		}
@@ -1324,7 +1323,7 @@ func (fs *FSObjects) listDirFactory() ListDirFunc {
 	// listDir - lists all the entries at a given prefix and given entry in the prefix.
 	listDir := func(bucket, prefixDir, prefixEntry string) (emptyDir bool, entries []string, delayIsLeaf bool) {
 		var err error
-		entries, err = readDir(pathJoin(fs.fsPath, bucket, prefixDir))
+		entries, err = readDir(pathJoin(fs.disk.String(), bucket, prefixDir))
 		if err != nil && err != errFileNotFound {
 			logger.LogIf(GlobalContext, err)
 			return false, nil, false
@@ -1344,7 +1343,7 @@ func (fs *FSObjects) listDirFactory() ListDirFunc {
 // and the prefix represents an empty directory. An S3 empty directory
 // is also an empty directory in the FS backend.
 func (fs *FSObjects) isObjectDir(bucket, prefix string) bool {
-	entries, err := readDirN(pathJoin(fs.fsPath, bucket, prefix), 1)
+	entries, err := readDirN(pathJoin(fs.disk.String(), bucket, prefix), 1)
 	if err != nil {
 		return false
 	}
@@ -1354,7 +1353,7 @@ func (fs *FSObjects) isObjectDir(bucket, prefix string) bool {
 // getObjectETag is a helper function, which returns only the md5sum
 // of the file on the disk.
 func (fs *FSObjects) getObjectETag(ctx context.Context, bucket, entry string, lock bool) (string, error) {
-	fsMetaPath := pathJoin(fs.fsPath, minioMetaBucket, bucketMetaPrefix, bucket, entry, fs.metaJSONFile)
+	fsMetaPath := pathJoin(fs.disk.String(), minioMetaBucket, bucketMetaPrefix, bucket, entry, fs.metaJSONFile)
 
 	var reader io.Reader
 	var fi os.FileInfo
@@ -1466,7 +1465,7 @@ func (fs *FSObjects) PutObjectTags(ctx context.Context, bucket, object string, t
 		}
 	}
 
-	fsMetaPath := pathJoin(fs.fsPath, minioMetaBucket, bucketMetaPrefix, bucket, object, fs.metaJSONFile)
+	fsMetaPath := pathJoin(fs.disk.String(), minioMetaBucket, bucketMetaPrefix, bucket, object, fs.metaJSONFile)
 	fsMeta := fsMetaV1{}
 	wlk, err := fs.rwPool.Write(fsMetaPath)
 	if err != nil {
@@ -1498,7 +1497,7 @@ func (fs *FSObjects) PutObjectTags(ctx context.Context, bucket, object string, t
 	}
 
 	// Stat the file to get file size.
-	fi, err := fsStatFile(ctx, pathJoin(fs.fsPath, bucket, object))
+	fi, err := fsStatFile(ctx, pathJoin(fs.disk.String(), bucket, object))
 	if err != nil {
 		return ObjectInfo{}, err
 	}
@@ -1598,7 +1597,7 @@ func (fs *FSObjects) IsTaggingSupported() bool {
 
 // Health returns health of the object layer
 func (fs *FSObjects) Health(ctx context.Context, opts HealthOptions) HealthResult {
-	if _, err := os.Stat(fs.fsPath); err != nil {
+	if _, err := os.Stat(fs.disk.String()); err != nil {
 		return HealthResult{}
 	}
 	return HealthResult{
@@ -1608,7 +1607,7 @@ func (fs *FSObjects) Health(ctx context.Context, opts HealthOptions) HealthResul
 
 // ReadHealth returns "read" health of the object layer
 func (fs *FSObjects) ReadHealth(ctx context.Context) bool {
-	_, err := os.Stat(fs.fsPath)
+	_, err := os.Stat(fs.disk.String())
 	return err == nil
 }
 
