@@ -354,8 +354,6 @@ func initAllSubsystems(ctx context.Context, newObject ObjectLayer) (err error) {
 				logger.Info(fmt.Sprintf("Verifying if %d buckets are consistent across drives...", len(buckets)))
 			}
 		}
-<<<<<<< HEAD
-
 		// Limit to no more than 50 concurrent buckets.
 		g := errgroup.WithNErrs(len(buckets)).WithConcurrency(50)
 		ctx, cancel := g.WithCancelOnError(ctx)
@@ -363,19 +361,13 @@ func initAllSubsystems(ctx context.Context, newObject ObjectLayer) (err error) {
 		for index := range buckets {
 			index := index
 			g.Go(func() error {
+				// TODO EC10 - We could support healing as well, but it must be delegated to the underlying DFS.
 				_, berr := newObject.HealBucket(ctx, buckets[index].Name, madmin.HealOpts{Recreate: true})
 				return berr
 			}, index)
 		}
 		if err := g.WaitErr(); err != nil {
 			return fmt.Errorf("Unable to list buckets to heal: %w", err)
-=======
-		for _, bucket := range buckets {
-			// TODO EC10 - We could support healing as well, but it must be delegated to the underlying DFS.
-			if _, err = newObject.HealBucket(ctx, bucket.Name, madmin.HealOpts{Recreate: true}); err != nil {
-				return fmt.Errorf("Unable to list buckets to heal: %w", err)
-			}
->>>>>>> eb403ea65... EC10 PoC
 		}
 	}
 

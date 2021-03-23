@@ -336,7 +336,7 @@ func benchmarkErasureDecode(data, parity, dataDown, parityDown int, size int64, 
 	}
 
 	content := make([]byte, size)
-	buffer := make([]byte, blockSizeV1, 2*blockSizeV2)
+	buffer := make([]byte, blockSizeV2, 2*blockSizeV2)
 	_, err = erasure.Encode(context.Background(), bytes.NewReader(content), writers, buffer, writeQuorum)
 	closeBitrotWriters(writers)
 	if err != nil {
