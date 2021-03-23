@@ -504,6 +504,7 @@ func serverMain(ctx *cli.Context) {
 
 	// Enable background operations for erasure coding
 	if globalIsErasure {
+		// EC10 - We don't need AutoHeal or BackgroundReplication when using a DFS in the background.
 		initAutoHeal(GlobalContext, newObject)
 		// TODO EC10: Maybe BackgroundTransition is something we could support. But what is this exactly?
 		initBackgroundTransition(GlobalContext, newObject)
