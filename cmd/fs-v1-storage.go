@@ -130,7 +130,6 @@ func (s *fsv1Storage) getVolDir(volume string) (string, error) {
 	return volumeDir, nil
 }
 
-
 func (s *fsv1Storage) ListVols(ctx context.Context) (vols []VolInfo, err error) {
 	return nil, NotImplemented{}
 }

@@ -183,8 +183,6 @@ func (fs *FSObjects) initMetaVolumeFS(ctx context.Context) error {
 	return fs.disk.MakeVolBulk(ctx, metaBucketPath, metaTmpPath, dataUsagePath, metaMultipartPath)
 }
 
-
-
 // NewNSLock - initialize a new namespace RWLocker instance.
 func (fs *FSObjects) NewNSLock(bucket string, objects ...string) RWLocker {
 	// lockers are explicitly 'nil' for FS mode since there are only local lockers

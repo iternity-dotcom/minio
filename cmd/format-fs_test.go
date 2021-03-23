@@ -51,7 +51,7 @@ func TestFSFormatFS(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	rlk, err := initFormatFS(context.Background(), fsPath)
+	rlk, err := initFormatFS(context.Background(), disk)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -94,7 +94,7 @@ func TestFSFormatFS(t *testing.T) {
 	if _, err = formatFSGetVersion(rlk); err == nil {
 		t.Fatal("expected to fail")
 	}
-	if _, err = initFormatFS(context.Background(), fsPath); err == nil {
+	if _, err = initFormatFS(context.Background(), disk); err == nil {
 		t.Fatal("expected to fail")
 	}
 
@@ -109,7 +109,7 @@ func TestFSFormatFS(t *testing.T) {
 	if _, err = formatMetaGetFormatBackendFS(f); err == nil {
 		t.Fatal("expected to fail")
 	}
-	if _, err = initFormatFS(context.Background(), fsPath); err == nil {
+	if _, err = initFormatFS(context.Background(), disk); err == nil {
 		t.Fatal("expected to fail")
 	}
 }
