@@ -497,48 +497,24 @@ func (fs *FSObjects) GetBucketInfo(ctx context.Context, bucket string) (bi Bucke
 
 // ListBuckets - list all s3 compatible buckets (directories) at fsPath.
 func (fs *FSObjects) ListBuckets(ctx context.Context) ([]BucketInfo, error) {
-	if err := checkPathLength(fs.disk.String()); err != nil {
-		logger.LogIf(ctx, err)
-		return nil, err
-	}
-
 	atomic.AddInt64(&fs.activeIOCount, 1)
 	defer func() {
 		atomic.AddInt64(&fs.activeIOCount, -1)
 	}()
 
-	entries, err := readDir(fs.disk.String())
+	volsInfo, err := fs.disk.ListVols(ctx)
 	if err != nil {
-		logger.LogIf(ctx, errDiskNotFound)
-		return nil, toObjectErr(errDiskNotFound)
+		return nil, err
 	}
-
-	bucketInfos := make([]BucketInfo, 0, len(entries))
-	for _, entry := range entries {
-		// Ignore all reserved bucket names and invalid bucket names.
-		if isReservedOrInvalidBucket(entry, false) {
+	bucketInfos := make([]BucketInfo, 0, len(volsInfo))
+	for _, v := range volsInfo {
+		// StorageAPI can send volume names which are
+		// incompatible with buckets - these are
+		// skipped, like the meta-bucket.
+		if isReservedOrInvalidBucket(v.Name, false) {
 			continue
 		}
-		var fi os.FileInfo
-		fi, err = fsStatVolume(ctx, pathJoin(fs.disk.String(), entry))
-		// There seems like no practical reason to check for errors
-		// at this point, if there are indeed errors we can simply
-		// just ignore such buckets and list only those which
-		// return proper Stat information instead.
-		if err != nil {
-			// Ignore any errors returned here.
-			continue
-		}
-		var created = fi.ModTime()
-		meta, err := globalBucketMetadataSys.Get(fi.Name())
-		if err == nil {
-			created = meta.Created
-		}
-
-		bucketInfos = append(bucketInfos, BucketInfo{
-			Name:    fi.Name(),
-			Created: created,
-		})
+		bucketInfos = append(bucketInfos, BucketInfo(v))
 	}
 
 	// Sort bucket infos by bucket name.

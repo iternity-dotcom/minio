@@ -131,7 +131,38 @@ func (s *fsv1Storage) getVolDir(volume string) (string, error) {
 }
 
 func (s *fsv1Storage) ListVols(ctx context.Context) (vols []VolInfo, err error) {
-	return nil, NotImplemented{}
+	if err := checkPathLength(s.String()); err != nil {
+		return nil, err
+	}
+	entries, err := readDir(s.String())
+	if err != nil {
+		return nil, errDiskNotFound
+	}
+	volsInfo := make([]VolInfo, 0, len(entries))
+	for _, entry := range entries {
+
+		var fi os.FileInfo
+		fi, err = fsStatVolume(ctx, pathJoin(s.String(), entry))
+		// There seems like no practical reason to check for errors
+		// at this point, if there are indeed errors we can simply
+		// just ignore such buckets and list only those which
+		// return proper Stat information instead.
+		if err != nil {
+			// Ignore any errors returned here.
+			continue
+		}
+		var created = fi.ModTime()
+		meta, err := globalBucketMetadataSys.Get(fi.Name())
+		if err == nil {
+			created = meta.Created
+		}
+
+		volsInfo = append(volsInfo, VolInfo{
+			Name:    fi.Name(),
+			Created: created,
+		})
+	}
+	return volsInfo, nil
 }
 
 func (s *fsv1Storage) StatVol(ctx context.Context, volume string) (vol VolInfo, err error) {
