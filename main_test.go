@@ -37,11 +37,6 @@ import (
 //
 // 1. As an alternative you can also run the system under test by just by calling "go test"
 // $ APP_ARGS="server /tmp/test" go test -cover -tags testrunmain -covermode count -coverpkg="./..." -coverprofile=coverage.cov
-// $ go test -coverpkg="./..." -c -tags testrunmain .
-// $ APP_ARGS="server /tmp/test" ./minio.test -test.run "^TestRunMain$" -test.coverprofile coverage.cov
-//
-// 1. Or run system under test just by calling go test
-// $ APP_ARGS="server /tmp/test" go test -cover -tags testrunmain -coverpkg="./..." -coverprofile=coverage.cov
 //
 // 2. Run System-Tests (when using GitBash prefix this line with MSYS_NO_PATHCONV=1)
 //    Note the the SERVER_ENDPOINT must be reachable from inside the docker container (so don't use localhost!)
@@ -54,7 +49,6 @@ import (
 // $ go tool cover -html=./coverage.cov -o coverage.html
 //
 // 5. Optionally transform the coverage file to .csv
-// 5. Transform the coverage file to .csv
 // $ cat coverage.cov | sed -E 's/mode: .*/source;from;to;stmnts;count/g' | sed -E 's/:| |,/;/g' > coverage.csv
 func TestRunMain(t *testing.T) {
 	cancelChan := make(chan os.Signal, 1)
