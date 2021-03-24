@@ -22,8 +22,6 @@ import (
 	"io"
 	"net/url"
 	"os"
-
-	"github.com/minio/minio/cmd/logger"
 )
 
 type fsv1Storage struct {
@@ -179,7 +177,23 @@ func (s *fsv1Storage) DeleteVol(ctx context.Context, volume string, forceDelete 
 	}
 
 	if forceDelete {
-		err = os.RemoveAll(volumeDir)
+		if isMinioMetaBucketName(volume) || HasPrefix(volume, minioMetaBucket) {
+			err = os.RemoveAll(volumeDir)
+		} else {
+			var delDir string
+			delBucket := pathJoin(minioMetaTmpBucket, volume+"."+mustGetUUID())
+			// move to a temporary directory and delete afterwards (move to deletefiles probably)
+			if delDir, err = s.getVolDir(delBucket); err != nil {
+				return err
+			}
+			if err := renameAll(volumeDir, delDir); err != nil {
+				return toObjectErr(err, volume)
+			}
+			go func() {
+				s.DeleteVol(ctx, delBucket, true) // ignore returned error if any.
+			}()
+
+		}
 	} else {
 		err = os.Remove(volumeDir)
 	}
@@ -198,35 +212,6 @@ func (s *fsv1Storage) DeleteVol(ctx context.Context, volume string, forceDelete 
 			return err
 		}
 	}
-	return nil
-}
-
-func (s *fsv1Storage) RenameVol(ctx context.Context, srcVolume, destVolume string) (err error) {
-	sourceDir, err := s.getVolDir(srcVolume)
-	if err != nil {
-		logger.LogIf(ctx, err)
-		return err
-	}
-	destDir, err := s.getVolDir(destVolume)
-	if err != nil {
-		logger.LogIf(ctx, err)
-		return err
-	}
-
-	if err := checkPathLength(sourceDir); err != nil {
-		logger.LogIf(ctx, err)
-		return err
-	}
-	if err := checkPathLength(destDir); err != nil {
-		logger.LogIf(ctx, err)
-		return err
-	}
-
-	if err := os.Rename(sourceDir, destDir); err != nil {
-		logger.LogIf(ctx, err)
-		return osErrToFileErr(err)
-	}
-
 	return nil
 }
 

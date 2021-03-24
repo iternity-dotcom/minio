@@ -526,10 +526,6 @@ func (fs *FSObjects) ListBuckets(ctx context.Context) ([]BucketInfo, error) {
 	return bucketInfos, nil
 }
 
-type volumeRenamer interface {
-	RenameVol(ctx context.Context, srcVolume, destVolume string) (err error)
-}
-
 // DeleteBucket - delete a bucket and all the metadata associated
 // with the bucket including pending multipart, object metadata.
 func (fs *FSObjects) DeleteBucket(ctx context.Context, bucket string, forceDelete bool) error {
@@ -538,23 +534,11 @@ func (fs *FSObjects) DeleteBucket(ctx context.Context, bucket string, forceDelet
 		atomic.AddInt64(&fs.activeIOCount, -1)
 	}()
 
-	if !forceDelete {
-		// Attempt to delete regular bucket.
-		if err := fs.disk.DeleteVol(ctx, bucket, false); err != nil {
-			return toObjectErr(err, bucket)
-		}
-	} else {
-		delBucket := bucket
-		if renamer, ok := fs.disk.(volumeRenamer); ok {
-			delBucket = pathJoin(minioMetaTmpBucket, bucket+"."+mustGetUUID())
-			if err := renamer.RenameVol(ctx, bucket, delBucket); err != nil {
-				return toObjectErr(err, bucket)
-			}
-		}
+	defer ObjectPathUpdated(bucket + slashSeparator)
 
-		go func() {
-			fs.disk.DeleteVol(ctx, delBucket, true) // ignore returned error if any.
-		}()
+	// Attempt to delete regular bucket.
+	if err := fs.disk.DeleteVol(ctx, bucket, forceDelete); err != nil {
+		return toObjectErr(err, bucket)
 	}
 
 	// Cleanup all the bucket metadata.
