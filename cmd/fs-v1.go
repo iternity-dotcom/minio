@@ -526,6 +526,10 @@ func (fs *FSObjects) ListBuckets(ctx context.Context) ([]BucketInfo, error) {
 	return bucketInfos, nil
 }
 
+type volumeRenamer interface {
+	RenameVol(ctx context.Context, srcVolume, destVolume string) (err error)
+}
+
 // DeleteBucket - delete a bucket and all the metadata associated
 // with the bucket including pending multipart, object metadata.
 func (fs *FSObjects) DeleteBucket(ctx context.Context, bucket string, forceDelete bool) error {
@@ -534,30 +538,28 @@ func (fs *FSObjects) DeleteBucket(ctx context.Context, bucket string, forceDelet
 		atomic.AddInt64(&fs.activeIOCount, -1)
 	}()
 
-	bucketDir, err := fs.getBucketDir(ctx, bucket)
-	if err != nil {
-		return toObjectErr(err, bucket)
-	}
-
 	if !forceDelete {
 		// Attempt to delete regular bucket.
-		if err = fsRemoveDir(ctx, bucketDir); err != nil {
+		if err := fs.disk.DeleteVol(ctx, bucket, false); err != nil {
 			return toObjectErr(err, bucket)
 		}
 	} else {
-		tmpBucketPath := pathJoin(fs.disk.String(), minioMetaTmpBucket, bucket+"."+mustGetUUID())
-		if err = fsSimpleRenameFile(ctx, bucketDir, tmpBucketPath); err != nil {
-			return toObjectErr(err, bucket)
+		delBucket := bucket
+		if renamer, ok := fs.disk.(volumeRenamer); ok {
+			delBucket = pathJoin(minioMetaTmpBucket, bucket+"."+mustGetUUID())
+			if err := renamer.RenameVol(ctx, bucket, delBucket); err != nil {
+				return toObjectErr(err, bucket)
+			}
 		}
 
 		go func() {
-			fsRemoveAll(ctx, tmpBucketPath) // ignore returned error if any.
+			fs.disk.DeleteVol(ctx, delBucket, true) // ignore returned error if any.
 		}()
 	}
 
 	// Cleanup all the bucket metadata.
-	minioMetadataBucketDir := pathJoin(fs.disk.String(), minioMetaBucket, bucketMetaPrefix, bucket)
-	if err = fsRemoveAll(ctx, minioMetadataBucketDir); err != nil {
+	minioMetadataBucketDir := pathJoin(minioMetaBucket, bucketMetaPrefix, bucket)
+	if err := fs.disk.DeleteVol(ctx, minioMetadataBucketDir, true); err != nil {
 		return toObjectErr(err, bucket)
 	}
 

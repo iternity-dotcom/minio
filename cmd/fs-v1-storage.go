@@ -22,6 +22,8 @@ import (
 	"io"
 	"net/url"
 	"os"
+
+	"github.com/minio/minio/cmd/logger"
 )
 
 type fsv1Storage struct {
@@ -196,6 +198,35 @@ func (s *fsv1Storage) DeleteVol(ctx context.Context, volume string, forceDelete 
 			return err
 		}
 	}
+	return nil
+}
+
+func (s *fsv1Storage) RenameVol(ctx context.Context, srcVolume, destVolume string) (err error) {
+	sourceDir, err := s.getVolDir(srcVolume)
+	if err != nil {
+		logger.LogIf(ctx, err)
+		return err
+	}
+	destDir, err := s.getVolDir(destVolume)
+	if err != nil {
+		logger.LogIf(ctx, err)
+		return err
+	}
+
+	if err := checkPathLength(sourceDir); err != nil {
+		logger.LogIf(ctx, err)
+		return err
+	}
+	if err := checkPathLength(destDir); err != nil {
+		logger.LogIf(ctx, err)
+		return err
+	}
+
+	if err := os.Rename(sourceDir, destDir); err != nil {
+		logger.LogIf(ctx, err)
+		return osErrToFileErr(err)
+	}
+
 	return nil
 }
 
