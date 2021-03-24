@@ -373,29 +373,6 @@ func (fs *FSObjects) scanBucket(ctx context.Context, bucket string, cache dataUs
 
 /// Bucket operations
 
-// getBucketDir - will convert incoming bucket names to
-// corresponding valid bucket names on the backend in a platform
-// compatible way for all operating systems.
-func (fs *FSObjects) getBucketDir(ctx context.Context, bucket string) (string, error) {
-	if bucket == "" || bucket == "." || bucket == ".." {
-		return "", errVolumeNotFound
-	}
-	bucketDir := pathJoin(fs.disk.String(), bucket)
-	return bucketDir, nil
-}
-
-func (fs *FSObjects) statBucketDir(ctx context.Context, bucket string) (os.FileInfo, error) {
-	bucketDir, err := fs.getBucketDir(ctx, bucket)
-	if err != nil {
-		return nil, err
-	}
-	st, err := fsStatVolume(ctx, bucketDir)
-	if err != nil {
-		return nil, err
-	}
-	return st, nil
-}
-
 // MakeBucketWithLocation - create a new bucket, returns if it already exists.
 func (fs *FSObjects) MakeBucketWithLocation(ctx context.Context, bucket string, opts BucketOptions) error {
 	if opts.LockEnabled || opts.VersioningEnabled {
@@ -413,12 +390,8 @@ func (fs *FSObjects) MakeBucketWithLocation(ctx context.Context, bucket string, 
 		atomic.AddInt64(&fs.activeIOCount, -1)
 	}()
 
-	bucketDir, err := fs.getBucketDir(ctx, bucket)
+	err := fs.disk.MakeVol(ctx, bucket)
 	if err != nil {
-		return toObjectErr(err, bucket)
-	}
-
-	if err = fsMkdir(ctx, bucketDir); err != nil {
 		return toObjectErr(err, bucket)
 	}
 
@@ -478,12 +451,12 @@ func (fs *FSObjects) GetBucketInfo(ctx context.Context, bucket string) (bi Bucke
 		atomic.AddInt64(&fs.activeIOCount, -1)
 	}()
 
-	st, err := fs.statBucketDir(ctx, bucket)
+	st, err := fs.disk.StatVol(ctx, bucket)
 	if err != nil {
 		return bi, toObjectErr(err, bucket)
 	}
 
-	createdTime := st.ModTime()
+	createdTime := st.Created
 	meta, err := globalBucketMetadataSys.Get(bucket)
 	if err == nil {
 		createdTime = meta.Created
@@ -584,7 +557,7 @@ func (fs *FSObjects) CopyObject(ctx context.Context, srcBucket, srcObject, dstBu
 		atomic.AddInt64(&fs.activeIOCount, -1)
 	}()
 
-	if _, err := fs.statBucketDir(ctx, srcBucket); err != nil {
+	if _, err := fs.disk.StatVol(ctx, srcBucket); err != nil {
 		return oi, toObjectErr(err, srcBucket)
 	}
 
@@ -655,7 +628,7 @@ func (fs *FSObjects) GetObjectNInfo(ctx context.Context, bucket, object string, 
 		atomic.AddInt64(&fs.activeIOCount, -1)
 	}()
 
-	if _, err = fs.statBucketDir(ctx, bucket); err != nil {
+	if _, err = fs.disk.StatVol(ctx, bucket); err != nil {
 		return nil, toObjectErr(err, bucket)
 	}
 
@@ -741,7 +714,7 @@ func (fs *FSObjects) GetObjectNInfo(ctx context.Context, bucket, object string, 
 
 // getObject - wrapper for GetObject
 func (fs *FSObjects) getObject(ctx context.Context, bucket, object string, offset int64, length int64, writer io.Writer, etag string, lock bool) (err error) {
-	if _, err = fs.statBucketDir(ctx, bucket); err != nil {
+	if _, err = fs.disk.StatVol(ctx, bucket); err != nil {
 		return toObjectErr(err, bucket)
 	}
 
@@ -955,7 +928,7 @@ func (fs *FSObjects) getObjectInfoWithLock(ctx context.Context, bucket, object s
 		return oi, err
 	}
 
-	if _, err := fs.statBucketDir(ctx, bucket); err != nil {
+	if _, err := fs.disk.StatVol(ctx, bucket); err != nil {
 		return oi, err
 	}
 
@@ -1061,7 +1034,7 @@ func (fs *FSObjects) putObject(ctx context.Context, bucket string, object string
 	var err error
 
 	// Validate if bucket name is valid and exists.
-	if _, err = fs.statBucketDir(ctx, bucket); err != nil {
+	if _, err = fs.disk.StatVol(ctx, bucket); err != nil {
 		return ObjectInfo{}, toObjectErr(err, bucket)
 	}
 
@@ -1229,7 +1202,7 @@ func (fs *FSObjects) DeleteObject(ctx context.Context, bucket, object string, op
 		atomic.AddInt64(&fs.activeIOCount, -1)
 	}()
 
-	if _, err = fs.statBucketDir(ctx, bucket); err != nil {
+	if _, err = fs.disk.StatVol(ctx, bucket); err != nil {
 		return objInfo, toObjectErr(err, bucket)
 	}
 

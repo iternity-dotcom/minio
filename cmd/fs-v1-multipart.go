@@ -135,7 +135,7 @@ func (fs *FSObjects) ListMultipartUploads(ctx context.Context, bucket, object, k
 		return result, toObjectErr(err)
 	}
 
-	if _, err := fs.statBucketDir(ctx, bucket); err != nil {
+	if _, err := fs.disk.StatVol(ctx, bucket); err != nil {
 		return result, toObjectErr(err, bucket)
 	}
 
@@ -218,7 +218,7 @@ func (fs *FSObjects) NewMultipartUpload(ctx context.Context, bucket, object stri
 		return "", toObjectErr(err, bucket)
 	}
 
-	if _, err := fs.statBucketDir(ctx, bucket); err != nil {
+	if _, err := fs.disk.StatVol(ctx, bucket); err != nil {
 		return "", toObjectErr(err, bucket)
 	}
 
@@ -293,7 +293,7 @@ func (fs *FSObjects) PutObjectPart(ctx context.Context, bucket, object, uploadID
 		return pi, toObjectErr(err, bucket)
 	}
 
-	if _, err := fs.statBucketDir(ctx, bucket); err != nil {
+	if _, err := fs.disk.StatVol(ctx, bucket); err != nil {
 		return pi, toObjectErr(err, bucket)
 	}
 
@@ -379,7 +379,7 @@ func (fs *FSObjects) GetMultipartInfo(ctx context.Context, bucket, object, uploa
 	}
 
 	// Check if bucket exists
-	if _, err := fs.statBucketDir(ctx, bucket); err != nil {
+	if _, err := fs.disk.StatVol(ctx, bucket); err != nil {
 		return minfo, toObjectErr(err, bucket)
 	}
 
@@ -425,7 +425,7 @@ func (fs *FSObjects) ListObjectParts(ctx context.Context, bucket, object, upload
 	result.PartNumberMarker = partNumberMarker
 
 	// Check if bucket exists
-	if _, err := fs.statBucketDir(ctx, bucket); err != nil {
+	if _, err := fs.disk.StatVol(ctx, bucket); err != nil {
 		return result, toObjectErr(err, bucket)
 	}
 
@@ -555,7 +555,7 @@ func (fs *FSObjects) CompleteMultipartUpload(ctx context.Context, bucket string,
 		return oi, toObjectErr(errFileParentIsFile, bucket, object)
 	}
 
-	if _, err := fs.statBucketDir(ctx, bucket); err != nil {
+	if _, err := fs.disk.StatVol(ctx, bucket); err != nil {
 		return oi, toObjectErr(err, bucket)
 	}
 	defer ObjectPathUpdated(pathutil.Join(bucket, object))
@@ -810,7 +810,7 @@ func (fs *FSObjects) AbortMultipartUpload(ctx context.Context, bucket, object, u
 		return err
 	}
 
-	if _, err := fs.statBucketDir(ctx, bucket); err != nil {
+	if _, err := fs.disk.StatVol(ctx, bucket); err != nil {
 		return toObjectErr(err, bucket)
 	}
 

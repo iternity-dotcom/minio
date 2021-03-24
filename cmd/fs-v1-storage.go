@@ -166,7 +166,33 @@ func (s *fsv1Storage) ListVols(ctx context.Context) (vols []VolInfo, err error) 
 }
 
 func (s *fsv1Storage) StatVol(ctx context.Context, volume string) (vol VolInfo, err error) {
-	return VolInfo{}, NotImplemented{}
+	volumeDir, err := s.getVolDir(volume)
+	if err != nil {
+		return VolInfo{}, err
+	}
+	// Stat a volume entry.
+	var st os.FileInfo
+	st, err = Lstat(volumeDir) // TODO: why xl uses lstat
+	if err != nil {
+		switch {
+		case osIsNotExist(err):
+			return VolInfo{}, errVolumeNotFound
+		case osIsPermission(err):
+			return VolInfo{}, errDiskAccessDenied
+		case isSysErrIO(err):
+			return VolInfo{}, errFaultyDisk
+		default:
+			return VolInfo{}, err
+		}
+	}
+	// As os.Lstat() doesn't carry other than ModTime(), use ModTime()
+	// as CreatedTime.
+	createdTime := st.ModTime()
+	return VolInfo{
+		Name:    volume,
+		Created: createdTime,
+	}, nil
+
 }
 
 func (s *fsv1Storage) DeleteVol(ctx context.Context, volume string, forceDelete bool) (err error) {
