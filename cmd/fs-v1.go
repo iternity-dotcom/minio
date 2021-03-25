@@ -1466,7 +1466,61 @@ func (fs *FSObjects) HealBucket(ctx context.Context, bucket string, opts madmin.
 // error walker returns error. Optionally if context.Done() is received
 // then Walk() stops the walker.
 func (fs *FSObjects) Walk(ctx context.Context, bucket, prefix string, results chan<- ObjectInfo, opts ObjectOptions) error {
-	return fsWalk(ctx, fs, bucket, prefix, fs.listDirFactory(ctx), fs.isLeaf, fs.isLeafDir, results, fs.getObjectInfoNoFSLock, fs.getObjectInfoNoFSLock)
+	if err := checkListObjsArgs(ctx, bucket, prefix, "", fs); err != nil {
+		// Upon error close the channel.
+		close(results)
+		return err
+	}
+
+	if opts.WalkVersions {
+		go func() {
+			defer close(results)
+
+			var marker, versionIDMarker string
+			for {
+				loi, err := fs.ListObjectVersions(ctx, bucket, prefix, marker, versionIDMarker, "", 1000)
+				if err != nil {
+					break
+				}
+
+				for _, obj := range loi.Objects {
+					results <- obj
+				}
+
+				if !loi.IsTruncated {
+					break
+				}
+
+				marker = loi.NextMarker
+				versionIDMarker = loi.NextVersionIDMarker
+			}
+		}()
+		return nil
+	}
+
+	go func() {
+		defer close(results)
+
+		var marker string
+		for {
+			loi, err := fs.ListObjects(ctx, bucket, prefix, marker, "", 1000)
+			if err != nil {
+				break
+			}
+
+			for _, obj := range loi.Objects {
+				results <- obj
+			}
+
+			if !loi.IsTruncated {
+				break
+			}
+
+			marker = loi.NextMarker
+		}
+	}()
+
+	return nil
 }
 
 // HealObjects - no-op for fs. Valid only for Erasure.
