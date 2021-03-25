@@ -1368,7 +1368,7 @@ func (fs *FSObjects) ListObjects(ctx context.Context, bucket, prefix, marker, de
 	}()
 
 	return listObjects(ctx, fs, bucket, prefix, marker, delimiter, maxKeys, fs.listPool,
-		fs.listDirFactory(ctx), fs.isLeaf, fs.isLeafDir, fs.getObjectInfoNoFSLock, fs.getObjectInfoNoFSLock)
+		fs.listDirFactory(ctx), fs.isLeaf, fs.isLeafDir, fs.getObjectInfoNoFSLock)
 }
 
 // GetObjectTags - get object tags from an existing object

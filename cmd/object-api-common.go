@@ -87,7 +87,7 @@ func newStorageAPI(endpoint Endpoint) (storage StorageAPI, err error) {
 	return newStorageRESTClient(endpoint, true), nil
 }
 
-func listObjectsNonSlash(ctx context.Context, bucket, prefix, marker, delimiter string, maxKeys int, tpool *TreeWalkPool, listDir ListDirFunc, isLeaf IsLeafFunc, isLeafDir IsLeafDirFunc, getObjInfo func(context.Context, string, string) (ObjectInfo, error), getObjectInfoDirs ...func(context.Context, string, string) (ObjectInfo, error)) (loi ListObjectsInfo, err error) {
+func listObjectsNonSlash(ctx context.Context, bucket, prefix, marker, delimiter string, maxKeys int, tpool *TreeWalkPool, listDir ListDirFunc, isLeaf IsLeafFunc, isLeafDir IsLeafDirFunc, getObjInfo func(context.Context, string, string) (ObjectInfo, error)) (loi ListObjectsInfo, err error) {
 	endWalkCh := make(chan struct{})
 	defer close(endWalkCh)
 	recursive := true
@@ -170,9 +170,9 @@ func listObjectsNonSlash(ctx context.Context, bucket, prefix, marker, delimiter 
 	return result, nil
 }
 
-func listObjects(ctx context.Context, obj ObjectLayer, bucket, prefix, marker, delimiter string, maxKeys int, tpool *TreeWalkPool, listDir ListDirFunc, isLeaf IsLeafFunc, isLeafDir IsLeafDirFunc, getObjInfo func(context.Context, string, string) (ObjectInfo, error), getObjectInfoDirs ...func(context.Context, string, string) (ObjectInfo, error)) (loi ListObjectsInfo, err error) {
+func listObjects(ctx context.Context, obj ObjectLayer, bucket, prefix, marker, delimiter string, maxKeys int, tpool *TreeWalkPool, listDir ListDirFunc, isLeaf IsLeafFunc, isLeafDir IsLeafDirFunc, getObjInfo func(context.Context, string, string) (ObjectInfo, error)) (loi ListObjectsInfo, err error) {
 	if delimiter != SlashSeparator && delimiter != "" {
-		return listObjectsNonSlash(ctx, bucket, prefix, marker, delimiter, maxKeys, tpool, listDir, isLeaf, isLeafDir, getObjInfo, getObjectInfoDirs...)
+		return listObjectsNonSlash(ctx, bucket, prefix, marker, delimiter, maxKeys, tpool, listDir, isLeaf, isLeafDir, getObjInfo)
 	}
 
 	if err := checkListObjsArgs(ctx, bucket, prefix, marker, obj); err != nil {
@@ -236,48 +236,27 @@ func listObjects(ctx context.Context, obj ObjectLayer, bucket, prefix, marker, d
 			eof = true
 		}
 
-		if HasSuffix(walkResult.entry, SlashSeparator) {
-			g.Go(func() error {
-				for _, getObjectInfoDir := range getObjectInfoDirs {
-					objInfo, err := getObjectInfoDir(ctx, bucket, walkResult.entry)
-					if err == nil {
-						objInfoFound[i] = &objInfo
-						// Done...
-						return nil
-					}
-
-					// Add temp, may be overridden,
-					if err == errFileNotFound {
-						objInfoFound[i] = &ObjectInfo{
-							Bucket: bucket,
-							Name:   walkResult.entry,
-							IsDir:  true,
-						}
-						continue
-					}
-					return toObjectErr(err, bucket, prefix)
-				}
-				return nil
-			}, i)
-		} else {
-			g.Go(func() error {
-				objInfo, err := getObjInfo(ctx, bucket, walkResult.entry)
-				if err != nil {
-					// Ignore errFileNotFound as the object might have got
-					// deleted in the interim period of listing and getObjectInfo(),
-					// ignore quorum error as it might be an entry from an outdated disk.
-					if IsErrIgnored(err, []error{
-						errFileNotFound,
-						errErasureReadQuorum,
-					}...) {
-						return nil
-					}
-					return toObjectErr(err, bucket, prefix)
-				}
+		g.Go(func() error {
+			objInfo, err := getObjInfo(ctx, bucket, walkResult.entry)
+			if err == nil {
 				objInfoFound[i] = &objInfo
 				return nil
-			}, i)
-		}
+			}
+			// Ignore errFileNotFound as the object might have got
+			// deleted in the interim period of listing and getObjectInfo(),
+			// ignore quorum error as it might be an entry from an outdated disk.
+			if err == errFileNotFound {
+				if HasSuffix(walkResult.entry, SlashSeparator) {
+					objInfoFound[i] = &ObjectInfo{
+						Bucket: bucket,
+						Name:   walkResult.entry,
+						IsDir:  true,
+					}
+				}
+				return nil
+			}
+			return toObjectErr(err, bucket, prefix)
+		}, i)
 
 		if walkResult.end {
 			eof = true
