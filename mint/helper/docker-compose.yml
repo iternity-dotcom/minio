@@ -1,0 +1,33 @@
+version: "3.3"
+
+services:
+
+  minio:
+    image: iternity/minio
+    command: server /data --address :443
+    ports:
+      - 443:443
+    environment:
+      - MINIO_ACCESS_KEY=accessKey
+      - MINIO_SECRET_KEY=secretKey
+    volumes:
+      - ./data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-k", "https://localhost/minio/health/live"]
+      interval: 5s
+      timeout: 2s
+      retries: 5
+
+  mint:
+    image: iternity/mint
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      - MINT_MODE=full
+      - SERVER_ENDPOINT=minio:443
+      - ACCESS_KEY=accessKey
+      - SECRET_KEY=secretKey
+      - ENABLE_HTTPS=1
+    volumes:
+      - ./test-logs:/mint/log
