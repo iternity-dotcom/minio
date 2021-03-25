@@ -515,8 +515,8 @@ func (fs *FSObjects) DeleteBucket(ctx context.Context, bucket string, forceDelet
 	}
 
 	// Cleanup all the bucket metadata.
-	minioMetadataBucketDir := pathJoin(minioMetaBucket, bucketMetaPrefix, bucket)
-	if err := fs.disk.DeleteVol(ctx, minioMetadataBucketDir, true); err != nil {
+	minioMetadataBucket := pathJoin(minioMetaBucket, bucketMetaPrefix, bucket)
+	if err := fs.disk.DeleteVol(ctx, minioMetadataBucket, true); err != nil {
 		return toObjectErr(err, bucket)
 	}
 
@@ -1252,11 +1252,11 @@ func (fs *FSObjects) isLeaf(bucket string, leafPath string) bool {
 // Returns function "listDir" of the type listDirFunc.
 // isLeaf - is used by listDir function to check if an entry
 // is a leaf or non-leaf entry.
-func (fs *FSObjects) listDirFactory() ListDirFunc {
+func (fs *FSObjects) listDirFactory(ctx context.Context) ListDirFunc {
 	// listDir - lists all the entries at a given prefix and given entry in the prefix.
 	listDir := func(bucket, prefixDir, prefixEntry string) (emptyDir bool, entries []string, delayIsLeaf bool) {
 		var err error
-		entries, err = readDir(pathJoin(fs.disk.String(), bucket, prefixDir))
+		entries, err = fs.disk.ListDir(ctx, bucket, prefixDir, -1)
 		if err != nil && err != errFileNotFound {
 			logger.LogIf(GlobalContext, err)
 			return false, nil, false
@@ -1368,7 +1368,7 @@ func (fs *FSObjects) ListObjects(ctx context.Context, bucket, prefix, marker, de
 	}()
 
 	return listObjects(ctx, fs, bucket, prefix, marker, delimiter, maxKeys, fs.listPool,
-		fs.listDirFactory(), fs.isLeaf, fs.isLeafDir, fs.getObjectInfoNoFSLock, fs.getObjectInfoNoFSLock)
+		fs.listDirFactory(ctx), fs.isLeaf, fs.isLeafDir, fs.getObjectInfoNoFSLock, fs.getObjectInfoNoFSLock)
 }
 
 // GetObjectTags - get object tags from an existing object
@@ -1466,7 +1466,7 @@ func (fs *FSObjects) HealBucket(ctx context.Context, bucket string, opts madmin.
 // error walker returns error. Optionally if context.Done() is received
 // then Walk() stops the walker.
 func (fs *FSObjects) Walk(ctx context.Context, bucket, prefix string, results chan<- ObjectInfo, opts ObjectOptions) error {
-	return fsWalk(ctx, fs, bucket, prefix, fs.listDirFactory(), fs.isLeaf, fs.isLeafDir, results, fs.getObjectInfoNoFSLock, fs.getObjectInfoNoFSLock)
+	return fsWalk(ctx, fs, bucket, prefix, fs.listDirFactory(ctx), fs.isLeaf, fs.isLeafDir, results, fs.getObjectInfoNoFSLock, fs.getObjectInfoNoFSLock)
 }
 
 // HealObjects - no-op for fs. Valid only for Erasure.

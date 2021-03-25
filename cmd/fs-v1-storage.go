@@ -293,8 +293,35 @@ func (s *fsv1Storage) WalkVersions(ctx context.Context, volume, dirPath, marker 
 	return nil, NotImplemented{}
 }
 
+// ListDir - return all the entries at the given directory path.
+// If an entry is a directory it will be returned with a trailing SlashSeparator.
 func (s *fsv1Storage) ListDir(ctx context.Context, volume, dirPath string, count int) (entries []string, err error) {
-	return nil, NotImplemented{}
+	// Verify if volume is valid and it exists.
+	volumeDir, err := s.getVolDir(volume)
+	if err != nil {
+		return nil, err
+	}
+
+	dirPathAbs := pathJoin(volumeDir, dirPath)
+	if count > 0 {
+		entries, err = readDirN(dirPathAbs, count)
+	} else {
+		entries, err = readDir(dirPathAbs)
+	}
+	if err != nil {
+		if err == errFileNotFound {
+			if _, verr := Lstat(volumeDir); verr != nil {
+				if osIsNotExist(verr) {
+					return nil, errVolumeNotFound
+				} else if isSysErrIO(verr) {
+					return nil, errFaultyDisk
+				}
+			}
+		}
+		return nil, err
+	}
+
+	return entries, nil
 }
 
 func (s *fsv1Storage) Delete(ctx context.Context, volume string, path string, recursive bool) error {
