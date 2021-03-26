@@ -21,7 +21,6 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
-	"github.com/minio/minio/cmd/logger"
 	"io"
 	"io/ioutil"
 	"net/url"
@@ -29,6 +28,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/minio/minio/cmd/logger"
 
 	pathutil "path"
 
@@ -556,6 +557,8 @@ func (s *fsv1Storage) WalkDir(ctx context.Context, opts WalkDirOptions, wr io.Wr
 			return nil
 		}
 
+		sort.Strings(entries)
+
 		dirObjects := make(map[string]struct{})
 		for i, entry := range entries {
 			if len(prefix) > 0 && !strings.HasPrefix(entry, prefix) {
@@ -589,7 +592,6 @@ func (s *fsv1Storage) WalkDir(ctx context.Context, opts WalkDirOptions, wr io.Wr
 			}
 			meta.name = pathJoin(current, entry)
 			out <- meta
-			return nil
 		}
 
 		// Process in sort order.
@@ -619,7 +621,7 @@ func (s *fsv1Storage) WalkDir(ctx context.Context, opts WalkDirOptions, wr io.Wr
 			}
 
 			if _, isDirObj := dirObjects[entry]; !isDirObj {
-				dirStack = append(dirStack, meta.name + slashSeparator)
+				dirStack = append(dirStack, meta.name+slashSeparator)
 			}
 
 		}
