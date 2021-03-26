@@ -22,7 +22,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"github.com/minio/minio/cmd/logger"
-	xioutil "github.com/minio/minio/pkg/ioutil"
 	"io"
 	"io/ioutil"
 	"net/url"
@@ -582,6 +581,7 @@ func (s *fsv1Storage) WalkDir(ctx context.Context, opts WalkDirOptions, wr io.Wr
 
 			// If root was an object return it as such.
 			var meta metaCacheEntry
+			// TODO: meta fileinfo
 			meta.metadata, err = s.getObjectMetaNoFSLock(ctx, opts.Bucket, pathJoin(current, entry))
 			if err != nil {
 				logger.LogIf(ctx, err)
@@ -618,43 +618,10 @@ func (s *fsv1Storage) WalkDir(ctx context.Context, opts WalkDirOptions, wr io.Wr
 				dirStack = dirStack[:len(dirStack)-1]
 			}
 
-			// All objects will be returned as directories, there has been no object check yet.
-			// Check it by attempting to read metadata.
-			_, isDirObj := dirObjects[entry]
-			if isDirObj {
-				meta.name = meta.name[:len(meta.name)-1] + globalDirSuffixWithSlash
+			if _, isDirObj := dirObjects[entry]; !isDirObj {
+				dirStack = append(dirStack, meta.name + slashSeparator)
 			}
 
-			meta.metadata, err = xioutil.ReadFile(pathJoin(volumeDir, meta.name, xlStorageFormatFile))
-			switch {
-			case err == nil:
-				// It was an object
-				if isDirObj {
-					meta.name = strings.TrimSuffix(meta.name, globalDirSuffixWithSlash) + slashSeparator
-				}
-				out <- meta
-			case osIsNotExist(err):
-				meta.metadata, err = xioutil.ReadFile(pathJoin(volumeDir, meta.name, xlStorageFormatFileV1))
-				if err == nil {
-					// Maybe rename? Would make it inconsistent across disks though.
-					// os.Rename(pathJoin(volumeDir, meta.name, xlStorageFormatFileV1), pathJoin(volumeDir, meta.name, xlStorageFormatFile))
-					// It was an object
-					out <- meta
-					continue
-				}
-
-				// NOT an object, append to stack (with slash)
-				// If dirObject, but no metadata (which is unexpected) we skip it.
-				if !isDirObj {
-					if !isDirEmpty(pathJoin(volumeDir, meta.name+slashSeparator)) {
-						dirStack = append(dirStack, meta.name+slashSeparator)
-					}
-				}
-			case isSysErrNotDir(err):
-				// skip
-			default:
-				logger.LogIf(ctx, err)
-			}
 		}
 		// If directory entry left on stack, pop it now.
 		for len(dirStack) > 0 {
