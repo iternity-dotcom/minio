@@ -544,6 +544,9 @@ func (s *fsv1Storage) WalkDir(ctx context.Context, opts WalkDirOptions, wr io.Wr
 	forward := opts.ForwardTo
 	var scanDir func(path string) error
 	scanDir = func(current string) error {
+		if contextCanceled(ctx) {
+			return ctx.Err()
+		}
 		entries, err := s.ListDir(ctx, opts.Bucket, current, -1)
 		if err != nil {
 			// Folder could have gone away in-between
@@ -569,7 +572,7 @@ func (s *fsv1Storage) WalkDir(ctx context.Context, opts WalkDirOptions, wr io.Wr
 			}
 
 			if strings.HasSuffix(entry, slashSeparator) {
-				if !s.isObjectDir(opts.Bucket, pathJoin(current, entry)) {
+				if s.isObjectDir(opts.Bucket, pathJoin(current, entry)) {
 					// Add without extension so it is sorted correctly.
 					dirObjects[entry] = struct{}{}
 					entries[i] = entry
@@ -582,9 +585,11 @@ func (s *fsv1Storage) WalkDir(ctx context.Context, opts WalkDirOptions, wr io.Wr
 			// Do do not retain the file.
 			entries[i] = ""
 
+			if contextCanceled(ctx) {
+				return ctx.Err()
+			}
 			// If root was an object return it as such.
 			var meta metaCacheEntry
-			// TODO: meta fileinfo
 			meta.metadata, err = s.getObjectMetaNoFSLock(ctx, opts.Bucket, pathJoin(current, entry))
 			if err != nil {
 				logger.LogIf(ctx, err)
@@ -602,6 +607,9 @@ func (s *fsv1Storage) WalkDir(ctx context.Context, opts WalkDirOptions, wr io.Wr
 		for _, entry := range entries {
 			if entry == "" {
 				continue
+			}
+			if contextCanceled(ctx) {
+				return ctx.Err()
 			}
 			meta := metaCacheEntry{name: PathJoin(current, entry)}
 

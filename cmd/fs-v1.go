@@ -20,8 +20,8 @@ package cmd
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
-	"github.com/minio/minio/pkg/sync/errgroup"
 	"io"
 	"io/ioutil"
 	"net/http"
@@ -124,8 +124,8 @@ func NewFSObjectLayer(fsPath string) (ObjectLayer, error) {
 
 	// Initialize fs objects.
 	fs := &FSObjects{
-		disk:         disk,
-		fsUUID:       diskID,
+		disk:   disk,
+		fsUUID: diskID,
 		rwPool: &fsIOPool{
 			readersMap: make(map[string]*lock.RLockedFile),
 		},
@@ -841,6 +841,7 @@ func (fs *FSObjects) getObjectInfoNoFSLock(ctx context.Context, bucket, object s
 
 	return fsMeta.ToObjectInfo(bucket, object, fi), nil
 }
+
 // getObjectInfo - wrapper for reading object metadata and constructs ObjectInfo.
 func (fs *FSObjects) getObjectInfo(ctx context.Context, bucket, object string) (oi ObjectInfo, e error) {
 	if strings.HasSuffix(object, SlashSeparator) && !fs.isObjectDir(bucket, object) {
@@ -1260,6 +1261,7 @@ func (fs *FSObjects) isObjectDir(bucket, prefix string) bool {
 	}
 	return len(entries) == 0
 }
+
 // getObjectETag is a helper function, which returns only the md5sum
 // of the file on the disk.
 func (fs *FSObjects) getObjectETag(ctx context.Context, bucket, entry string, lock bool) (string, error) {
@@ -1344,29 +1346,100 @@ func (fs *FSObjects) ListObjects(ctx context.Context, bucket, prefix, marker, de
 		atomic.AddInt64(&fs.activeIOCount, -1)
 	}()
 
-	return fs.fsListObjects(ctx, bucket, prefix, marker, delimiter, maxKeys)
+	// Default is recursive, if delimiter is set then list non recursive.
+	recursive := true
+	if delimiter == SlashSeparator {
+		recursive = false
+	}
+	opts := listPathOptions{
+		Bucket:      bucket,
+		Prefix:      prefix,
+		Separator:   delimiter,
+		Limit:       maxKeysPlusOne(maxKeys, marker != ""),
+		Marker:      marker,
+		Recursive:   recursive,
+		InclDeleted: true,
+		AskDisks:    0,
+	}
+	return fs.fsListObjects(ctx, opts)
 }
 
+// fileInfoVersionsFS is a copy of fileInfos converts the metadata to FileInfoVersions where possible.
+// Metadata that cannot be decoded is skipped.
+func (m *metaCacheEntriesSorted) fileInfosFS(bucket, prefix, delimiter string, objectInfo func(object string) (ObjectInfo, error)) (objects []ObjectInfo) {
+	objects = make([]ObjectInfo, 0, m.len())
+	prevPrefix := ""
+	for _, entry := range m.o {
+		if entry.isObject() {
+			if delimiter != "" {
+				idx := strings.Index(strings.TrimPrefix(entry.name, prefix), delimiter)
+				if idx >= 0 {
+					idx = len(prefix) + idx + len(delimiter)
+					currPrefix := entry.name[:idx]
+					if currPrefix == prevPrefix {
+						continue
+					}
+					prevPrefix = currPrefix
+					objects = append(objects, ObjectInfo{
+						IsDir:  true,
+						Bucket: bucket,
+						Name:   currPrefix,
+					})
+					continue
+				}
+			}
 
-func (fs *FSObjects) fsListObjects(ctx context.Context, bucket, prefix, marker, delimiter string, maxKeys int) (loi ListObjectsInfo, err error) {
-	if delimiter != SlashSeparator && delimiter != "" {
-		return listObjectsNonSlash(ctx, bucket, prefix, marker, delimiter, maxKeys, fs.listPool, fs.listDirFactory(ctx), fs.isLeaf, fs.isLeafDir, fs.getObjectInfoNoFSLock)
+			oi, err := objectInfo(entry.name)
+			if err == nil {
+				objects = append(objects, oi)
+			}
+			continue
+		}
+		if entry.isDir() {
+			if delimiter == "" {
+				continue
+			}
+			idx := strings.Index(strings.TrimPrefix(entry.name, prefix), delimiter)
+			if idx < 0 {
+				continue
+			}
+			idx = len(prefix) + idx + len(delimiter)
+			currPrefix := entry.name[:idx]
+			if currPrefix == prevPrefix {
+				continue
+			}
+			prevPrefix = currPrefix
+			objects = append(objects, ObjectInfo{
+				IsDir:  true,
+				Bucket: bucket,
+				Name:   currPrefix,
+			})
+		}
 	}
 
-	if err := checkListObjsArgs(ctx, bucket, prefix, marker, fs); err != nil {
+	return objects
+}
+func (fs *FSObjects) fsListObjects(ctx context.Context, opts listPathOptions) (ListObjectsInfo, error) {
+	var loi ListObjectsInfo
+
+	// Cancel upstream if we finish before we expect.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	if err := checkListObjsArgs(ctx, opts.Bucket, opts.Prefix, opts.Marker, fs); err != nil {
 		return loi, err
 	}
 
 	// Marker is set validate pre-condition.
-	if marker != "" {
+	if opts.Marker != "" {
 		// Marker not common with prefix is not implemented. Send an empty response
-		if !HasPrefix(marker, prefix) {
+		if !HasPrefix(opts.Marker, opts.Separator) {
 			return loi, nil
 		}
 	}
 
 	// With max keys of zero we have reached eof, return right here.
-	if maxKeys == 0 {
+	if opts.Limit == 0 {
 		return loi, nil
 	}
 
@@ -1375,19 +1448,8 @@ func (fs *FSObjects) fsListObjects(ctx context.Context, bucket, prefix, marker, 
 	// along // with the prefix. On a flat namespace with 'prefix'
 	// as '/' we don't have any entries, since all the keys are
 	// of form 'keyName/...'
-	if delimiter == SlashSeparator && prefix == SlashSeparator {
+	if opts.Separator == SlashSeparator && opts.Prefix == SlashSeparator {
 		return loi, nil
-	}
-
-	// Over flowing count - reset to maxObjectList.
-	if maxKeys < 0 || maxKeys > maxObjectList {
-		maxKeys = maxObjectList
-	}
-
-	// Default is recursive, if delimiter is set then list non recursive.
-	recursive := true
-	if delimiter == SlashSeparator {
-		recursive = false
 	}
 
 	r, w := io.Pipe()
@@ -1395,114 +1457,54 @@ func (fs *FSObjects) fsListObjects(ctx context.Context, bucket, prefix, marker, 
 	if err != nil {
 		return loi, err
 	}
+
+	// Make sure we close the pipe so blocked writes doesn't stay around.
+	// todo - move to a pool
+	defer r.CloseWithError(context.Canceled)
+
 	go func() {
 		werr := fs.disk.WalkDir(ctx, WalkDirOptions{
-			Bucket:         bucket,
-			BaseDir:        baseDirFromPrefix(prefix),
-			Recursive:      recursive,
+			Bucket:         opts.Bucket,
+			BaseDir:        baseDirFromPrefix(opts.Prefix),
+			Recursive:      opts.Recursive,
 			ReportNotFound: false,
-			FilterPrefix:   prefix,
+			FilterPrefix:   opts.Prefix,
 		}, w)
 		w.CloseWithError(werr)
-		if werr != io.EOF && werr != nil && werr.Error() != errFileNotFound.Error() && werr.Error() != errVolumeNotFound.Error() {
+		if werr != io.EOF && werr != nil &&
+			werr.Error() != errFileNotFound.Error() &&
+			werr.Error() != errVolumeNotFound.Error() &&
+			!errors.Is(werr, context.Canceled) {
 			logger.LogIf(ctx, werr)
 		}
 	}()
 
-	//walkResultCh, endWalkCh := tpool.Release(listParams{bucket, recursive, marker, prefix})
-	//if walkResultCh == nil {
-	//	endWalkCh = make(chan struct{})
-	//	walkResultCh = startTreeWalk(ctx, bucket, prefix, marker, recursive, listDir, isLeaf, isLeafDir, endWalkCh)
-	//}
-
 	var eof bool
-	var nextMarker string
-
-	// List until maxKeys requested.
-	g := errgroup.WithNErrs(maxKeys).WithConcurrency(10)
-	ctx, cancel := g.WithCancelOnError(ctx)
-	defer cancel()
-
-	objInfoFound := make([]*ObjectInfo, maxKeys)
-	var i int
-	for i = 0; i < maxKeys; i++ {
-		i := i
-		walkResult, ok := <-walkResultCh
-		if !ok {
-			// Closed channel.
-			eof = true
-		}
-
-		g.Go(func() error {
-			objInfo, err := getObjInfo(ctx, bucket, walkResult.entry)
-			if err == nil {
-				objInfoFound[i] = &objInfo
-				return nil
-			}
-			// Ignore errFileNotFound as the object might have got
-			// deleted in the interim period of listing and getObjectInfo(),
-			// ignore quorum error as it might be an entry from an outdated disk.
-			if err == errFileNotFound {
-				if HasSuffix(walkResult.entry, SlashSeparator) {
-					objInfoFound[i] = &ObjectInfo{
-						Bucket: bucket,
-						Name:   walkResult.entry,
-						IsDir:  true,
-					}
-				}
-				return nil
-			}
-			return toObjectErr(err, bucket, prefix)
-		}, i)
-
-		if walkResult.end {
-			eof = true
-			break
-		}
-	}
-	if err := g.WaitErr(); err != nil {
-		return loi, err
-	}
-	// Copy found objects
-	objInfos := make([]ObjectInfo, 0, i+1)
-	for _, objInfo := range objInfoFound {
-		if objInfo == nil {
-			continue
-		}
-		objInfos = append(objInfos, *objInfo)
-		nextMarker = objInfo.Name
-	}
-
-	// Save list routine for the next marker if we haven't reached EOF.
-	params := listParams{bucket, recursive, nextMarker, prefix}
-	if !eof {
-		tpool.Set(params, walkResultCh, endWalkCh)
-	}
-
 	result := ListObjectsInfo{}
-	for _, objInfo := range objInfos {
-		if objInfo.IsDir && delimiter == SlashSeparator {
-			result.Prefixes = append(result.Prefixes, objInfo.Name)
-			continue
+	entries, err := metaR.filter(opts)
+	if err != nil {
+		if err == io.EOF {
+			eof = true
+		} else {
+			return loi, err
 		}
-		result.Objects = append(result.Objects, objInfo)
 	}
+
+	objInfoFound := entries.fileInfosFS(opts.Bucket, opts.Prefix, opts.Separator, func(object string) (ObjectInfo, error) {
+		return fs.getObjectInfoNoFSLock(ctx, opts.Bucket, object)
+	})
+	result.Objects = objInfoFound
 
 	if !eof {
 		result.IsTruncated = true
-		if len(objInfos) > 0 {
-			result.NextMarker = objInfos[len(objInfos)-1].Name
+		if len(objInfoFound) > 0 {
+			result.NextMarker = objInfoFound[len(objInfoFound)-1].Name
 		}
 	}
 
 	// Success.
 	return result, nil
 }
-
-
-
-
-
 
 // GetObjectTags - get object tags from an existing object
 func (fs *FSObjects) GetObjectTags(ctx context.Context, bucket, object string, opts ObjectOptions) (*tags.Tags, error) {
