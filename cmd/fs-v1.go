@@ -21,6 +21,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"github.com/minio/minio/pkg/sync/errgroup"
 	"io"
 	"io/ioutil"
 	"net/http"
@@ -124,7 +125,6 @@ func NewFSObjectLayer(fsPath string) (ObjectLayer, error) {
 	// Initialize fs objects.
 	fs := &FSObjects{
 		disk:         disk,
-		metaJSONFile: fsMetaJSONFile,
 		fsUUID:       diskID,
 		rwPool: &fsIOPool{
 			readersMap: make(map[string]*lock.RLockedFile),
@@ -318,7 +318,7 @@ func (fs *FSObjects) scanBucket(ctx context.Context, bucket string, cache dataUs
 			}
 		}
 		if !metaOk {
-			fsMeta = fs.defaultFsJSON(object)
+			fsMeta = defaultFsJSON(object)
 		}
 
 		// Stat the file.
@@ -549,7 +549,7 @@ func (fs *FSObjects) CopyObject(ctx context.Context, srcBucket, srcObject, dstBu
 		fsMeta := newFSMetaV1()
 		if _, err = fsMeta.ReadFrom(ctx, wlk); err != nil {
 			// For any error to read fsMeta, set default ETag and proceed.
-			fsMeta = fs.defaultFsJSON(srcObject)
+			fsMeta = defaultFsJSON(srcObject)
 		}
 
 		fsMeta.Meta = cloneMSS(srcInfo.UserDefined)
@@ -776,7 +776,7 @@ func (fs *FSObjects) createFsJSON(object, fsMetaPath string) error {
 }
 
 // Used to return default etag values when a pre-existing object's meta data is queried.
-func (fs *FSObjects) defaultFsJSON(object string) fsMetaV1 {
+func defaultFsJSON(object string) fsMetaV1 {
 	fsMeta := newFSMetaV1()
 	fsMeta.Meta = map[string]string{
 		"etag":         defaultEtag,
@@ -785,6 +785,13 @@ func (fs *FSObjects) defaultFsJSON(object string) fsMetaV1 {
 	return fsMeta
 }
 
+func defaultFsJSONMarshalled(object string) ([]byte, error) {
+	fsMeta := defaultFsJSON(object)
+	var json = jsoniter.ConfigCompatibleWithStandardLibrary
+	return json.Marshal(fsMeta)
+}
+
+// TODO: remove as soon as it it not needed anymore due to refactoring of FSObject
 func (fs *FSObjects) getObjectInfoNoFSLock(ctx context.Context, bucket, object string) (oi ObjectInfo, e error) {
 	fsMeta := fsMetaV1{}
 	if HasSuffix(object, SlashSeparator) {
@@ -807,17 +814,17 @@ func (fs *FSObjects) getObjectInfoNoFSLock(ctx context.Context, bucket, object s
 			var json = jsoniter.ConfigCompatibleWithStandardLibrary
 			if rerr = json.Unmarshal(fsMetaBuf, &fsMeta); rerr != nil {
 				// For any error to read fsMeta, set default ETag and proceed.
-				fsMeta = fs.defaultFsJSON(object)
+				fsMeta = defaultFsJSON(object)
 			}
 		} else {
 			// For any error to read fsMeta, set default ETag and proceed.
-			fsMeta = fs.defaultFsJSON(object)
+			fsMeta = defaultFsJSON(object)
 		}
 	}
 
 	// Return a default etag and content-type based on the object's extension.
 	if err == errFileNotFound {
-		fsMeta = fs.defaultFsJSON(object)
+		fsMeta = defaultFsJSON(object)
 	}
 
 	// Ignore if `fs.json` is not available, this is true for pre-existing data.
@@ -834,7 +841,6 @@ func (fs *FSObjects) getObjectInfoNoFSLock(ctx context.Context, bucket, object s
 
 	return fsMeta.ToObjectInfo(bucket, object, fi), nil
 }
-
 // getObjectInfo - wrapper for reading object metadata and constructs ObjectInfo.
 func (fs *FSObjects) getObjectInfo(ctx context.Context, bucket, object string) (oi ObjectInfo, e error) {
 	if strings.HasSuffix(object, SlashSeparator) && !fs.isObjectDir(bucket, object) {
@@ -861,13 +867,13 @@ func (fs *FSObjects) getObjectInfo(ctx context.Context, bucket, object string) (
 		fs.rwPool.Close(fsMetaPath)
 		if rerr != nil {
 			// For any error to read fsMeta, set default ETag and proceed.
-			fsMeta = fs.defaultFsJSON(object)
+			fsMeta = defaultFsJSON(object)
 		}
 	}
 
 	// Return a default etag and content-type based on the object's extension.
 	if err == errFileNotFound {
-		fsMeta = fs.defaultFsJSON(object)
+		fsMeta = defaultFsJSON(object)
 	}
 
 	// Ignore if `fs.json` is not available, this is true for pre-existing data.
@@ -1243,6 +1249,7 @@ func (fs *FSObjects) listDirFactory(ctx context.Context) ListDirFunc {
 	return listDir
 }
 
+// TODO: remove as soon as it it not needed anymore due to refactoring of FSObject
 // isObjectDir returns true if the specified bucket & prefix exists
 // and the prefix represents an empty directory. An S3 empty directory
 // is also an empty directory in the FS backend.
@@ -1253,7 +1260,6 @@ func (fs *FSObjects) isObjectDir(bucket, prefix string) bool {
 	}
 	return len(entries) == 0
 }
-
 // getObjectETag is a helper function, which returns only the md5sum
 // of the file on the disk.
 func (fs *FSObjects) getObjectETag(ctx context.Context, bucket, entry string, lock bool) (string, error) {
@@ -1338,9 +1344,165 @@ func (fs *FSObjects) ListObjects(ctx context.Context, bucket, prefix, marker, de
 		atomic.AddInt64(&fs.activeIOCount, -1)
 	}()
 
-	return listObjects(ctx, fs, bucket, prefix, marker, delimiter, maxKeys, fs.listPool,
-		fs.listDirFactory(ctx), fs.isLeaf, fs.isLeafDir, fs.getObjectInfoNoFSLock)
+	return fs.fsListObjects(ctx, bucket, prefix, marker, delimiter, maxKeys)
 }
+
+
+func (fs *FSObjects) fsListObjects(ctx context.Context, bucket, prefix, marker, delimiter string, maxKeys int) (loi ListObjectsInfo, err error) {
+	if delimiter != SlashSeparator && delimiter != "" {
+		return listObjectsNonSlash(ctx, bucket, prefix, marker, delimiter, maxKeys, fs.listPool, fs.listDirFactory(ctx), fs.isLeaf, fs.isLeafDir, fs.getObjectInfoNoFSLock)
+	}
+
+	if err := checkListObjsArgs(ctx, bucket, prefix, marker, fs); err != nil {
+		return loi, err
+	}
+
+	// Marker is set validate pre-condition.
+	if marker != "" {
+		// Marker not common with prefix is not implemented. Send an empty response
+		if !HasPrefix(marker, prefix) {
+			return loi, nil
+		}
+	}
+
+	// With max keys of zero we have reached eof, return right here.
+	if maxKeys == 0 {
+		return loi, nil
+	}
+
+	// For delimiter and prefix as '/' we do not list anything at all
+	// since according to s3 spec we stop at the 'delimiter'
+	// along // with the prefix. On a flat namespace with 'prefix'
+	// as '/' we don't have any entries, since all the keys are
+	// of form 'keyName/...'
+	if delimiter == SlashSeparator && prefix == SlashSeparator {
+		return loi, nil
+	}
+
+	// Over flowing count - reset to maxObjectList.
+	if maxKeys < 0 || maxKeys > maxObjectList {
+		maxKeys = maxObjectList
+	}
+
+	// Default is recursive, if delimiter is set then list non recursive.
+	recursive := true
+	if delimiter == SlashSeparator {
+		recursive = false
+	}
+
+	r, w := io.Pipe()
+	metaR, err := newMetacacheReader(r)
+	if err != nil {
+		return loi, err
+	}
+	go func() {
+		werr := fs.disk.WalkDir(ctx, WalkDirOptions{
+			Bucket:         bucket,
+			BaseDir:        baseDirFromPrefix(prefix),
+			Recursive:      recursive,
+			ReportNotFound: false,
+			FilterPrefix:   prefix,
+		}, w)
+		w.CloseWithError(werr)
+		if werr != io.EOF && werr != nil && werr.Error() != errFileNotFound.Error() && werr.Error() != errVolumeNotFound.Error() {
+			logger.LogIf(ctx, werr)
+		}
+	}()
+
+	//walkResultCh, endWalkCh := tpool.Release(listParams{bucket, recursive, marker, prefix})
+	//if walkResultCh == nil {
+	//	endWalkCh = make(chan struct{})
+	//	walkResultCh = startTreeWalk(ctx, bucket, prefix, marker, recursive, listDir, isLeaf, isLeafDir, endWalkCh)
+	//}
+
+	var eof bool
+	var nextMarker string
+
+	// List until maxKeys requested.
+	g := errgroup.WithNErrs(maxKeys).WithConcurrency(10)
+	ctx, cancel := g.WithCancelOnError(ctx)
+	defer cancel()
+
+	objInfoFound := make([]*ObjectInfo, maxKeys)
+	var i int
+	for i = 0; i < maxKeys; i++ {
+		i := i
+		walkResult, ok := <-walkResultCh
+		if !ok {
+			// Closed channel.
+			eof = true
+		}
+
+		g.Go(func() error {
+			objInfo, err := getObjInfo(ctx, bucket, walkResult.entry)
+			if err == nil {
+				objInfoFound[i] = &objInfo
+				return nil
+			}
+			// Ignore errFileNotFound as the object might have got
+			// deleted in the interim period of listing and getObjectInfo(),
+			// ignore quorum error as it might be an entry from an outdated disk.
+			if err == errFileNotFound {
+				if HasSuffix(walkResult.entry, SlashSeparator) {
+					objInfoFound[i] = &ObjectInfo{
+						Bucket: bucket,
+						Name:   walkResult.entry,
+						IsDir:  true,
+					}
+				}
+				return nil
+			}
+			return toObjectErr(err, bucket, prefix)
+		}, i)
+
+		if walkResult.end {
+			eof = true
+			break
+		}
+	}
+	if err := g.WaitErr(); err != nil {
+		return loi, err
+	}
+	// Copy found objects
+	objInfos := make([]ObjectInfo, 0, i+1)
+	for _, objInfo := range objInfoFound {
+		if objInfo == nil {
+			continue
+		}
+		objInfos = append(objInfos, *objInfo)
+		nextMarker = objInfo.Name
+	}
+
+	// Save list routine for the next marker if we haven't reached EOF.
+	params := listParams{bucket, recursive, nextMarker, prefix}
+	if !eof {
+		tpool.Set(params, walkResultCh, endWalkCh)
+	}
+
+	result := ListObjectsInfo{}
+	for _, objInfo := range objInfos {
+		if objInfo.IsDir && delimiter == SlashSeparator {
+			result.Prefixes = append(result.Prefixes, objInfo.Name)
+			continue
+		}
+		result.Objects = append(result.Objects, objInfo)
+	}
+
+	if !eof {
+		result.IsTruncated = true
+		if len(objInfos) > 0 {
+			result.NextMarker = objInfos[len(objInfos)-1].Name
+		}
+	}
+
+	// Success.
+	return result, nil
+}
+
+
+
+
+
 
 // GetObjectTags - get object tags from an existing object
 func (fs *FSObjects) GetObjectTags(ctx context.Context, bucket, object string, opts ObjectOptions) (*tags.Tags, error) {
@@ -1385,7 +1547,7 @@ func (fs *FSObjects) PutObjectTags(ctx context.Context, bucket, object string, t
 	// Read objects' metadata in `fs.json`.
 	if _, err = fsMeta.ReadFrom(ctx, wlk); err != nil {
 		// For any error to read fsMeta, set default ETag and proceed.
-		fsMeta = fs.defaultFsJSON(object)
+		fsMeta = defaultFsJSON(object)
 	}
 
 	// clean fsMeta.Meta of tag key, before updating the new tags

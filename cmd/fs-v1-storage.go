@@ -21,9 +21,14 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"github.com/minio/minio/cmd/logger"
+	xioutil "github.com/minio/minio/pkg/ioutil"
 	"io"
+	"io/ioutil"
 	"net/url"
 	"os"
+	"sort"
+	"strings"
 	"time"
 
 	pathutil "path"
@@ -476,8 +481,200 @@ func (s *fsv1Storage) Close() error {
 	return nil
 }
 
+// isObjectDir returns true if the specified bucket & prefix exists
+// and the prefix represents an empty directory. An S3 empty directory
+// is also an empty directory in the FS backend.
+func (s *fsv1Storage) isObjectDir(bucket, prefix string) bool {
+	entries, err := readDirN(pathJoin(s.String(), bucket, prefix), 1)
+	if err != nil {
+		return false
+	}
+	return len(entries) == 0
+}
+
+func (s *fsv1Storage) getObjectMetaNoFSLock(ctx context.Context, bucket, object string) ([]byte, error) {
+	fsMetaPath := pathJoin(s.String(), minioMetaBucket, bucketMetaPrefix, bucket, object, fsMetaJSONFile)
+	// Read `fs.json` to perhaps contend with
+	// parallel Put() operations.
+
+	rc, _, err := fsOpenFile(ctx, fsMetaPath, 0)
+	if err != nil {
+		return defaultFsJSONMarshalled(object)
+	}
+
+	fsMetaBuf, rerr := ioutil.ReadAll(rc)
+	_ = rc.Close()
+	if rerr != nil {
+		return defaultFsJSONMarshalled(object)
+	}
+
+	return fsMetaBuf, nil
+}
+
+// WalkDir will traverse a directory and return all entries found.
+// On success a sorted meta cache stream will be returned.
 func (s *fsv1Storage) WalkDir(ctx context.Context, opts WalkDirOptions, wr io.Writer) error {
-	return NotImplemented{}
+	// Verify if volume is valid and it exists.
+	volumeDir, err := s.getVolDir(opts.Bucket)
+	if err != nil {
+		return err
+	}
+
+	// Stat a volume entry.
+	_, err = os.Lstat(volumeDir)
+	if err != nil {
+		if osIsNotExist(err) {
+			return errVolumeNotFound
+		} else if isSysErrIO(err) {
+			return errFaultyDisk
+		}
+		return err
+	}
+
+	// Use a small block size to start sending quickly
+	w := newMetacacheWriter(wr, 16<<10)
+	defer w.Close()
+	out, err := w.stream()
+	if err != nil {
+		return err
+	}
+	defer close(out)
+
+	prefix := opts.FilterPrefix
+	forward := opts.ForwardTo
+	var scanDir func(path string) error
+	scanDir = func(current string) error {
+		entries, err := s.ListDir(ctx, opts.Bucket, current, -1)
+		if err != nil {
+			// Folder could have gone away in-between
+			if err != errVolumeNotFound && err != errFileNotFound {
+				logger.LogIf(ctx, err)
+			}
+			if opts.ReportNotFound && err == errFileNotFound && current == opts.BaseDir {
+				return errFileNotFound
+			}
+			// Forward some errors?
+			return nil
+		}
+
+		dirObjects := make(map[string]struct{})
+		for i, entry := range entries {
+			if len(prefix) > 0 && !strings.HasPrefix(entry, prefix) {
+				continue
+			}
+			if len(forward) > 0 && entry < forward {
+				continue
+			}
+
+			if strings.HasSuffix(entry, slashSeparator) {
+				if !s.isObjectDir(opts.Bucket, pathJoin(current, entry)) {
+					// Add without extension so it is sorted correctly.
+					dirObjects[entry] = struct{}{}
+					entries[i] = entry
+					continue
+				}
+				// Trim slash, maybe compiler is clever?
+				entries[i] = entries[i][:len(entry)-1]
+				continue
+			}
+			// Do do not retain the file.
+			entries[i] = ""
+
+			// If root was an object return it as such.
+			var meta metaCacheEntry
+			meta.metadata, err = s.getObjectMetaNoFSLock(ctx, opts.Bucket, pathJoin(current, entry))
+			if err != nil {
+				logger.LogIf(ctx, err)
+				continue
+			}
+			meta.name = pathJoin(current, entry)
+			out <- meta
+			return nil
+		}
+
+		// Process in sort order.
+		sort.Strings(entries)
+		dirStack := make([]string, 0, 5)
+		prefix = "" // Remove prefix after first level.
+
+		for _, entry := range entries {
+			if entry == "" {
+				continue
+			}
+			meta := metaCacheEntry{name: PathJoin(current, entry)}
+
+			// If directory entry on stack before this, pop it now.
+			for len(dirStack) > 0 && dirStack[len(dirStack)-1] < meta.name {
+				pop := dirStack[len(dirStack)-1]
+				out <- metaCacheEntry{name: pop}
+				if opts.Recursive {
+					// Scan folder we found. Should be in correct sort order where we are.
+					forward = ""
+					if len(opts.ForwardTo) > 0 && strings.HasPrefix(opts.ForwardTo, pop) {
+						forward = strings.TrimPrefix(opts.ForwardTo, pop)
+					}
+					logger.LogIf(ctx, scanDir(pop))
+				}
+				dirStack = dirStack[:len(dirStack)-1]
+			}
+
+			// All objects will be returned as directories, there has been no object check yet.
+			// Check it by attempting to read metadata.
+			_, isDirObj := dirObjects[entry]
+			if isDirObj {
+				meta.name = meta.name[:len(meta.name)-1] + globalDirSuffixWithSlash
+			}
+
+			meta.metadata, err = xioutil.ReadFile(pathJoin(volumeDir, meta.name, xlStorageFormatFile))
+			switch {
+			case err == nil:
+				// It was an object
+				if isDirObj {
+					meta.name = strings.TrimSuffix(meta.name, globalDirSuffixWithSlash) + slashSeparator
+				}
+				out <- meta
+			case osIsNotExist(err):
+				meta.metadata, err = xioutil.ReadFile(pathJoin(volumeDir, meta.name, xlStorageFormatFileV1))
+				if err == nil {
+					// Maybe rename? Would make it inconsistent across disks though.
+					// os.Rename(pathJoin(volumeDir, meta.name, xlStorageFormatFileV1), pathJoin(volumeDir, meta.name, xlStorageFormatFile))
+					// It was an object
+					out <- meta
+					continue
+				}
+
+				// NOT an object, append to stack (with slash)
+				// If dirObject, but no metadata (which is unexpected) we skip it.
+				if !isDirObj {
+					if !isDirEmpty(pathJoin(volumeDir, meta.name+slashSeparator)) {
+						dirStack = append(dirStack, meta.name+slashSeparator)
+					}
+				}
+			case isSysErrNotDir(err):
+				// skip
+			default:
+				logger.LogIf(ctx, err)
+			}
+		}
+		// If directory entry left on stack, pop it now.
+		for len(dirStack) > 0 {
+			pop := dirStack[len(dirStack)-1]
+			out <- metaCacheEntry{name: pop}
+			if opts.Recursive {
+				// Scan folder we found. Should be in correct sort order where we are.
+				forward = ""
+				if len(opts.ForwardTo) > 0 && strings.HasPrefix(opts.ForwardTo, pop) {
+					forward = strings.TrimPrefix(opts.ForwardTo, pop)
+				}
+				logger.LogIf(ctx, scanDir(pop))
+			}
+			dirStack = dirStack[:len(dirStack)-1]
+		}
+		return nil
+	}
+
+	// Stream output.
+	return scanDir(opts.BaseDir)
 }
 
 func (s *fsv1Storage) GetDiskLoc() (poolIdx, setIdx, diskIdx int) {
