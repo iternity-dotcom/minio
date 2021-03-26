@@ -33,21 +33,9 @@ func TestFSFormatFS(t *testing.T) {
 	fsFormatPath := pathJoin(fsPath, minioMetaBucket, formatConfigFile)
 
 	// Assign a new UUID.
-	uuid := mustGetUUID()
-
-	disk, _ := newfsv1Storage(fsPath)
-
-	fs := &FSObjects{
-		disk:          disk,
-		metaJSONFile:  fsMetaJSONFile,
-		fsUUID:        uuid,
-		nsMutex:       newNSLock(false),
-		listPool:      NewTreeWalkPool(globalLookupTimeout),
-		appendFileMap: make(map[string]*fsAppendFile),
-	}
-
-	// Initialize meta volume, if volume already exists ignores it.
-	if err := fs.initMetaVolumeFS(context.Background()); err != nil {
+	var err error
+	disk, err := newLocalFSV1Storage(fsPath)
+	if err != nil {
 		t.Fatal(err)
 	}
 

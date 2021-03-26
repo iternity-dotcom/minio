@@ -94,48 +94,38 @@ type fsAppendFile struct {
 
 // NewFSObjectLayer - initialize new fs object layer.
 func NewFSObjectLayer(fsPath string) (ObjectLayer, error) {
-	// disk, err := newLocalXLStorage(fsPath)
-	disk, err := newfsv1Storage(fsPath)
-	if err != nil {
-		return nil, err
-	}
-	return NewFSObjectLayerWithDisk(disk)
-}
-
-// NewFSObjectLayerWithDisk - initialize new fs object layer based on a given StorageAPI implementation.
-func NewFSObjectLayerWithDisk(disk StorageAPI) (ObjectLayer, error) {
 	ctx := GlobalContext
-	fsPath := disk.String()
-	if fsPath == "" {
-		return nil, errInvalidArgument
-	}
 
-	var err error
-	if fsPath, err = getValidPath(fsPath); err != nil {
+	disk, err := newLocalFSV1Storage(fsPath)
+	if err != nil {
 		if err == errMinDiskSize {
 			return nil, config.ErrUnableToWriteInBackend(err).Hint(err.Error())
 		}
 
-		// Show a descriptive error with a hint about how to fix it.
-		var username string
-		if u, err := user.Current(); err == nil {
-			username = u.Username
-		} else {
-			username = "<your-username>"
+		if os.IsPermission(err) {
+			// Show a descriptive error with a hint about how to fix it.
+			var username string
+			if u, err := user.Current(); err == nil {
+				username = u.Username
+			} else {
+				username = "<your-username>"
+			}
+			hint := fmt.Sprintf("Use 'sudo chown -R %s %s && sudo chmod u+rxw %s' to provide sufficient permissions.", username, fsPath, fsPath)
+			return nil, config.ErrUnableToWriteInBackend(err).Hint(hint)
 		}
-		hint := fmt.Sprintf("Use 'sudo chown -R %s %s && sudo chmod u+rxw %s' to provide sufficient permissions.", username, fsPath, fsPath)
-		return nil, config.ErrUnableToWriteInBackend(err).Hint(hint)
+		return nil, err
 	}
 
-	// Assign a new UUID for FS minio mode. Each server instance
-	// gets its own UUID for temporary file transaction.
-	fsUUID := mustGetUUID()
+	diskID, err := disk.GetDiskID()
+	if err != nil {
+		return nil, err
+	}
 
 	// Initialize fs objects.
 	fs := &FSObjects{
 		disk:         disk,
 		metaJSONFile: fsMetaJSONFile,
-		fsUUID:       fsUUID,
+		fsUUID:       diskID,
 		rwPool: &fsIOPool{
 			readersMap: make(map[string]*lock.RLockedFile),
 		},
@@ -143,11 +133,6 @@ func NewFSObjectLayerWithDisk(disk StorageAPI) (ObjectLayer, error) {
 		listPool:      NewTreeWalkPool(globalLookupTimeout),
 		appendFileMap: make(map[string]*fsAppendFile),
 		diskMount:     mountinfo.IsLikelyMountPoint(fsPath),
-	}
-
-	// Initialize meta volume, if volume already exists ignores it.
-	if err = fs.initMetaVolumeFS(ctx); err != nil {
-		return nil, err
 	}
 
 	// Initialize `format.json`, this function also returns.
@@ -167,20 +152,6 @@ func NewFSObjectLayerWithDisk(disk StorageAPI) (ObjectLayer, error) {
 
 	// Return successfully initialized object layer.
 	return fs, nil
-}
-
-// Initializes meta volume on all the fs path.
-func (fs *FSObjects) initMetaVolumeFS(ctx context.Context) error {
-	// This happens for the first time, but keep this here since this
-	// is the only place where it can be made less expensive
-	// optimizing all other calls. Create minio meta volume,
-	// if it doesn't exist yet.
-	metaBucketPath := pathJoin(minioMetaBucket)
-	metaTmpPath := pathJoin(minioMetaTmpBucket, fs.fsUUID)
-	metaMultipartPath := pathJoin(minioMetaMultipartBucket)
-	dataUsagePath := pathJoin(dataUsageBucket)
-
-	return fs.disk.MakeVolBulk(ctx, metaBucketPath, metaTmpPath, dataUsagePath, metaMultipartPath)
 }
 
 // NewNSLock - initialize a new namespace RWLocker instance.
@@ -219,7 +190,7 @@ func (fs *FSObjects) StorageInfo(ctx context.Context) (StorageInfo, []error) {
 		atomic.AddInt64(&fs.activeIOCount, -1)
 	}()
 
-	di, err := getDiskInfo(fs.disk.String())
+	di, err := fs.disk.DiskInfo(ctx)
 	if err != nil {
 		return StorageInfo{}, []error{err}
 	}

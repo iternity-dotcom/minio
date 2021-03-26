@@ -18,30 +18,130 @@ package cmd
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"io"
 	"net/url"
 	"os"
+	"time"
+
+	pathutil "path"
+
+	"github.com/minio/minio/pkg/disk"
+	"github.com/minio/minio/pkg/env"
 )
 
 type fsv1Storage struct {
+	diskPath string
 	endpoint Endpoint
+
+	diskID        string
+	rootDisk      bool
+	diskInfoCache timedValue
+
+	ctx context.Context
+
 	// Indexes, will be -1 until assigned a set.
 	poolIndex, setIndex, diskIndex int
 }
 
-func newfsv1Storage(path string) (*fsv1Storage, error) {
+func newLocalFSV1Storage(path string) (*fsv1Storage, error) {
 	u := url.URL{Path: path}
-	return &fsv1Storage{
-		endpoint: Endpoint{
-			URL:     &u,
-			IsLocal: true,
-		},
-	}, nil
+	return newFSV1Storage(Endpoint{
+		URL:     &u,
+		IsLocal: true,
+	})
+
+}
+
+// Initialize a new storage disk.
+func newFSV1Storage(ep Endpoint) (*fsv1Storage, error) {
+	path := ep.Path
+	var err error
+	if path, err = getValidPath(path); err != nil {
+		return nil, err
+	}
+
+	var rootDisk bool
+	if env.Get("MINIO_CI_CD", "") != "" {
+		rootDisk = true
+	} else {
+		if IsDocker() || IsKubernetes() {
+			// Start with overlay "/" to check if
+			// possible the path has device id as
+			// "overlay" that would mean the path
+			// is emphemeral and we should treat it
+			// as root disk from the baremetal
+			// terminology.
+			rootDisk, err = disk.IsRootDisk(path, SlashSeparator)
+			if err != nil {
+				return nil, err
+			}
+			if !rootDisk {
+				// No root disk was found, its possible that
+				// path is referenced at "/etc/hosts" which has
+				// different device ID that points to the original
+				// "/" on the host system, fall back to that instead
+				// to verify of the device id is same.
+				rootDisk, err = disk.IsRootDisk(path, "/etc/hosts")
+				if err != nil {
+					return nil, err
+				}
+			}
+
+		} else {
+			// On baremetal setups its always "/" is the root disk.
+			rootDisk, err = disk.IsRootDisk(path, SlashSeparator)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	// Assign a new UUID for FS minio mode. Each server instance
+	// gets its own UUID for temporary file transaction.
+	diskID := mustGetUUID()
+	p := &fsv1Storage{
+		diskPath:  path,
+		endpoint:  ep,
+		ctx:       GlobalContext,
+		rootDisk:  rootDisk,
+		diskID:    diskID,
+		poolIndex: -1,
+		setIndex:  -1,
+		diskIndex: -1,
+	}
+
+	metaTmpPath := pathJoin(minioMetaTmpBucket, diskID)
+
+	// Create all necessary bucket folders if possible.
+	if err = p.MakeVolBulk(context.TODO(), minioMetaBucket, metaTmpPath, minioMetaMultipartBucket, dataUsageBucket); err != nil {
+		return nil, err
+	}
+
+	// Check if backend is writable and supports O_DIRECT
+	var rnd [8]byte
+	_, _ = rand.Read(rnd[:])
+	tmpFile := ".writable-check-" + hex.EncodeToString(rnd[:]) + ".tmp"
+	filePath := pathJoin(p.diskPath, metaTmpPath, tmpFile)
+	w, err := disk.OpenFileDirectIO(filePath, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0666)
+	if err != nil {
+		return p, err
+	}
+	if _, err = w.Write(alignedBuf[:]); err != nil {
+		w.Close()
+		return p, err
+	}
+	w.Close()
+	defer Remove(filePath)
+
+	// Success.
+	return p, nil
 }
 
 func (s *fsv1Storage) String() string {
-	return s.endpoint.String()
+	return s.diskPath
 }
 
 func (s *fsv1Storage) IsOnline() bool {
@@ -69,14 +169,51 @@ func (s *fsv1Storage) CrawlAndGetDataUsage(ctx context.Context, cache dataUsageC
 }
 
 func (s *fsv1Storage) GetDiskID() (string, error) {
-	return s.endpoint.String(), NotImplemented{}
+	return s.diskID, nil
 }
 
 func (s *fsv1Storage) SetDiskID(id string) {
 }
 
 func (s *fsv1Storage) DiskInfo(ctx context.Context) (info DiskInfo, err error) {
-	return DiskInfo{}, NotImplemented{}
+	s.diskInfoCache.Once.Do(func() {
+		s.diskInfoCache.TTL = time.Second
+		s.diskInfoCache.Update = func() (interface{}, error) {
+			dcinfo := DiskInfo{
+				RootDisk:  s.rootDisk,
+				MountPath: s.String(),
+				Endpoint:  s.endpoint.String(),
+			}
+			di, err := getDiskInfo(s.String())
+			if err != nil {
+				return dcinfo, err
+			}
+			dcinfo.Total = di.Total
+			dcinfo.Free = di.Free
+			dcinfo.Used = di.Used
+			dcinfo.UsedInodes = di.Files - di.Ffree
+			dcinfo.FSType = di.FSType
+
+			diskID, err := s.GetDiskID()
+			if errors.Is(err, errUnformattedDisk) {
+				// if we found an unformatted disk then
+				// healing is automatically true.
+				dcinfo.Healing = true
+			} else {
+				// Check if the disk is being healed if GetDiskID
+				// returned any error other than fresh disk
+				dcinfo.Healing = s.Healing() != nil
+			}
+
+			dcinfo.ID = diskID
+			return dcinfo, err
+		}
+	})
+
+	v, err := s.diskInfoCache.Get()
+	info = v.(DiskInfo)
+	return info, err
+
 }
 
 func (s *fsv1Storage) NSScanner(ctx context.Context, cache dataUsageCache) (dataUsageCache, error) {
@@ -140,9 +277,12 @@ func (s *fsv1Storage) ListVols(ctx context.Context) (vols []VolInfo, err error) 
 	}
 	volsInfo := make([]VolInfo, 0, len(entries))
 	for _, entry := range entries {
-
-		var fi os.FileInfo
-		fi, err = fsStatVolume(ctx, pathJoin(s.String(), entry))
+		if !HasSuffix(entry, SlashSeparator) || !isValidVolname(pathutil.Clean(entry)) {
+			// Skip if entry is neither a directory not a valid volume name.
+			continue
+		}
+		var vi VolInfo
+		vi, err = s.StatVol(ctx, pathutil.Clean(entry))
 		// There seems like no practical reason to check for errors
 		// at this point, if there are indeed errors we can simply
 		// just ignore such buckets and list only those which
@@ -151,16 +291,8 @@ func (s *fsv1Storage) ListVols(ctx context.Context) (vols []VolInfo, err error) 
 			// Ignore any errors returned here.
 			continue
 		}
-		var created = fi.ModTime()
-		meta, err := globalBucketMetadataSys.Get(fi.Name())
-		if err == nil {
-			created = meta.Created
-		}
 
-		volsInfo = append(volsInfo, VolInfo{
-			Name:    fi.Name(),
-			Created: created,
-		})
+		volsInfo = append(volsInfo, vi)
 	}
 	return volsInfo, nil
 }
