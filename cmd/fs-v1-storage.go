@@ -562,28 +562,32 @@ func (s *fsv1Storage) WalkDir(ctx context.Context, opts WalkDirOptions, wr io.Wr
 
 		sort.Strings(entries)
 
-		dirObjects := make(map[string]struct{})
-		for i, entry := range entries {
-			if len(prefix) > 0 && !strings.HasPrefix(entry, prefix) {
+		for _, entry := range entries {
+			if len(prefix) > 0 && !strings.HasPrefix(pathJoin(current, entry), prefix) {
 				continue
 			}
-			if len(forward) > 0 && entry < forward {
+			if len(forward) > 0 && pathJoin(current, entry) < forward {
 				continue
 			}
 
 			if strings.HasSuffix(entry, slashSeparator) {
+				out <- metaCacheEntry{name: pathJoin(current, entry)}
 				if s.isObjectDir(opts.Bucket, pathJoin(current, entry)) {
-					// Add without extension so it is sorted correctly.
-					dirObjects[entry] = struct{}{}
-					entries[i] = entry
 					continue
 				}
+				if opts.Recursive {
+					// Scan folder we found. Should be in correct sort order where we are.
+					forward = ""
+					entry = entry[:len(entry)-1]
+					if len(opts.ForwardTo) > 0 && strings.HasPrefix(opts.ForwardTo, pathJoin(current, entry)) {
+						forward = strings.TrimPrefix(opts.ForwardTo, pathJoin(current, entry))
+					}
+					logger.LogIf(ctx, scanDir(pathJoin(current, entry)))
+				}
 				// Trim slash, maybe compiler is clever?
-				entries[i] = entries[i][:len(entry)-1]
 				continue
 			}
 			// Do do not retain the file.
-			entries[i] = ""
 
 			if contextCanceled(ctx) {
 				return ctx.Err()
@@ -597,55 +601,6 @@ func (s *fsv1Storage) WalkDir(ctx context.Context, opts WalkDirOptions, wr io.Wr
 			}
 			meta.name = pathJoin(current, entry)
 			out <- meta
-		}
-
-		// Process in sort order.
-		sort.Strings(entries)
-		dirStack := make([]string, 0, 5)
-		prefix = "" // Remove prefix after first level.
-
-		for _, entry := range entries {
-			if entry == "" {
-				continue
-			}
-			if contextCanceled(ctx) {
-				return ctx.Err()
-			}
-			meta := metaCacheEntry{name: PathJoin(current, entry)}
-
-			// If directory entry on stack before this, pop it now.
-			for len(dirStack) > 0 && dirStack[len(dirStack)-1] < meta.name {
-				pop := dirStack[len(dirStack)-1]
-				out <- metaCacheEntry{name: pop}
-				if opts.Recursive {
-					// Scan folder we found. Should be in correct sort order where we are.
-					forward = ""
-					if len(opts.ForwardTo) > 0 && strings.HasPrefix(opts.ForwardTo, pop) {
-						forward = strings.TrimPrefix(opts.ForwardTo, pop)
-					}
-					logger.LogIf(ctx, scanDir(pop))
-				}
-				dirStack = dirStack[:len(dirStack)-1]
-			}
-
-			if _, isDirObj := dirObjects[entry]; !isDirObj {
-				dirStack = append(dirStack, meta.name+slashSeparator)
-			}
-
-		}
-		// If directory entry left on stack, pop it now.
-		for len(dirStack) > 0 {
-			pop := dirStack[len(dirStack)-1]
-			out <- metaCacheEntry{name: pop}
-			if opts.Recursive {
-				// Scan folder we found. Should be in correct sort order where we are.
-				forward = ""
-				if len(opts.ForwardTo) > 0 && strings.HasPrefix(opts.ForwardTo, pop) {
-					forward = strings.TrimPrefix(opts.ForwardTo, pop)
-				}
-				logger.LogIf(ctx, scanDir(pop))
-			}
-			dirStack = dirStack[:len(dirStack)-1]
 		}
 		return nil
 	}

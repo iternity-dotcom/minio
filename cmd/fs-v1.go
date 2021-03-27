@@ -1352,73 +1352,19 @@ func (fs *FSObjects) ListObjects(ctx context.Context, bucket, prefix, marker, de
 		recursive = false
 	}
 	opts := listPathOptions{
-		Bucket:      bucket,
-		Prefix:      prefix,
-		Separator:   delimiter,
-		Limit:       maxKeysPlusOne(maxKeys, marker != ""),
-		Marker:      marker,
-		Recursive:   recursive,
-		InclDeleted: true,
-		AskDisks:    0,
+		Bucket:             bucket,
+		Prefix:             prefix,
+		Separator:          delimiter,
+		Limit:              maxKeys,
+		Marker:             marker,
+		Recursive:          recursive,
+		InclDeleted:        true,
+		IncludeDirectories: delimiter == SlashSeparator,
+		AskDisks:           0,
 	}
 	return fs.fsListObjects(ctx, opts)
 }
 
-// fileInfoVersionsFS is a copy of fileInfos converts the metadata to FileInfoVersions where possible.
-// Metadata that cannot be decoded is skipped.
-func (m *metaCacheEntriesSorted) fileInfosFS(bucket, prefix, delimiter string, objectInfo func(object string) (ObjectInfo, error)) (objects []ObjectInfo) {
-	objects = make([]ObjectInfo, 0, m.len())
-	prevPrefix := ""
-	for _, entry := range m.o {
-		if entry.isObject() {
-			if delimiter != "" {
-				idx := strings.Index(strings.TrimPrefix(entry.name, prefix), delimiter)
-				if idx >= 0 {
-					idx = len(prefix) + idx + len(delimiter)
-					currPrefix := entry.name[:idx]
-					if currPrefix == prevPrefix {
-						continue
-					}
-					prevPrefix = currPrefix
-					objects = append(objects, ObjectInfo{
-						IsDir:  true,
-						Bucket: bucket,
-						Name:   currPrefix,
-					})
-					continue
-				}
-			}
-
-			oi, err := objectInfo(entry.name)
-			if err == nil {
-				objects = append(objects, oi)
-			}
-			continue
-		}
-		if entry.isDir() {
-			if delimiter == "" {
-				continue
-			}
-			idx := strings.Index(strings.TrimPrefix(entry.name, prefix), delimiter)
-			if idx < 0 {
-				continue
-			}
-			idx = len(prefix) + idx + len(delimiter)
-			currPrefix := entry.name[:idx]
-			if currPrefix == prevPrefix {
-				continue
-			}
-			prevPrefix = currPrefix
-			objects = append(objects, ObjectInfo{
-				IsDir:  true,
-				Bucket: bucket,
-				Name:   currPrefix,
-			})
-		}
-	}
-
-	return objects
-}
 func (fs *FSObjects) fsListObjects(ctx context.Context, opts listPathOptions) (ListObjectsInfo, error) {
 	var loi ListObjectsInfo
 
@@ -1481,6 +1427,8 @@ func (fs *FSObjects) fsListObjects(ctx context.Context, opts listPathOptions) (L
 
 	var eof bool
 	result := ListObjectsInfo{}
+
+	opts.Limit = maxKeysPlusOne(opts.Limit, opts.Marker != "")
 	entries, err := metaR.filter(opts)
 	if err != nil {
 		if err == io.EOF {
@@ -1488,6 +1436,9 @@ func (fs *FSObjects) fsListObjects(ctx context.Context, opts listPathOptions) (L
 		} else {
 			return loi, err
 		}
+	}
+	if opts.Marker != "" && len(entries.o) > 0 && entries.o[0].name == opts.Marker {
+		entries.o = entries.o[1:]
 	}
 
 	objInfoFound := entries.fileInfosFS(opts.Bucket, opts.Prefix, opts.Separator, func(object string) (ObjectInfo, error) {
@@ -1504,6 +1455,62 @@ func (fs *FSObjects) fsListObjects(ctx context.Context, opts listPathOptions) (L
 
 	// Success.
 	return result, nil
+}
+
+// fileInfoVersionsFS is a copy of fileInfos converts the metadata to FileInfoVersions where possible.
+// Metadata that cannot be decoded is skipped.
+func (m *metaCacheEntriesSorted) fileInfosFS(bucket, prefix, delimiter string, objectInfo func(object string) (ObjectInfo, error)) (objects []ObjectInfo) {
+	objects = make([]ObjectInfo, 0, m.len())
+	prevPrefix := ""
+	for _, entry := range m.o {
+		if entry.isObject() {
+			if delimiter != "" {
+				idx := strings.Index(strings.TrimPrefix(entry.name, prefix), delimiter)
+				if idx >= 0 {
+					idx = len(prefix) + idx + len(delimiter)
+					currPrefix := entry.name[:idx]
+					if currPrefix == prevPrefix {
+						continue
+					}
+					prevPrefix = currPrefix
+					objects = append(objects, ObjectInfo{
+						IsDir:  true,
+						Bucket: bucket,
+						Name:   currPrefix,
+					})
+					continue
+				}
+			}
+
+			oi, err := objectInfo(entry.name)
+			if err == nil {
+				objects = append(objects, oi)
+			}
+			continue
+		}
+		if entry.isDir() {
+			if delimiter == "" {
+				continue
+			}
+			idx := strings.Index(strings.TrimPrefix(entry.name, prefix), delimiter)
+			if idx < 0 {
+				continue
+			}
+			idx = len(prefix) + idx + len(delimiter)
+			currPrefix := entry.name[:idx]
+			if currPrefix == prevPrefix {
+				continue
+			}
+			prevPrefix = currPrefix
+			objects = append(objects, ObjectInfo{
+				IsDir:  true,
+				Bucket: bucket,
+				Name:   currPrefix,
+			})
+		}
+	}
+
+	return objects
 }
 
 // GetObjectTags - get object tags from an existing object
