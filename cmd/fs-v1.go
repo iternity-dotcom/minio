@@ -1362,6 +1362,7 @@ func (fs *FSObjects) ListObjects(ctx context.Context, bucket, prefix, marker, de
 		IncludeDirectories: delimiter == SlashSeparator,
 		AskDisks:           0,
 	}
+
 	return fs.fsListObjects(ctx, opts)
 }
 
@@ -1379,7 +1380,7 @@ func (fs *FSObjects) fsListObjects(ctx context.Context, opts listPathOptions) (L
 	// Marker is set validate pre-condition.
 	if opts.Marker != "" {
 		// Marker not common with prefix is not implemented. Send an empty response
-		if !HasPrefix(opts.Marker, opts.Separator) {
+		if !HasPrefix(opts.Marker, opts.Prefix) {
 			return loi, nil
 		}
 	}
@@ -1437,6 +1438,12 @@ func (fs *FSObjects) fsListObjects(ctx context.Context, opts listPathOptions) (L
 			return loi, err
 		}
 	}
+
+	if opts.Limit > 0 && entries.len() > opts.Limit {
+		entries.truncate(opts.Limit)
+		eof = false
+	}
+
 	if opts.Marker != "" && len(entries.o) > 0 && entries.o[0].name == opts.Marker {
 		entries.o = entries.o[1:]
 	}
@@ -1444,7 +1451,14 @@ func (fs *FSObjects) fsListObjects(ctx context.Context, opts listPathOptions) (L
 	objInfoFound := entries.fileInfosFS(opts.Bucket, opts.Prefix, opts.Separator, func(object string) (ObjectInfo, error) {
 		return fs.getObjectInfoNoFSLock(ctx, opts.Bucket, object)
 	})
-	result.Objects = objInfoFound
+
+	for _, objInfo := range objInfoFound {
+		if objInfo.IsDir && opts.Separator == SlashSeparator {
+			result.Prefixes = append(result.Prefixes, objInfo.Name)
+			continue
+		}
+		result.Objects = append(result.Objects, objInfo)
+	}
 
 	if !eof {
 		result.IsTruncated = true

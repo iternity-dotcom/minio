@@ -571,10 +571,17 @@ func (s *fsv1Storage) WalkDir(ctx context.Context, opts WalkDirOptions, wr io.Wr
 			}
 
 			if strings.HasSuffix(entry, slashSeparator) {
-				out <- metaCacheEntry{name: pathJoin(current, entry)}
+				cacheEntry := metaCacheEntry{name: pathJoin(current, entry)}
 				if s.isObjectDir(opts.Bucket, pathJoin(current, entry)) {
+					cacheEntry.metadata, err = defaultFsJSONMarshalled(pathJoin(current, entry))
+					if err != nil {
+						logger.LogIf(ctx, err)
+						continue
+					}
+					out <- cacheEntry
 					continue
 				}
+				out <- cacheEntry
 				if opts.Recursive {
 					// Scan folder we found. Should be in correct sort order where we are.
 					forward = ""
