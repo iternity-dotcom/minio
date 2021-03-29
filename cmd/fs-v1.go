@@ -1453,7 +1453,7 @@ func (fs *FSObjects) fsListObjects(ctx context.Context, opts listPathOptions) (L
 	})
 
 	for _, objInfo := range objInfoFound {
-		if objInfo.IsDir && opts.Separator == SlashSeparator {
+		if objInfo.IsDir && opts.Separator != "" {
 			result.Prefixes = append(result.Prefixes, objInfo.Name)
 			continue
 		}
