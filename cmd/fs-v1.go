@@ -802,7 +802,7 @@ func (fs *FSObjects) getObjectInfoNoFSLock(ctx context.Context, bucket, object s
 		return fsMeta.ToObjectInfo(bucket, object, fi), nil
 	}
 
-	fsMetaPath := pathJoin(fs.disk.String(), minioMetaBucket, bucketMetaPrefix, bucket, object, fs.metaJSONFile)
+	fsMetaPath := pathJoin(fs.disk.String(), minioMetaBucket, bucketMetaPrefix, bucket, object, fsMetaJSONFile)
 	// Read `fs.json` to perhaps contend with
 	// parallel Put() operations.
 
