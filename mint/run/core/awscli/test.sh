@@ -21,6 +21,9 @@ HASH_65_MB=$(md5sum "${MINT_DATA_DIR}/datafile-65-MB" | awk '{print $1}')
 _init() {
     AWS="aws --endpoint-url $1"
 }
+function get_timestamp() {
+    date +%Y-%m-%dT00:00:00.000Z
+}
 
 function get_time() {
     date +%s%N
@@ -944,6 +947,84 @@ function test_multipart_upload_10() {
     return $rv
 }
 
+# Tests lifecycle of a bucket.
+function test_bucket_lifecycle() {
+    # log start time
+    start_time=$(get_time)
+
+    timestamp=$(get_timestamp)
+
+    echo "{ \"Rules\": [ { \"Expiration\": { \"Date\": \"${timestamp}\"},\"ID\": \"Bucketlifecycle test\", \"Filter\": { \"Prefix\": \"\" }, \"Status\": \"Enabled\" } ] }" >> /tmp/lifecycle.json
+
+    function="make_bucket"
+    bucket_name=$(make_bucket)
+    rv=$?
+
+    # if make bucket succeeds put bucket lifecycle
+    if [ $rv -eq 0 ]; then
+        function="${AWS} s3api put-bucket-lifecycle-configuration --bucket ${bucket_name} --lifecycle-configuration file:///tmp/lifecycle.json"
+        out=$($function 2>&1)
+        rv=$?
+    else
+        # if make bucket fails, $bucket_name has the error output
+        out="${bucket_name}"
+        log_failure "$(get_duration "$start_time")" "${function}"
+    fi
+
+    if [ $rv -eq 0 ]; then
+        log_success "$(get_duration "$start_time")" "${function}"
+    fi
+
+    # if put bucket lifecycle succeeds get bucket lifecycle
+    if [ $rv -eq 0 ]; then
+        function="${AWS} s3api get-bucket-lifecycle-configuration --bucket ${bucket_name}"
+        out=$($function 2>&1)
+        rv=$?
+    else
+        # if put bucket lifecycle fails, $bucket_name has the error output
+        out="${bucket_name}"
+        log_failure "$(get_duration "$start_time")" "${function}"
+    fi
+
+    if [ $rv -eq 0 ]; then
+        log_success "$(get_duration "$start_time")" "${function}"
+    fi
+
+    # if get bucket lifecycle succeeds delete bucket lifecycle
+    if [ $rv -eq 0 ]; then
+        function="${AWS} s3api delete-bucket-lifecycle --bucket ${bucket_name}"
+        out=$($function 2>&1)
+        rv=$?
+    else
+        # if get bucket lifecycle fails, $bucket_name has the error output
+        out="${bucket_name}"
+        log_failure "$(get_duration "$start_time")" "${function}"
+    fi
+
+    if [ $rv -eq 0 ]; then
+        log_success "$(get_duration "$start_time")" "${function}"
+    fi
+
+    # delete lifecycle.json
+    rm -f /tmp/lifecycle.json
+
+    # delete bucket
+    if [ $rv -eq 0 ]; then
+        function="delete_bucket"
+        out=$(delete_bucket "$bucket_name")
+        rv=$?
+    fi
+    if [ $rv -eq 0 ]; then
+        log_success "$(get_duration "$start_time")" "${function}"
+    else
+        # clean up and log error
+        ${AWS} s3 rb s3://"${bucket_name}" --force > /dev/null 2>&1
+        log_failure "$(get_duration "$start_time")" "${function}" "${out}"
+    fi
+
+    return $rv
+}
+
 # Tests `aws s3 cp` by uploading a local file.
 function test_aws_s3_cp() {
     file_name="${MINT_DATA_DIR}/datafile-65-MB"
@@ -1518,177 +1599,203 @@ function test_serverside_encryption_error() {
     return $rv
 }
 
-# # WORM bucket tests.
-# function test_worm_bucket() {
-#     # log start time
-#     start_time=$(get_time)
+# WORM bucket tests.
+function test_worm_bucket() {
+    # log start time
+    start_time=$(get_time)
 
-#     # Make bucket
-#     bucket_name="awscli-mint-test-bucket-$RANDOM"
-#     function="${AWS} s3api create-bucket --bucket ${bucket_name} --object-lock-enabled-for-bucket"
+    # Make bucket
+    bucket_name="awscli-mint-test-bucket-$RANDOM"
+    function="${AWS} s3api create-bucket --bucket ${bucket_name} --object-lock-enabled-for-bucket"
 
-#     # execute the test
-#     out=$($function 2>&1)
-#     rv=$?
+    # execute the test
+    out=$($function 2>&1)
+    rv=$?
 
-#     if [ $rv -ne 0 ]; then
-#         # if this functionality is not implemented return right away.
-#         if echo "$out" | grep -q "NotImplemented"; then
-#             ${AWS} s3 rb s3://"${bucket_name}" --force > /dev/null 2>&1
-#             return 0
-#         fi
-#     fi
+    if [ $rv -ne 0 ]; then
+        # if this functionality is not implemented return right away.
+        if echo "$out" | grep -q "NotImplemented"; then
+            ${AWS} s3 rb s3://"${bucket_name}" --force >/dev/null 2>&1
+            log_failure "$(get_duration "$start_time")" "${function}" "${out}"
+            return 0
+        fi
+    fi
 
-#     # if make bucket succeeds set object lock configuration
-#     if [ $rv -eq 0 ]; then
-#         function="${AWS} s3api put-object-lock-configuration --bucket ${bucket_name} --object-lock-configuration ObjectLockEnabled=Enabled"
-#         out=$($function 2>&1)
-#         rv=$?
-# 	if [ $rv -ne 0 ]; then
-#             # if this functionality is not implemented return right away.
-#             if echo "$out" | grep -q "NotImplemented"; then
-# 		${AWS} s3 rb s3://"${bucket_name}" --force > /dev/null 2>&1
-# 		return 0
-#             fi
-# 	fi
-#     else
-#         # if make bucket fails, $bucket_name has the error output
-#         out="${bucket_name}"
-#     fi
+    if [ $rv -eq 0 ]; then
+        log_success "$(get_duration "$start_time")" "${function}"
+    fi
 
-#     # if setting object lock configuration succeeds, upload a file first time
-#     if [ $rv -eq 0 ]; then
-#         function="${AWS} s3api put-object --body ${MINT_DATA_DIR}/datafile-1-kB --bucket ${bucket_name} --key datafile-1-kB"
-#         out=$($function 2>&1)
-#         rv=$?
-#     else
-#         # if make bucket fails, $bucket_name has the error output
-#         out="${bucket_name}"
-#     fi
+    # if make bucket succeeds set object lock configuration
+    if [ $rv -eq 0 ]; then
+        function="${AWS} s3api put-object-lock-configuration --bucket ${bucket_name} --object-lock-configuration ObjectLockEnabled=Enabled"
+        out=$($function 2>&1)
+        rv=$?
+        if [ $rv -ne 0 ]; then
+            # if this functionality is not implemented return right away.
+            if echo "$out" | grep -q "NotImplemented"; then
+                ${AWS} s3 rb s3://"${bucket_name}" --force >/dev/null 2>&1
+                return 0
+            fi
+        fi
+    else
+        # if make bucket fails, $bucket_name has the error output
+        out="${bucket_name}"
+    fi
 
-#     # second time upload will succeed and there shall be now two versions of the object
-#     if [ $rv -eq 0 ]; then
-#         function="${AWS} s3api put-object --body ${MINT_DATA_DIR}/datafile-1-kB --bucket ${bucket_name} --key datafile-1-kB"
-#         out=$($function 2>&1)
-#         rv=$?
-#     else
-#         out="First time object upload failed"
-#     fi
+    if [ $rv -eq 0 ]; then
+        log_success "$(get_duration "$start_time")" "${function}"
+    fi
 
-#     if [ $rv -eq 0 ]; then
-#         log_success "$(get_duration "$start_time")" "${test_function}"
-#     else
-#         # cleanup is not possible due to one day validity of object lock configurataion
-#         log_failure "$(get_duration "$start_time")" "${function}" "${out}"
-#     fi
+    # if setting object lock configuration succeeds, upload a file first time
+    if [ $rv -eq 0 ]; then
+        function="${AWS} s3api put-object --body ${MINT_DATA_DIR}/datafile-1-kB --bucket ${bucket_name} --key datafile-1-kB"
+        out=$($function 2>&1)
+        rv=$?
+    else
+        # if make bucket fails, $bucket_name has the error output
+        out="${bucket_name}"
+    fi
 
-#     return $rv
-# }
+    # second time upload will succeed and there shall be now two versions of the object
+    if [ $rv -eq 0 ]; then
+        function="${AWS} s3api put-object --body ${MINT_DATA_DIR}/datafile-1-kB --bucket ${bucket_name} --key datafile-1-kB"
+        out=$($function 2>&1)
+        rv=$?
+    else
+        out="First time object upload failed"
+    fi
 
-# # Tests creating and deleting an object with legal hold.
-# function test_legal_hold() {
-#     # log start time
-#     start_time=$(get_time)
+    if [ $rv -eq 0 ]; then
+        log_success "$(get_duration "$start_time")" "${function}"
+    else
+        # cleanup is not possible due to one day validity of object lock configurataion
+        log_failure "$(get_duration "$start_time")" "${function}" "${out}"
+    fi
 
-#     # Make bucket
-#     bucket_name="awscli-mint-test-bucket-$RANDOM"
-#     function="${AWS} s3api create-bucket --bucket ${bucket_name} --object-lock-enabled-for-bucket"
+    return $rv
+}
 
-#     # execute the test
-#     out=$($function 2>&1)
-#     rv=$?
+# Tests creating and deleting an object with legal hold.
+function test_legal_hold() {
+    # log start time
+    start_time=$(get_time)
 
-#     if [ $rv -ne 0 ]; then
-#         # if this functionality is not implemented return right away.
-#         if echo "$out" | grep -q "NotImplemented"; then
-#             ${AWS} s3 rb s3://"${bucket_name}" --force > /dev/null 2>&1
-#             return 0
-#         fi
-#     fi
+    # Make bucket
+    bucket_name="awscli-mint-test-bucket-$RANDOM"
+    function="${AWS} s3api create-bucket --bucket ${bucket_name} --object-lock-enabled-for-bucket"
 
-#     # if make bucket succeeds upload a file
-#     if [ $rv -eq 0 ]; then
-#         function="${AWS} s3api put-object --body ${MINT_DATA_DIR}/datafile-1-kB --bucket ${bucket_name} --key datafile-1-kB --object-lock-legal-hold-status ON"
-#         out=$($function 2>&1)
-#         errcnt=$(echo "$out" | sed -n '/Bucket is missing ObjectLockConfiguration/p' | wc -l)
-#         # skip test for gateways
-#         if [ "$errcnt" -eq 1 ]; then
-#             return 0
-#         fi
-#         rv=$?
-#     else
-#         # if make bucket fails, $bucket_name has the error output
-#         out="${bucket_name}"
-#     fi
+    # execute the test
+    out=$($function 2>&1)
+    rv=$?
 
-#     # if upload succeeds stat the file
-#     if [ $rv -eq 0 ]; then
-#         function="${AWS} s3api head-object --bucket ${bucket_name} --key datafile-1-kB"
-#         # save the ref to function being tested, so it can be logged
-#         test_function=${function}
-#         out=$($function 2>&1)
-#         lhold=$(echo "$out" | jq -r .ObjectLockLegalHoldStatus)
-#         rv=$?
-#     fi
+    if [ $rv -ne 0 ]; then
+        # if this functionality is not implemented return right away.
+        if echo "$out" | grep -q "NotImplemented"; then
+            ${AWS} s3 rb s3://"${bucket_name}" --force >/dev/null 2>&1
+            log_failure "$(get_duration "$start_time")" "${function}" "${out}"
+            return 0
+        fi
+    fi
 
-#     # if head-object succeeds, verify metadata has legal hold status
-#     if [ $rv -eq 0 ]; then
-#        if [ "${lhold}" == "" ]; then
-#             rv=1
-#             out="Legal hold was not applied"
-#         fi
-#         if [ "${lhold}" == "OFF" ]; then
-#             rv=1
-#             out="Legal hold was not applied"
-#         fi
-#     fi
-#     if [ $rv -eq 0 ]; then
-#         function="${AWS} s3api put-object-legal-hold --bucket ${bucket_name} --key datafile-1-kB --legal-hold Status=OFF"
-#         out=$($function 2>&1)
-#         rv=$?
-#     else
-#         # if make bucket fails, $bucket_name has the error output
-#         out="${bucket_name}"
-#     fi
-#     # if upload succeeds download the file
-#     if [ $rv -eq 0 ]; then
-#         function="${AWS} s3api get-object-legal-hold --bucket ${bucket_name} --key datafile-1-kB"
-#         # save the ref to function being tested, so it can be logged
-#         test_function=${function}
-#         out=$($function 2>&1)
-#         lhold=$(echo "$out" | jq -r .LegalHold.Status)
-#         rv=$?
-#     fi
+    if [ $rv -eq 0 ]; then
+        log_success "$(get_duration "$start_time")" "${function}"
+    fi
 
-#     # if head-object succeeds, verify metadata has legal hold status
-#     if [ $rv -eq 0 ]; then
-#        if [ "${lhold}" == "" ]; then
-#             rv=1
-#             out="Legal hold was not applied"
-#         fi
-#         if [ "${lhold}" == "ON" ]; then
-#             rv=1
-#             out="Legal hold status not turned off"
-#         fi
-#     fi
-#      # Attempt a delete on prefix shouldn't delete the directory since we have an object inside it.
-#     if [ $rv -eq 0 ]; then
-#         function="${AWS} s3api delete-object --bucket ${bucket_name} --key datafile-1-kB"
-#         # save the ref to function being tested, so it can be logged
-#         test_function=${function}
-#         out=$($function 2>&1)
-#         rv=$?
-#     fi
-#     if [ $rv -eq 0 ]; then
-#         log_success "$(get_duration "$start_time")" "${test_function}"
-#     else
-#         # clean up and log error
-#         ${AWS} s3 rb s3://"${bucket_name}" --force > /dev/null 2>&1
-#         log_failure "$(get_duration "$start_time")" "${function}" "${out}"
-#     fi
+    # if make bucket succeeds upload a file
+    if [ $rv -eq 0 ]; then
+        function="${AWS} s3api put-object --body ${MINT_DATA_DIR}/datafile-1-kB --bucket ${bucket_name} --key datafile-1-kB --object-lock-legal-hold-status ON"
+        out=$($function 2>&1)
+        errcnt=$(echo "$out" | sed -n '/Bucket is missing ObjectLockConfiguration/p' | wc -l)
+        # skip test for gateways
+        if [ "$errcnt" -eq 1 ]; then
+            return 0
+        fi
+        rv=$?
+    else
+        # if make bucket fails, $bucket_name has the error output
+        out="${bucket_name}"
+    fi
 
-#     return $rv
-# }
+    if [ $rv -eq 0 ]; then
+        log_success "$(get_duration "$start_time")" "${function}"
+    fi
+
+    # if upload succeeds stat the file
+    if [ $rv -eq 0 ]; then
+        function="${AWS} s3api head-object --bucket ${bucket_name} --key datafile-1-kB"
+        # save the ref to function being tested, so it can be logged
+        test_function=${function}
+        out=$($function 2>&1)
+        lhold=$(echo "$out" | jq -r .ObjectLockLegalHoldStatus)
+        rv=$?
+    fi
+
+    # if head-object succeeds, verify metadata has legal hold status
+    if [ $rv -eq 0 ]; then
+        if [ "${lhold}" == "" ]; then
+            rv=1
+            out="Legal hold was not applied"
+        fi
+        if [ "${lhold}" == "OFF" ]; then
+            rv=1
+            out="Legal hold was not applied"
+        fi
+    fi
+    if [ $rv -eq 0 ]; then
+        function="${AWS} s3api put-object-legal-hold --bucket ${bucket_name} --key datafile-1-kB --legal-hold Status=OFF"
+        out=$($function 2>&1)
+        rv=$?
+    else
+        # if make bucket fails, $bucket_name has the error output
+        out="${bucket_name}"
+    fi
+    if [ $rv -eq 0 ]; then
+        log_success "$(get_duration "$start_time")" "${function}"
+    fi
+
+    # if upload succeeds download the file
+    if [ $rv -eq 0 ]; then
+        function="${AWS} s3api get-object-legal-hold --bucket ${bucket_name} --key datafile-1-kB"
+        # save the ref to function being tested, so it can be logged
+        test_function=${function}
+        out=$($function 2>&1)
+        lhold=$(echo "$out" | jq -r .LegalHold.Status)
+        rv=$?
+    fi
+
+    if [ $rv -eq 0 ]; then
+        log_success "$(get_duration "$start_time")" "${test_function}"
+    fi
+
+    # if head-object succeeds, verify metadata has legal hold status
+    if [ $rv -eq 0 ]; then
+        if [ "${lhold}" == "" ]; then
+            rv=1
+            out="Legal hold was not applied"
+        fi
+        if [ "${lhold}" == "ON" ]; then
+            rv=1
+            out="Legal hold status not turned off"
+        fi
+    fi
+    # Attempt a delete on prefix shouldn't delete the directory since we have an object inside it.
+    if [ $rv -eq 0 ]; then
+        function="${AWS} s3api delete-object --bucket ${bucket_name} --key datafile-1-kB"
+        # save the ref to function being tested, so it can be logged
+        test_function=${function}
+        out=$($function 2>&1)
+        rv=$?
+    fi
+    if [ $rv -eq 0 ]; then
+        log_success "$(get_duration "$start_time")" "${test_function}"
+    else
+        # clean up and log error
+        ${AWS} s3 rb s3://"${bucket_name}" --force >/dev/null 2>&1
+        log_failure "$(get_duration "$start_time")" "${function}" "${out}"
+    fi
+
+    return $rv
+}
 
 # main handler for all the tests.
 main() {
@@ -1706,6 +1813,7 @@ main() {
     test_presigned_object && \
     test_upload_object_10 && \
     test_multipart_upload_10 && \
+    test_bucket_lifecycle && \
     test_serverside_encryption && \
     test_serverside_encryption_get_range && \
     test_serverside_encryption_multipart && \
@@ -1717,8 +1825,8 @@ main() {
     test_list_objects_error && \
     test_put_object_error && \
     test_serverside_encryption_error
-    # test_worm_bucket && \
-    # test_legal_hold
+    test_worm_bucket && \
+    test_legal_hold
 
     return $?
 }
