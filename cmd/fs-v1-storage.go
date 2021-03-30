@@ -21,6 +21,8 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	jsoniter "github.com/json-iterator/go"
+	"github.com/minio/minio/pkg/lock"
 	"io"
 	"io/ioutil"
 	"net/url"
@@ -46,6 +48,9 @@ type fsv1Storage struct {
 	diskInfoCache timedValue
 
 	ctx context.Context
+
+	// FS rw pool.
+	rwPool *fsIOPool
 
 	// Indexes, will be -1 until assigned a set.
 	poolIndex, setIndex, diskIndex int
@@ -113,6 +118,9 @@ func newFSV1Storage(ep Endpoint) (*fsv1Storage, error) {
 		ctx:       GlobalContext,
 		rootDisk:  rootDisk,
 		diskID:    diskID,
+		rwPool: &fsIOPool{
+			readersMap: make(map[string]*lock.RLockedFile),
+		},
 		poolIndex: -1,
 		setIndex:  -1,
 		diskIndex: -1,
@@ -415,7 +423,61 @@ func (s *fsv1Storage) ReadVersion(ctx context.Context, volume, path, versionID s
 }
 
 func (s *fsv1Storage) ReadAll(ctx context.Context, volume string, path string) ([]byte, error) {
-	return nil, NotImplemented{}
+	volumeDir, err := s.getVolDir(volume)
+	if err != nil {
+		return nil, err
+	}
+
+	// Validate file path length, before reading.
+	filePath := pathJoin(volumeDir, path)
+	if err = checkPathLength(filePath); err != nil {
+		return nil, err
+	}
+
+	return s.readAllData(volumeDir, filePath)
+}
+
+func (s *fsv1Storage) readAllData(volumeDir string, filePath string) (buf []byte, err error) {
+	rlk, err := s.rwPool.Open(filePath)
+	defer s.rwPool.Close(filePath)
+	if err != nil {
+		if osIsNotExist(err) {
+			// Check if the object doesn't exist because its bucket
+			// is missing in order to return the correct error.
+			_, err = Lstat(volumeDir)
+			if err != nil && osIsNotExist(err) {
+				return nil, errVolumeNotFound
+			}
+			return nil, errFileNotFound
+		} else if osIsPermission(err) {
+			return nil, errFileAccessDenied
+		} else if isSysErrNotDir(err) || isSysErrIsDir(err) {
+			return nil, errFileNotFound
+		} else if isSysErrHandleInvalid(err) {
+			// This case is special and needs to be handled for windows.
+			return nil, errFileNotFound
+		} else if isSysErrIO(err) {
+			return nil, errFaultyDisk
+		} else if isSysErrTooManyFiles(err) {
+			return nil, errTooManyOpenFiles
+		} else if isSysErrInvalidArg(err) {
+			st, _ := Lstat(filePath)
+			if st != nil && st.IsDir() {
+				// Linux returns InvalidArg for directory O_DIRECT
+				// we need to keep this fallback code to return correct
+				// errors upwards.
+				return nil, errFileNotFound
+			}
+			return nil, errUnsupportedDisk
+		}
+		return nil, err
+	}
+
+	buf, err = ioutil.ReadAll(rlk)
+	if err != nil {
+		err = osErrToFileErr(err)
+	}
+	return buf, err
 }
 
 func (s *fsv1Storage) ReadFileStream(ctx context.Context, volume, path string, offset, length int64) (io.ReadCloser, error) {
@@ -492,23 +554,64 @@ func (s *fsv1Storage) isObjectDir(bucket, prefix string) bool {
 	return len(entries) == 0
 }
 
-func (s *fsv1Storage) getObjectMetaNoFSLock(ctx context.Context, bucket, object string) ([]byte, error) {
+func (s *fsv1Storage) getObjectInfoNoFSLockBuf(bucket, object string) ([]byte, error) {
+	objInfo, err := s.getObjectInfoNoFSLock(bucket, object)
+	if err != nil {
+		return nil, err
+	}
+
+	var json = jsoniter.ConfigCompatibleWithStandardLibrary
+	return json.Marshal(objInfo)
+}
+
+func (s *fsv1Storage) getObjectInfoNoFSLock(bucket, object string) (oi ObjectInfo, e error) {
+	fsMeta := fsMetaV1{}
+	if HasSuffix(object, SlashSeparator) {
+		fi, err := fsStatDir(s.ctx, pathJoin(s.String(), bucket, object))
+		if err != nil {
+			return oi, err
+		}
+		return fsMeta.ToObjectInfo(bucket, object, fi), nil
+	}
+
 	fsMetaPath := pathJoin(s.String(), minioMetaBucket, bucketMetaPrefix, bucket, object, fsMetaJSONFile)
 	// Read `fs.json` to perhaps contend with
 	// parallel Put() operations.
 
-	rc, _, err := fsOpenFile(ctx, fsMetaPath, 0)
+	rc, _, err := fsOpenFile(s.ctx, fsMetaPath, 0)
+	if err == nil {
+		fsMetaBuf, rerr := ioutil.ReadAll(rc)
+		rc.Close()
+		if rerr == nil {
+			var json = jsoniter.ConfigCompatibleWithStandardLibrary
+			if rerr = json.Unmarshal(fsMetaBuf, &fsMeta); rerr != nil {
+				// For any error to read fsMeta, set default ETag and proceed.
+				fsMeta = defaultFsJSON(object)
+			}
+		} else {
+			// For any error to read fsMeta, set default ETag and proceed.
+			fsMeta = defaultFsJSON(object)
+		}
+	}
+
+	// Return a default etag and content-type based on the object's extension.
+	if err == errFileNotFound {
+		fsMeta = defaultFsJSON(object)
+	}
+
+	// Ignore if `fs.json` is not available, this is true for pre-existing data.
+	if err != nil && err != errFileNotFound {
+		logger.LogIf(s.ctx, err)
+		return oi, err
+	}
+
+	// Stat the file to get file size.
+	fi, err := fsStatFile(s.ctx, pathJoin(s.String(), bucket, object))
 	if err != nil {
-		return defaultFsJSONMarshalled(object)
+		return oi, err
 	}
 
-	fsMetaBuf, rerr := ioutil.ReadAll(rc)
-	_ = rc.Close()
-	if rerr != nil {
-		return defaultFsJSONMarshalled(object)
-	}
-
-	return fsMetaBuf, nil
+	return fsMeta.ToObjectInfo(bucket, object, fi), nil
 }
 
 // WalkDir will traverse a directory and return all entries found.
@@ -573,7 +676,7 @@ func (s *fsv1Storage) WalkDir(ctx context.Context, opts WalkDirOptions, wr io.Wr
 			if strings.HasSuffix(entry, slashSeparator) {
 				cacheEntry := metaCacheEntry{name: pathJoin(current, entry)}
 				if s.isObjectDir(opts.Bucket, pathJoin(current, entry)) {
-					cacheEntry.metadata, err = defaultFsJSONMarshalled(pathJoin(current, entry))
+					cacheEntry.metadata, err = s.getObjectInfoNoFSLockBuf(opts.Bucket, pathJoin(current, entry))
 					if err != nil {
 						logger.LogIf(ctx, err)
 						continue
@@ -601,7 +704,7 @@ func (s *fsv1Storage) WalkDir(ctx context.Context, opts WalkDirOptions, wr io.Wr
 			}
 			// If root was an object return it as such.
 			var meta metaCacheEntry
-			meta.metadata, err = s.getObjectMetaNoFSLock(ctx, opts.Bucket, pathJoin(current, entry))
+			meta.metadata, err = s.getObjectInfoNoFSLockBuf(opts.Bucket, pathJoin(current, entry))
 			if err != nil {
 				logger.LogIf(ctx, err)
 				continue

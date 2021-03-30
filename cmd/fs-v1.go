@@ -62,8 +62,6 @@ type FSObjects struct {
 	// The count of concurrent calls on FSObjects API
 	activeIOCount int64
 
-	// meta json filename, varies by fs / cache backend.
-	metaJSONFile string
 	// Unique value to be used for all
 	// temporary transactions.
 	fsUUID string
@@ -71,11 +69,9 @@ type FSObjects struct {
 	// This value shouldn't be touched, once initialized.
 	fsFormatRlk *lock.RLockedFile // Is a read lock on `format.json`.
 
+	// TODO: delete, has been moved to fsV1Storage
 	// FS rw pool.
 	rwPool *fsIOPool
-
-	// ListObjects pool management.
-	listPool *TreeWalkPool
 
 	diskMount bool
 
@@ -130,7 +126,6 @@ func NewFSObjectLayer(fsPath string) (ObjectLayer, error) {
 			readersMap: make(map[string]*lock.RLockedFile),
 		},
 		nsMutex:       newNSLock(false),
-		listPool:      NewTreeWalkPool(globalLookupTimeout),
 		appendFileMap: make(map[string]*fsAppendFile),
 		diskMount:     mountinfo.IsLikelyMountPoint(fsPath),
 	}
@@ -785,63 +780,6 @@ func defaultFsJSON(object string) fsMetaV1 {
 	return fsMeta
 }
 
-func defaultFsJSONMarshalled(object string) ([]byte, error) {
-	fsMeta := defaultFsJSON(object)
-	var json = jsoniter.ConfigCompatibleWithStandardLibrary
-	return json.Marshal(fsMeta)
-}
-
-// TODO: remove as soon as it it not needed anymore due to refactoring of FSObject
-func (fs *FSObjects) getObjectInfoNoFSLock(ctx context.Context, bucket, object string) (oi ObjectInfo, e error) {
-	fsMeta := fsMetaV1{}
-	if HasSuffix(object, SlashSeparator) {
-		fi, err := fsStatDir(ctx, pathJoin(fs.disk.String(), bucket, object))
-		if err != nil {
-			return oi, err
-		}
-		return fsMeta.ToObjectInfo(bucket, object, fi), nil
-	}
-
-	fsMetaPath := pathJoin(fs.disk.String(), minioMetaBucket, bucketMetaPrefix, bucket, object, fsMetaJSONFile)
-	// Read `fs.json` to perhaps contend with
-	// parallel Put() operations.
-
-	rc, _, err := fsOpenFile(ctx, fsMetaPath, 0)
-	if err == nil {
-		fsMetaBuf, rerr := ioutil.ReadAll(rc)
-		rc.Close()
-		if rerr == nil {
-			var json = jsoniter.ConfigCompatibleWithStandardLibrary
-			if rerr = json.Unmarshal(fsMetaBuf, &fsMeta); rerr != nil {
-				// For any error to read fsMeta, set default ETag and proceed.
-				fsMeta = defaultFsJSON(object)
-			}
-		} else {
-			// For any error to read fsMeta, set default ETag and proceed.
-			fsMeta = defaultFsJSON(object)
-		}
-	}
-
-	// Return a default etag and content-type based on the object's extension.
-	if err == errFileNotFound {
-		fsMeta = defaultFsJSON(object)
-	}
-
-	// Ignore if `fs.json` is not available, this is true for pre-existing data.
-	if err != nil && err != errFileNotFound {
-		logger.LogIf(ctx, err)
-		return oi, err
-	}
-
-	// Stat the file to get file size.
-	fi, err := fsStatFile(ctx, pathJoin(fs.disk.String(), bucket, object))
-	if err != nil {
-		return oi, err
-	}
-
-	return fsMeta.ToObjectInfo(bucket, object, fi), nil
-}
-
 // getObjectInfo - wrapper for reading object metadata and constructs ObjectInfo.
 func (fs *FSObjects) getObjectInfo(ctx context.Context, bucket, object string) (oi ObjectInfo, e error) {
 	if strings.HasSuffix(object, SlashSeparator) && !fs.isObjectDir(bucket, object) {
@@ -1448,8 +1386,11 @@ func (fs *FSObjects) fsListObjects(ctx context.Context, opts listPathOptions) (L
 		entries.o = entries.o[1:]
 	}
 
-	objInfoFound := entries.fileInfosFS(opts.Bucket, opts.Prefix, opts.Separator, func(object string) (ObjectInfo, error) {
-		return fs.getObjectInfoNoFSLock(ctx, opts.Bucket, object)
+	objInfoFound := entries.objectInfos(opts.Bucket, opts.Prefix, opts.Separator, func(objectInfoBuf []byte) (ObjectInfo, error) {
+		oi := ObjectInfo{}
+		var json = jsoniter.ConfigCompatibleWithStandardLibrary
+		err := json.Unmarshal(objectInfoBuf, &oi)
+		return oi, err
 	})
 
 	for _, objInfo := range objInfoFound {
@@ -1473,7 +1414,7 @@ func (fs *FSObjects) fsListObjects(ctx context.Context, opts listPathOptions) (L
 
 // fileInfoVersionsFS is a copy of fileInfos converts the metadata to FileInfoVersions where possible.
 // Metadata that cannot be decoded is skipped.
-func (m *metaCacheEntriesSorted) fileInfosFS(bucket, prefix, delimiter string, objectInfo func(object string) (ObjectInfo, error)) (objects []ObjectInfo) {
+func (m *metaCacheEntriesSorted) objectInfos(bucket, prefix, delimiter string, objectInfo func(object []byte) (ObjectInfo, error)) (objects []ObjectInfo) {
 	objects = make([]ObjectInfo, 0, m.len())
 	prevPrefix := ""
 	for _, entry := range m.o {
@@ -1496,7 +1437,7 @@ func (m *metaCacheEntriesSorted) fileInfosFS(bucket, prefix, delimiter string, o
 				}
 			}
 
-			oi, err := objectInfo(entry.name)
+			oi, err := objectInfo(entry.metadata)
 			if err == nil {
 				objects = append(objects, oi)
 			}
