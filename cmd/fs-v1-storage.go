@@ -17,12 +17,11 @@
 package cmd
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
-	jsoniter "github.com/json-iterator/go"
-	"github.com/minio/minio/pkg/lock"
 	"io"
 	"io/ioutil"
 	"net/url"
@@ -30,6 +29,10 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	jsoniter "github.com/json-iterator/go"
+	"github.com/klauspost/readahead"
+	"github.com/minio/minio/pkg/lock"
 
 	"github.com/minio/minio/cmd/logger"
 
@@ -113,11 +116,11 @@ func newFSV1Storage(ep Endpoint) (*fsv1Storage, error) {
 	// gets its own UUID for temporary file transaction.
 	diskID := mustGetUUID()
 	p := &fsv1Storage{
-		diskPath:  path,
-		endpoint:  ep,
-		ctx:       GlobalContext,
-		rootDisk:  rootDisk,
-		diskID:    diskID,
+		diskPath: path,
+		endpoint: ep,
+		ctx:      GlobalContext,
+		rootDisk: rootDisk,
+		diskID:   diskID,
 		rwPool: &fsIOPool{
 			readersMap: make(map[string]*lock.RLockedFile),
 		},
@@ -418,8 +421,82 @@ func (s *fsv1Storage) RenameData(ctx context.Context, srcVolume, srcPath, dataDi
 	return NotImplemented{}
 }
 
+// ReadVersion - reads metadata and returns FileInfo at path `xl.meta`
+// for all objects less than `32KiB` this call returns data as well
+// along with metadata.
 func (s *fsv1Storage) ReadVersion(ctx context.Context, volume, path, versionID string, readData bool) (fi FileInfo, err error) {
-	return FileInfo{}, NotImplemented{}
+	if _, err := s.StatVol(ctx, volume); err != nil {
+		return fi, err
+	}
+
+	volumeDir, err := s.getVolDir(volume)
+	if err != nil {
+		return fi, err
+	}
+
+	if strings.HasSuffix(path, SlashSeparator) && !s.isObjectDir(volume, path) {
+		return fi, errFileNotFound
+	}
+
+	fsMeta := fsMetaV1{}
+	if HasSuffix(path, SlashSeparator) {
+		dirInfo, err := fsStatDir(ctx, pathJoin(s.String(), volume, path))
+		if err != nil {
+			return fi, err
+		}
+		return fsMeta.ToFileInfo(volume, path, dirInfo), nil
+	}
+
+	buf, err := s.ReadAll(ctx, minioMetaBucket, pathJoin(bucketMetaPrefix, volume, path, fsMetaJSONFile))
+	if err != nil {
+		if err == errFileNotFound {
+			fsMeta = defaultFsJSON(path)
+		} else {
+			logger.LogIf(ctx, err)
+			return fi, err
+		}
+	}
+
+	if len(buf) == 0 {
+		if versionID != "" {
+			return fi, errFileVersionNotFound
+		}
+		return fi, errFileNotFound
+	}
+
+	var json = jsoniter.ConfigCompatibleWithStandardLibrary
+	err = json.Unmarshal(buf, &fsMeta)
+	if err != nil {
+		logger.LogIf(ctx, err)
+		return fi, errCorruptedFormat
+	}
+
+	if !isFSMetaValid(fsMeta.Version) {
+		return fi, errCorruptedFormat
+	}
+
+	// Stat the file to get file size.
+	fileInfo, err := fsStatFile(ctx, pathJoin(volumeDir, path))
+	if err != nil {
+		return fi, err
+	}
+
+	fi = fsMeta.ToFileInfo(volume, path, fileInfo)
+
+	if readData {
+		// Reading data for small objects when
+		// - object has not yet transitioned
+		// - object size lesser than 32KiB
+		// - object has maximum of 1 parts
+		if fi.Size <= smallFileThreshold {
+			fi.Data, err = s.readAllData(volumeDir, path)
+			if err != nil {
+				return FileInfo{}, err
+			}
+		}
+	}
+
+	return fi, nil
 }
 
 func (s *fsv1Storage) ReadAll(ctx context.Context, volume string, path string) ([]byte, error) {
@@ -480,8 +557,88 @@ func (s *fsv1Storage) readAllData(volumeDir string, filePath string) (buf []byte
 	return buf, err
 }
 
+// ReadFileStream - Returns the read stream of the file.
 func (s *fsv1Storage) ReadFileStream(ctx context.Context, volume, path string, offset, length int64) (io.ReadCloser, error) {
-	return nil, NotImplemented{}
+	if offset < 0 {
+		return nil, errInvalidArgument
+	}
+
+	volumeDir, err := s.getVolDir(volume)
+	if err != nil {
+		return nil, err
+	}
+
+	// Validate effective path length before reading.
+	filePath := pathJoin(volumeDir, path)
+	if err = checkPathLength(filePath); err != nil {
+		return nil, err
+	}
+
+	// Open the file for reading.
+	file, err := s.rwPool.Open(filePath)
+	if err != nil {
+		switch {
+		case osIsNotExist(err):
+			_, err = Lstat(volumeDir)
+			if err != nil && osIsNotExist(err) {
+				return nil, errVolumeNotFound
+			}
+			return nil, errFileNotFound
+		case osIsPermission(err):
+			return nil, errFileAccessDenied
+		case isSysErrNotDir(err):
+			return nil, errFileAccessDenied
+		case isSysErrIO(err):
+			return nil, errFaultyDisk
+		case isSysErrTooManyFiles(err):
+			return nil, errTooManyOpenFiles
+		case isSysErrInvalidArg(err):
+			return nil, errUnsupportedDisk
+		default:
+			return nil, err
+		}
+	}
+
+	st, err := file.Stat()
+	if err != nil {
+		s.rwPool.Close(filePath)
+		return nil, err
+	}
+
+	// Verify it is a regular file, otherwise subsequent Seek is
+	// undefined.
+	if !st.Mode().IsRegular() {
+		s.rwPool.Close(filePath)
+		return nil, errIsNotRegular
+	}
+
+	r := struct {
+		io.Reader
+		io.Closer
+	}{Reader: io.LimitReader(file, length), Closer: closeWrapper(func() error {
+		return s.rwPool.Close(filePath)
+	})}
+
+	if offset > 0 {
+		if _, err = file.Seek(offset, io.SeekStart); err != nil {
+			s.rwPool.Close(filePath)
+			return nil, err
+		}
+	}
+
+	// Add readahead to big reads
+	if length >= readAheadSize {
+		rc, err := readahead.NewReadCloserSize(r, readAheadBuffers, readAheadBufSize)
+		if err != nil {
+			s.rwPool.Close(filePath)
+			return nil, err
+		}
+		return rc, nil
+	}
+
+	// Just add a small 64k buffer.
+	r.Reader = bufio.NewReaderSize(r.Reader, 64<<10)
+	return r, nil
 }
 
 func (s *fsv1Storage) ReadFile(ctx context.Context, volume string, path string, offset int64, buf []byte, verifier *BitrotVerifier) (int64, error) {

@@ -200,6 +200,45 @@ func (m fsMetaV1) ToObjectInfo(bucket, object string, fi os.FileInfo) ObjectInfo
 	return objInfo
 }
 
+func (m fsMetaV1) ToFileInfo(bucket, object string, fi os.FileInfo) FileInfo {
+	if len(m.Meta) == 0 {
+		m.Meta = make(map[string]string)
+	}
+
+	// Guess content-type from the extension if possible.
+	if m.Meta["content-type"] == "" {
+		m.Meta["content-type"] = mimedb.TypeByExtension(pathutil.Ext(object))
+	}
+
+	if HasSuffix(object, SlashSeparator) {
+		m.Meta["etag"] = emptyETag // For directories etag is d41d8cd98f00b204e9800998ecf8427e
+		m.Meta["content-type"] = "application/octet-stream"
+	}
+
+	fileInfo := FileInfo{
+		Volume: bucket,
+		Name:  object,
+		IsLatest:  true,
+		Deleted: false,
+		Parts: m.Parts,
+		XLV1: false,
+		Metadata: m.Meta,
+		Mode: uint32(fi.Mode()),
+		NumVersions: 1,
+	}
+
+	if fi != nil {
+		fileInfo.ModTime = fi.ModTime()
+		fileInfo.Size = fi.Size()
+		if fi.IsDir() {
+			// Directory is always 0 bytes in S3 API, treat it as such.
+			fileInfo.Size = 0
+		}
+	}
+
+	return fileInfo
+}
+
 func (m *fsMetaV1) WriteTo(lk *lock.LockedFile) (n int64, err error) {
 	if err = jsonSave(lk, m); err != nil {
 		return 0, err

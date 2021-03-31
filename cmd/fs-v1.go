@@ -22,6 +22,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/minio/minio/pkg/bucket/lifecycle"
 	"io"
 	"io/ioutil"
 	"net/http"
@@ -870,24 +871,81 @@ func (fs *FSObjects) GetObjectInfo(ctx context.Context, bucket, object string, o
 		atomic.AddInt64(&fs.activeIOCount, -1)
 	}()
 
-	oi, err := fs.getObjectInfoWithLock(ctx, bucket, object)
-	if err == errCorruptedFormat || err == io.EOF {
-		lk := fs.NewNSLock(bucket, object)
-		ctx, err = lk.GetLock(ctx, globalOperationTimeout)
-		if err != nil {
-			return oi, toObjectErr(err, bucket, object)
-		}
+	var err error
+	if err = checkGetObjArgs(ctx, bucket, object); err != nil {
+		return oi, err
+	}
 
+	if !opts.NoLock {
+		// Lock the object before reading.
+		lk := fs.NewNSLock(bucket, object)
+		ctx, err = lk.GetRLock(ctx, globalOperationTimeout)
+		if err != nil {
+			return ObjectInfo{}, err
+		}
+		defer lk.RUnlock()
+	}
+
+	fi, err := fs.disk.ReadVersion(ctx, bucket, object, opts.VersionID, false)
+
+	if err == errCorruptedFormat || err == io.EOF {
+		// TODO: replace with fs.disk.WriteMetadata
 		fsMetaPath := pathJoin(fs.disk.String(), minioMetaBucket, bucketMetaPrefix, bucket, object, fsMetaJSONFile)
 		err = fs.createFsJSON(object, fsMetaPath)
-		lk.Unlock()
 		if err != nil {
 			return oi, toObjectErr(err, bucket, object)
 		}
 
-		oi, err = fs.getObjectInfoWithLock(ctx, bucket, object)
+		fi, err = fs.disk.ReadVersion(ctx, bucket, object, opts.VersionID, false)
 	}
-	return oi, toObjectErr(err, bucket, object)
+
+	if err != nil {
+		return oi, toObjectErr(err, bucket, object)
+	}
+
+	oi = fi.ToObjectInfo(bucket, object)
+	if oi.TransitionStatus == lifecycle.TransitionComplete {
+		// overlay storage class for transitioned objects with transition tier SC Label
+		if sc := transitionSC(ctx, bucket); sc != "" {
+			oi.StorageClass = sc
+		}
+	}
+	if !fi.VersionPurgeStatus.Empty() && opts.VersionID != "" {
+		// Make sure to return object info to provide extra information.
+		return oi, toObjectErr(errMethodNotAllowed, bucket, object)
+	}
+
+	if fi.Deleted {
+		if opts.VersionID == "" || opts.DeleteMarker {
+			return oi, toObjectErr(errFileNotFound, bucket, object)
+		}
+		// Make sure to return object info to provide extra information.
+		return oi, toObjectErr(errMethodNotAllowed, bucket, object)
+	}
+
+	return oi, nil
+
+
+
+	//oi, err := fs.getObjectInfoWithLock(ctx, bucket, object)
+	//if err == errCorruptedFormat || err == io.EOF {
+	//	lk := fs.NewNSLock(bucket, object)
+	//	ctx, err = lk.GetLock(ctx, globalOperationTimeout)
+	//	if err != nil {
+	//		return oi, toObjectErr(err, bucket, object)
+	//	}
+	//
+	//	fs.disk.Wri
+	//	fsMetaPath := pathJoin(fs.disk.String(), minioMetaBucket, bucketMetaPrefix, bucket, object, fsMetaJSONFile)
+	//	err = fs.createFsJSON(object, fsMetaPath)
+	//	lk.Unlock()
+	//	if err != nil {
+	//		return oi, toObjectErr(err, bucket, object)
+	//	}
+	//
+	//	oi, err = fs.getObjectInfoWithLock(ctx, bucket, object)
+	//}
+	//return oi, toObjectErr(err, bucket, object)
 }
 
 // This function does the following check, suppose
