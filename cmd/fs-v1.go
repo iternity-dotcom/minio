@@ -22,7 +22,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/minio/minio/pkg/bucket/lifecycle"
 	"io"
 	"io/ioutil"
 	"net/http"
@@ -34,6 +33,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/minio/minio/pkg/bucket/lifecycle"
 
 	jsoniter "github.com/json-iterator/go"
 	"github.com/minio/minio-go/v7/pkg/s3utils"
@@ -682,82 +683,6 @@ func (fs *FSObjects) GetObjectNInfo(ctx context.Context, bucket, object string, 
 	return objReaderFn(reader, h, opts.CheckPrecondFn, closeFn)
 }
 
-// getObject - wrapper for GetObject
-func (fs *FSObjects) getObject(ctx context.Context, bucket, object string, offset int64, length int64, writer io.Writer, etag string, lock bool) (err error) {
-	if _, err = fs.disk.StatVol(ctx, bucket); err != nil {
-		return toObjectErr(err, bucket)
-	}
-
-	// Offset cannot be negative.
-	if offset < 0 {
-		logger.LogIf(ctx, errUnexpected, logger.Application)
-		return toObjectErr(errUnexpected, bucket, object)
-	}
-
-	// Writer cannot be nil.
-	if writer == nil {
-		logger.LogIf(ctx, errUnexpected, logger.Application)
-		return toObjectErr(errUnexpected, bucket, object)
-	}
-
-	// If its a directory request, we return an empty body.
-	if HasSuffix(object, SlashSeparator) {
-		_, err = writer.Write([]byte(""))
-		logger.LogIf(ctx, err)
-		return toObjectErr(err, bucket, object)
-	}
-
-	if bucket != minioMetaBucket {
-		fsMetaPath := pathJoin(fs.disk.String(), minioMetaBucket, bucketMetaPrefix, bucket, object, fsMetaJSONFile)
-		if lock {
-			_, err = fs.rwPool.Open(fsMetaPath)
-			if err != nil && err != errFileNotFound {
-				logger.LogIf(ctx, err)
-				return toObjectErr(err, bucket, object)
-			}
-			defer fs.rwPool.Close(fsMetaPath)
-		}
-	}
-
-	if etag != "" && etag != defaultEtag {
-		objEtag, perr := fs.getObjectETag(ctx, bucket, object, lock)
-		if perr != nil {
-			return toObjectErr(perr, bucket, object)
-		}
-		if objEtag != etag {
-			logger.LogIf(ctx, InvalidETag{}, logger.Application)
-			return toObjectErr(InvalidETag{}, bucket, object)
-		}
-	}
-
-	// Read the object, doesn't exist returns an s3 compatible error.
-	fsObjPath := pathJoin(fs.disk.String(), bucket, object)
-	reader, size, err := fsOpenFile(ctx, fsObjPath, offset)
-	if err != nil {
-		return toObjectErr(err, bucket, object)
-	}
-	defer reader.Close()
-
-	// For negative length we read everything.
-	if length < 0 {
-		length = size - offset
-	}
-
-	// Reply back invalid range if the input offset and length fall out of range.
-	if offset > size || offset+length > size {
-		err = InvalidRange{offset, length, size}
-		logger.LogIf(ctx, err, logger.Application)
-		return err
-	}
-
-	_, err = io.Copy(writer, io.LimitReader(reader, length))
-	// The writer will be closed incase of range queries, which will emit ErrClosedPipe.
-	if err == io.ErrClosedPipe {
-		err = nil
-	}
-	return toObjectErr(err, bucket, object)
-}
-
 // Create a new fs.json file, if the existing one is corrupt. Should happen very rarely.
 func (fs *FSObjects) createFsJSON(object, fsMetaPath string) error {
 	fsMeta := newFSMetaV1()
@@ -782,81 +707,6 @@ func defaultFsJSON(object string) fsMetaV1 {
 		"content-type": mimedb.TypeByExtension(path.Ext(object)),
 	}
 	return fsMeta
-}
-
-// getObjectInfo - wrapper for reading object metadata and constructs ObjectInfo.
-func (fs *FSObjects) getObjectInfo(ctx context.Context, bucket, object string) (oi ObjectInfo, e error) {
-	if strings.HasSuffix(object, SlashSeparator) && !fs.isObjectDir(bucket, object) {
-		return oi, errFileNotFound
-	}
-
-	fsMeta := fsMetaV1{}
-	if HasSuffix(object, SlashSeparator) {
-		fi, err := fsStatDir(ctx, pathJoin(fs.disk.String(), bucket, object))
-		if err != nil {
-			return oi, err
-		}
-		return fsMeta.ToObjectInfo(bucket, object, fi), nil
-	}
-
-	fsMetaPath := pathJoin(fs.disk.String(), minioMetaBucket, bucketMetaPrefix, bucket, object, fsMetaJSONFile)
-	// Read `fs.json` to perhaps contend with
-	// parallel Put() operations.
-
-	rlk, err := fs.rwPool.Open(fsMetaPath)
-	if err == nil {
-		// Read from fs metadata only if it exists.
-		_, rerr := fsMeta.ReadFrom(ctx, rlk.LockedFile)
-		fs.rwPool.Close(fsMetaPath)
-		if rerr != nil {
-			// For any error to read fsMeta, set default ETag and proceed.
-			fsMeta = defaultFsJSON(object)
-		}
-	}
-
-	// Return a default etag and content-type based on the object's extension.
-	if err == errFileNotFound {
-		fsMeta = defaultFsJSON(object)
-	}
-
-	// Ignore if `fs.json` is not available, this is true for pre-existing data.
-	if err != nil && err != errFileNotFound {
-		logger.LogIf(ctx, err)
-		return oi, err
-	}
-
-	// Stat the file to get file size.
-	fi, err := fsStatFile(ctx, pathJoin(fs.disk.String(), bucket, object))
-	if err != nil {
-		return oi, err
-	}
-
-	return fsMeta.ToObjectInfo(bucket, object, fi), nil
-}
-
-// getObjectInfoWithLock - reads object metadata and replies back ObjectInfo.
-func (fs *FSObjects) getObjectInfoWithLock(ctx context.Context, bucket, object string) (oi ObjectInfo, err error) {
-	// Lock the object before reading.
-	lk := fs.NewNSLock(bucket, object)
-	ctx, err = lk.GetRLock(ctx, globalOperationTimeout)
-	if err != nil {
-		return oi, err
-	}
-	defer lk.RUnlock()
-
-	if err := checkGetObjArgs(ctx, bucket, object); err != nil {
-		return oi, err
-	}
-
-	if _, err := fs.disk.StatVol(ctx, bucket); err != nil {
-		return oi, err
-	}
-
-	if strings.HasSuffix(object, SlashSeparator) && !fs.isObjectDir(bucket, object) {
-		return oi, errFileNotFound
-	}
-
-	return fs.getObjectInfo(ctx, bucket, object)
 }
 
 // GetObjectInfo - reads object metadata and replies back ObjectInfo.
@@ -927,28 +777,6 @@ func (fs *FSObjects) GetObjectInfo(ctx context.Context, bucket, object string, o
 	}
 
 	return oi, nil
-
-
-
-	//oi, err := fs.getObjectInfoWithLock(ctx, bucket, object)
-	//if err == errCorruptedFormat || err == io.EOF {
-	//	lk := fs.NewNSLock(bucket, object)
-	//	ctx, err = lk.GetLock(ctx, globalOperationTimeout)
-	//	if err != nil {
-	//		return oi, toObjectErr(err, bucket, object)
-	//	}
-	//
-	//	fs.disk.Wri
-	//	fsMetaPath := pathJoin(fs.disk.String(), minioMetaBucket, bucketMetaPrefix, bucket, object, fsMetaJSONFile)
-	//	err = fs.createFsJSON(object, fsMetaPath)
-	//	lk.Unlock()
-	//	if err != nil {
-	//		return oi, toObjectErr(err, bucket, object)
-	//	}
-	//
-	//	oi, err = fs.getObjectInfoWithLock(ctx, bucket, object)
-	//}
-	//return oi, toObjectErr(err, bucket, object)
 }
 
 // This function does the following check, suppose
@@ -1216,49 +1044,6 @@ func (fs *FSObjects) DeleteObject(ctx context.Context, bucket, object string, op
 		}
 	}
 	return ObjectInfo{Bucket: bucket, Name: object}, nil
-}
-
-func (fs *FSObjects) isLeafDir(bucket string, leafPath string) bool {
-	return fs.isObjectDir(bucket, leafPath)
-}
-
-func (fs *FSObjects) isLeaf(bucket string, leafPath string) bool {
-	return !strings.HasSuffix(leafPath, slashSeparator)
-}
-
-// Returns function "listDir" of the type listDirFunc.
-// isLeaf - is used by listDir function to check if an entry
-// is a leaf or non-leaf entry.
-func (fs *FSObjects) listDirFactory(ctx context.Context) ListDirFunc {
-	// listDir - lists all the entries at a given prefix and given entry in the prefix.
-	listDir := func(bucket, prefixDir, prefixEntry string) (emptyDir bool, entries []string, delayIsLeaf bool) {
-		var err error
-		entries, err = fs.disk.ListDir(ctx, bucket, prefixDir, -1)
-		if err != nil && err != errFileNotFound {
-			logger.LogIf(GlobalContext, err)
-			return false, nil, false
-		}
-		if len(entries) == 0 {
-			return true, nil, false
-		}
-		entries, delayIsLeaf = filterListEntries(bucket, prefixDir, entries, prefixEntry, fs.isLeaf)
-		return false, entries, delayIsLeaf
-	}
-
-	// Return list factory instance.
-	return listDir
-}
-
-// TODO: remove as soon as it it not needed anymore due to refactoring of FSObject
-// isObjectDir returns true if the specified bucket & prefix exists
-// and the prefix represents an empty directory. An S3 empty directory
-// is also an empty directory in the FS backend.
-func (fs *FSObjects) isObjectDir(bucket, prefix string) bool {
-	entries, err := readDirN(pathJoin(fs.disk.String(), bucket, prefix), 1)
-	if err != nil {
-		return false
-	}
-	return len(entries) == 0
 }
 
 // getObjectETag is a helper function, which returns only the md5sum
