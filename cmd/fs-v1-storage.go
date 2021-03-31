@@ -421,31 +421,28 @@ func (s *fsv1Storage) RenameData(ctx context.Context, srcVolume, srcPath, dataDi
 	return NotImplemented{}
 }
 
-func (s *fsv1Storage) acquireMetaLock(ctx context.Context, volume, path string) (*lock.RLockedFile, func (), error) {
+func (s *fsv1Storage) acquireMetaLock(ctx context.Context, volume, path string) (*lock.RLockedFile, func(), error) {
 	volDir, err := s.getVolDir(minioMetaBucket)
-	if volume == minioMetaBucket {
-		fsMetaPath := pathJoin(volDir, volume, path)
-		l, err := s.rwPool.Open(fsMetaPath)
-		if err != nil {
-			logger.LogIf(ctx, err)
-			return nil, func() {}, err
-		}
-		return l, func() { s.rwPool.Close(fsMetaPath) }, nil
-	}
-
 	if err != nil {
 		return nil, func() {}, err
 	}
-	bucketMetaDir := pathJoin(volDir, bucketMetaPrefix)
-	fsMetaPath := pathJoin(bucketMetaDir, volume, path, fsMetaJSONFile)
+
+	var fsMetaPath string
+	if volume == minioMetaBucket {
+		fsMetaPath = pathJoin(volDir, path)
+	} else {
+		bucketMetaDir := pathJoin(volDir, bucketMetaPrefix)
+		fsMetaPath = pathJoin(bucketMetaDir, volume, path, fsMetaJSONFile)
+	}
 
 	l, err := s.rwPool.Open(fsMetaPath)
-	if err != nil && err != errFileNotFound {
+	if err != nil {
 		logger.LogIf(ctx, err)
 		return nil, func() {}, err
 	}
-
-	return l, func() { s.rwPool.Close(fsMetaPath) }, nil
+	return l, func() {
+		s.rwPool.Close(fsMetaPath)
+	}, nil
 }
 
 // ReadVersion - reads metadata and returns FileInfo at path `xl.meta`
@@ -482,20 +479,20 @@ func (s *fsv1Storage) ReadVersion(ctx context.Context, volume, path, versionID s
 			logger.LogIf(ctx, err)
 			return fi, err
 		}
-	}
-
-	if len(buf) == 0 {
-		if versionID != "" {
-			return fi, errFileVersionNotFound
+	} else {
+		if len(buf) == 0 {
+			if versionID != "" {
+				return fi, errFileVersionNotFound
+			}
+			return fi, errFileNotFound
 		}
-		return fi, errFileNotFound
-	}
 
-	var json = jsoniter.ConfigCompatibleWithStandardLibrary
-	err = json.Unmarshal(buf, &fsMeta)
-	if err != nil {
-		logger.LogIf(ctx, err)
-		return fi, errCorruptedFormat
+		var json = jsoniter.ConfigCompatibleWithStandardLibrary
+		err = json.Unmarshal(buf, &fsMeta)
+		if err != nil {
+			logger.LogIf(ctx, err)
+			return fi, errCorruptedFormat
+		}
 	}
 
 	if !isFSMetaValid(fsMeta.Version) {
@@ -516,7 +513,7 @@ func (s *fsv1Storage) ReadVersion(ctx context.Context, volume, path, versionID s
 		// - object size lesser than 32KiB
 		// - object has maximum of 1 parts
 		if fi.Size <= smallFileThreshold {
-			fi.Data, err = s.readAllData(volumeDir, path)
+			fi.Data, err = s.ReadAll(ctx, volume, path)
 			if err != nil {
 				return FileInfo{}, err
 			}
@@ -527,6 +524,7 @@ func (s *fsv1Storage) ReadVersion(ctx context.Context, volume, path, versionID s
 }
 
 func (s *fsv1Storage) ReadAll(ctx context.Context, volume string, path string) ([]byte, error) {
+	var file *os.File
 	volumeDir, err := s.getVolDir(volume)
 	if err != nil {
 		return nil, err
@@ -538,47 +536,61 @@ func (s *fsv1Storage) ReadAll(ctx context.Context, volume string, path string) (
 		return nil, err
 	}
 
-	return s.readAllData(volumeDir, filePath)
-}
+	rlk, f, err := s.acquireMetaLock(ctx, volume, path)
 
-func (s *fsv1Storage) readAllData(volumeDir string, filePath string) (buf []byte, err error) {
-
-	rlk, f, err := s.acquireMetaLock(context.TODO(), volumeDir, filePath)
-	defer f()
 	if err != nil {
-		if osIsNotExist(err) {
-			// Check if the object doesn't exist because its bucket
-			// is missing in order to return the correct error.
-			_, err = Lstat(volumeDir)
-			if err != nil && osIsNotExist(err) {
-				return nil, errVolumeNotFound
+		if volume == minioMetaBucket {
+			return nil, err
+		} else {
+			if err != errFileNotFound {
+				return nil, err
+
 			}
-			return nil, errFileNotFound
-		} else if osIsPermission(err) {
-			return nil, errFileAccessDenied
-		} else if isSysErrNotDir(err) || isSysErrIsDir(err) {
-			return nil, errFileNotFound
-		} else if isSysErrHandleInvalid(err) {
-			// This case is special and needs to be handled for windows.
-			return nil, errFileNotFound
-		} else if isSysErrIO(err) {
-			return nil, errFaultyDisk
-		} else if isSysErrTooManyFiles(err) {
-			return nil, errTooManyOpenFiles
-		} else if isSysErrInvalidArg(err) {
-			st, _ := Lstat(filePath)
-			if st != nil && st.IsDir() {
-				// Linux returns InvalidArg for directory O_DIRECT
-				// we need to keep this fallback code to return correct
-				// errors upwards.
-				return nil, errFileNotFound
-			}
-			return nil, errUnsupportedDisk
 		}
-		return nil, err
+	} else {
+		defer f()
+	}
+	if volume != minioMetaBucket {
+		file, err = OpenFile(filePath, readMode, 0)
+
+		if err != nil {
+			if osIsNotExist(err) {
+				// Check if the object doesn't exist because its bucket
+				// is missing in order to return the correct error.
+				_, err = Lstat(volumeDir)
+				if err != nil && osIsNotExist(err) {
+					return nil, errVolumeNotFound
+				}
+				return nil, errFileNotFound
+			} else if osIsPermission(err) {
+				return nil, errFileAccessDenied
+			} else if isSysErrNotDir(err) || isSysErrIsDir(err) {
+				return nil, errFileNotFound
+			} else if isSysErrHandleInvalid(err) {
+				// This case is special and needs to be handled for windows.
+				return nil, errFileNotFound
+			} else if isSysErrIO(err) {
+				return nil, errFaultyDisk
+			} else if isSysErrTooManyFiles(err) {
+				return nil, errTooManyOpenFiles
+			} else if isSysErrInvalidArg(err) {
+				st, _ := Lstat(filePath)
+				if st != nil && st.IsDir() {
+					// Linux returns InvalidArg for directory O_DIRECT
+					// we need to keep this fallback code to return correct
+					// errors upwards.
+					return nil, errFileNotFound
+				}
+				return nil, errUnsupportedDisk
+			}
+			return nil, err
+		}
+		defer file.Close()
+	} else {
+		file = rlk.File
 	}
 
-	buf, err = ioutil.ReadAll(rlk)
+	buf, err := ioutil.ReadAll(file)
 	if err != nil {
 		err = osErrToFileErr(err)
 	}
