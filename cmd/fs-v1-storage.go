@@ -421,6 +421,33 @@ func (s *fsv1Storage) RenameData(ctx context.Context, srcVolume, srcPath, dataDi
 	return NotImplemented{}
 }
 
+func (s *fsv1Storage) acquireMetaLock(ctx context.Context, volume, path string) (*lock.RLockedFile, func (), error) {
+	volDir, err := s.getVolDir(minioMetaBucket)
+	if volume == minioMetaBucket {
+		fsMetaPath := pathJoin(volDir, volume, path)
+		l, err := s.rwPool.Open(fsMetaPath)
+		if err != nil {
+			logger.LogIf(ctx, err)
+			return nil, func() {}, err
+		}
+		return l, func() { s.rwPool.Close(fsMetaPath) }, nil
+	}
+
+	if err != nil {
+		return nil, func() {}, err
+	}
+	bucketMetaDir := pathJoin(volDir, bucketMetaPrefix)
+	fsMetaPath := pathJoin(bucketMetaDir, volume, path, fsMetaJSONFile)
+
+	l, err := s.rwPool.Open(fsMetaPath)
+	if err != nil && err != errFileNotFound {
+		logger.LogIf(ctx, err)
+		return nil, func() {}, err
+	}
+
+	return l, func() { s.rwPool.Close(fsMetaPath) }, nil
+}
+
 // ReadVersion - reads metadata and returns FileInfo at path `xl.meta`
 // for all objects less than `32KiB` this call returns data as well
 // along with metadata.
@@ -515,8 +542,9 @@ func (s *fsv1Storage) ReadAll(ctx context.Context, volume string, path string) (
 }
 
 func (s *fsv1Storage) readAllData(volumeDir string, filePath string) (buf []byte, err error) {
-	rlk, err := s.rwPool.Open(filePath)
-	defer s.rwPool.Close(filePath)
+
+	rlk, f, err := s.acquireMetaLock(context.TODO(), volumeDir, filePath)
+	defer f()
 	if err != nil {
 		if osIsNotExist(err) {
 			// Check if the object doesn't exist because its bucket
