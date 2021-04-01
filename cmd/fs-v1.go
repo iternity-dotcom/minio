@@ -624,6 +624,7 @@ func (fs *FSObjects) GetObjectNInfo(ctx context.Context, bucket, object string, 
 	fi, err := fs.disk.ReadVersion(ctx, bucket, object, opts.VersionID, false)
 
 	if err != nil {
+		nsUnlocker()
 		return nil, toObjectErr(err, bucket, object)
 	}
 	objInfo := fi.ToObjectInfo(bucket, object)
@@ -636,11 +637,13 @@ func (fs *FSObjects) GetObjectNInfo(ctx context.Context, bucket, object string, 
 	}
 
 	if objInfo.DeleteMarker {
+		nsUnlocker()
 		if opts.VersionID == "" {
 			return &GetObjectReader{
 				ObjInfo: objInfo,
 			}, toObjectErr(errFileNotFound, bucket, object)
 		}
+
 		// Make sure to return object info to provide extra information.
 		return &GetObjectReader{
 			ObjInfo: objInfo,
@@ -650,17 +653,21 @@ func (fs *FSObjects) GetObjectNInfo(ctx context.Context, bucket, object string, 
 		// If transitioned, stream from transition tier unless object is restored locally or restore date is past.
 		restoreHdr, ok := caseInsensitiveMap(objInfo.UserDefined).Lookup(xhttp.AmzRestore)
 		if !ok || !strings.HasPrefix(restoreHdr, "ongoing-request=false") || (!objInfo.RestoreExpires.IsZero() && time.Now().After(objInfo.RestoreExpires)) {
-			return getTransitionedObjectReader(ctx, bucket, object, rs, h, objInfo, opts)
+			transR, err := getTransitionedObjectReader(ctx, bucket, object, rs, h, objInfo, opts)
+			nsUnlocker()
+			return transR, err
 		}
 	}
 
 	objReaderFn, off, length, err := NewGetObjectReader(rs, objInfo, opts, nsUnlocker)
 	if err != nil {
+		nsUnlocker()
 		return nil, err
 	}
 
 	// Read the object, doesn't exist returns an s3 compatible error.
-	readCloser, err := fs.disk.ReadFileStream(ctx, bucket, object, off, length)
+	ctxWithLockType := context.WithValue(ctx, lockTypeKey, lockType)
+	readCloser, err := fs.disk.ReadFileStream(ctxWithLockType, bucket, object, off, length)
 	if err != nil {
 		nsUnlocker()
 		return nil, toObjectErr(err, bucket, object)

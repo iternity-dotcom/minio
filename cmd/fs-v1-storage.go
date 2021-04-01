@@ -23,6 +23,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"io"
+	"io/fs"
 	"io/ioutil"
 	"net/url"
 	"os"
@@ -421,7 +422,39 @@ func (s *fsv1Storage) RenameData(ctx context.Context, srcVolume, srcPath, dataDi
 	return NotImplemented{}
 }
 
-func (s *fsv1Storage) acquireMetaLock(ctx context.Context, volume, path string) (*lock.RLockedFile, func(), error) {
+func openFile(filePath string, mode int) (f *os.File, err error) {
+	// Create top level directories if they don't exist.
+	// with mode 0777 mkdir honors system umask.
+	if err = mkdirAll(pathutil.Dir(filePath), 0777); err != nil {
+		return nil, osErrToFileErr(err)
+	}
+
+	w, err := OpenFile(filePath, mode|writeMode, 0666)
+	if err != nil {
+		// File path cannot be verified since one of the parents is a file.
+		switch {
+		case isSysErrIsDir(err):
+			return nil, errIsNotRegular
+		case osIsPermission(err):
+			return nil, errFileAccessDenied
+		case isSysErrIO(err):
+			return nil, errFaultyDisk
+		case isSysErrTooManyFiles(err):
+			return nil, errTooManyOpenFiles
+		default:
+			return nil, err
+		}
+	}
+
+	return w, nil
+}
+
+type StatReadCloser interface {
+	io.ReadSeekCloser
+	Stat() (fs.FileInfo, error)
+}
+
+func (s *fsv1Storage) acquireMetaLock(ctx context.Context, volume, path string) (StatReadCloser, func(), error) {
 	volDir, err := s.getVolDir(minioMetaBucket)
 	if err != nil {
 		return nil, func() {}, err
@@ -431,16 +464,27 @@ func (s *fsv1Storage) acquireMetaLock(ctx context.Context, volume, path string) 
 	if volume == minioMetaBucket {
 		fsMetaPath = pathJoin(volDir, path)
 	} else {
-		bucketMetaDir := pathJoin(volDir, bucketMetaPrefix)
-		fsMetaPath = pathJoin(bucketMetaDir, volume, path, fsMetaJSONFile)
+		fsMetaPath = pathJoin(volDir, bucketMetaPrefix, volume, path, fsMetaJSONFile)
 	}
 
-	l, err := s.rwPool.Open(fsMetaPath)
+	lockType := ctx.Value(lockTypeKey)
+	if lockType == noLock {
+		l, err := openFile(fsMetaPath, readMode)
+		if err != nil {
+			logger.LogIf(ctx, err)
+			return nil, func() {}, err
+		}
+		return l, func() {
+			l.Close()
+		}, nil
+	}
+
+	rlk, err := s.rwPool.Open(fsMetaPath)
 	if err != nil {
 		logger.LogIf(ctx, err)
 		return nil, func() {}, err
 	}
-	return l, func() {
+	return rlk, func() {
 		s.rwPool.Close(fsMetaPath)
 	}, nil
 }
@@ -524,7 +568,6 @@ func (s *fsv1Storage) ReadVersion(ctx context.Context, volume, path, versionID s
 }
 
 func (s *fsv1Storage) ReadAll(ctx context.Context, volume string, path string) ([]byte, error) {
-	var file *os.File
 	volumeDir, err := s.getVolDir(volume)
 	if err != nil {
 		return nil, err
@@ -536,20 +579,15 @@ func (s *fsv1Storage) ReadAll(ctx context.Context, volume string, path string) (
 		return nil, err
 	}
 
-	rlk, f, err := s.acquireMetaLock(ctx, volume, path)
+	metaFile, f, err := s.acquireMetaLock(ctx, volume, path)
+	defer f()
 
-	if err != nil {
-		if volume == minioMetaBucket {
-			return nil, err
-		} else {
-			if err != errFileNotFound {
-				return nil, err
-
-			}
-		}
-	} else {
-		defer f()
+	if  err != nil &&
+		(volume == minioMetaBucket || (volume != minioMetaBucket && err != errFileNotFound)) {
+		return nil, err
 	}
+
+	var file io.ReadCloser
 	if volume != minioMetaBucket {
 		file, err = OpenFile(filePath, readMode, 0)
 
@@ -587,7 +625,7 @@ func (s *fsv1Storage) ReadAll(ctx context.Context, volume string, path string) (
 		}
 		defer file.Close()
 	} else {
-		file = rlk.File
+		file = metaFile
 	}
 
 	buf, err := ioutil.ReadAll(file)
@@ -615,7 +653,14 @@ func (s *fsv1Storage) ReadFileStream(ctx context.Context, volume, path string, o
 	}
 
 	// Open the file for reading.
-	file, err := s.rwPool.Open(filePath)
+	_, unlocker, err := s.acquireMetaLock(ctx, volume, path)
+	defer unlocker()
+	if  err != nil &&
+		(volume == minioMetaBucket || (volume != minioMetaBucket && err != errFileNotFound)) {
+		return nil, err
+	}
+
+	file, err := openFile(filePath, readMode)
 	if err != nil {
 		switch {
 		case osIsNotExist(err):
@@ -641,14 +686,14 @@ func (s *fsv1Storage) ReadFileStream(ctx context.Context, volume, path string, o
 
 	st, err := file.Stat()
 	if err != nil {
-		s.rwPool.Close(filePath)
+		unlocker()
 		return nil, err
 	}
 
 	// Verify it is a regular file, otherwise subsequent Seek is
 	// undefined.
 	if !st.Mode().IsRegular() {
-		s.rwPool.Close(filePath)
+		unlocker()
 		return nil, errIsNotRegular
 	}
 
@@ -656,12 +701,13 @@ func (s *fsv1Storage) ReadFileStream(ctx context.Context, volume, path string, o
 		io.Reader
 		io.Closer
 	}{Reader: io.LimitReader(file, length), Closer: closeWrapper(func() error {
-		return s.rwPool.Close(filePath)
+		unlocker()
+		return nil
 	})}
 
 	if offset > 0 {
 		if _, err = file.Seek(offset, io.SeekStart); err != nil {
-			s.rwPool.Close(filePath)
+			unlocker()
 			return nil, err
 		}
 	}
@@ -670,7 +716,7 @@ func (s *fsv1Storage) ReadFileStream(ctx context.Context, volume, path string, o
 	if length >= readAheadSize {
 		rc, err := readahead.NewReadCloserSize(r, readAheadBuffers, readAheadBufSize)
 		if err != nil {
-			s.rwPool.Close(filePath)
+			unlocker()
 			return nil, err
 		}
 		return rc, nil
@@ -925,3 +971,7 @@ func (s *fsv1Storage) SetDiskLoc(poolIdx, setIdx, diskIdx int) {
 	s.setIndex = setIdx
 	s.diskIndex = diskIdx
 }
+
+type ContextKeys string
+
+const lockTypeKey ContextKeys = "lockTypeKey"
