@@ -27,6 +27,8 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/credentials"
+	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
 )
 
@@ -174,6 +176,48 @@ func testListObjectVersionsSimple() {
 	// Ensure that we have 11 distinct versions IDs
 	if len(versionIDs) != 11 {
 		failureLog(function, args, startTime, "", "ListObjectVersions didn't return 11 different version IDs", nil).Fatal()
+		return
+	}
+
+	// Error cases
+	lovInput := &s3.ListObjectVersionsInput{
+		Bucket:          aws.String(bucket),
+		VersionIdMarker: aws.String("test"),
+	}
+
+	// bucket-listobjects-handlers.go > ListObjectVersionsHandler > listObjectVersions
+	result, err = s3Client.ListObjectVersions(lovInput)
+	if err == nil {
+		failureLog(function, args, startTime, "", fmt.Sprintf("ListObjectVersions expected to fail but got %v", err), err).Fatal()
+		return
+	}
+	// bucket-listobjects-handlers.go > ListObjectVersionsHandler > validateListObjectsArgs
+	lovInput.EncodingType = aws.String("test")
+	result, err = s3Client.ListObjectVersions(lovInput)
+	if err == nil {
+		failureLog(function, args, startTime, "", fmt.Sprintf("ListObjectVersions expected to fail but got %v", err), err).Fatal()
+		return
+	}
+
+	// Second client
+	creds := credentials.NewStaticCredentials("test", "test", "")
+	newSession, err := session.NewSession()
+	if err != nil {
+		failureLog(function, args, startTime, "", fmt.Sprintf("NewSession expected to succeed but got %v", err), err).Fatal()
+		return
+	}
+	s3Config := &aws.Config{
+		Credentials:      creds,
+		Endpoint:         s3Client.Config.Endpoint,
+		Region:           s3Client.Config.Region,
+		S3ForcePathStyle: s3Client.Config.S3ForcePathStyle,
+	}
+	s3ClientTest := s3.New(newSession, s3Config)
+
+	// Check with a second client: bucket-listobjects-handlers.go > ListObjectVersionsHandler > checkRequestAuthType
+	result, err = s3ClientTest.ListObjectVersions(lovInput)
+	if err == nil {
+		failureLog(function, args, startTime, "", fmt.Sprintf("ListObjectVersions expected to fail but got %v", err), err).Fatal()
 		return
 	}
 
