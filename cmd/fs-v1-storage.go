@@ -548,17 +548,6 @@ func (s *fsv1Storage) getMetaWriteLock(ctx context.Context, volume, path string)
 		fsMetaPath = pathJoin(volDir, bucketMetaPrefix, volume, path, fsMetaJSONFile)
 	}
 
-	if volume == minioMetaBucket {
-		l, err := openFile(fsMetaPath, writeMode)
-		if err != nil {
-			logger.LogIf(ctx, err)
-			return nil, func() {}, func() {}, err
-		}
-		return l, func() {
-			l.Close()
-		}, func() {}, nil
-	}
-
 	cleanUp := func() {}
 	rlk, err := s.rwPool.Write(fsMetaPath)
 	if err != nil {
