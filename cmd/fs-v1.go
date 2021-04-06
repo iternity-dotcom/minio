@@ -819,14 +819,6 @@ func (fs *FSObjects) PutObject(ctx context.Context, bucket string, object string
 		return ObjectInfo{}, err
 	}
 
-	// Lock the object.
-	lk := fs.NewNSLock(bucket, object)
-	ctx, err = lk.GetLock(ctx, globalOperationTimeout)
-	if err != nil {
-		logger.LogIf(ctx, err)
-		return objInfo, err
-	}
-	defer lk.Unlock()
 	defer ObjectPathUpdated(path.Join(bucket, object))
 
 	atomic.AddInt64(&fs.activeIOCount, 1)
@@ -834,15 +826,13 @@ func (fs *FSObjects) PutObject(ctx context.Context, bucket string, object string
 		atomic.AddInt64(&fs.activeIOCount, -1)
 	}()
 
+	opts.ParentIsObject = fs.parentDirIsObject
 	return fs.putObject(ctx, bucket, object, r, opts)
 }
 
 // putObject - wrapper for PutObject
 func (fs *FSObjects) putObject(ctx context.Context, bucket string, object string, r *PutObjReader, opts ObjectOptions) (objInfo ObjectInfo, retErr error) {
-	data := r.Reader
-
 	// No metadata is set, allocate a new one.
-	meta := cloneMSS(opts.UserDefined)
 	var err error
 
 	// Validate if bucket name is valid and exists.
@@ -850,113 +840,117 @@ func (fs *FSObjects) putObject(ctx context.Context, bucket string, object string
 		return ObjectInfo{}, toObjectErr(err, bucket)
 	}
 
-	fsMeta := newFSMetaV1()
-	fsMeta.Meta = meta
+	data := r.Reader
+
+	uniqueID := mustGetUUID()
+	tempObj := uniqueID
+	// No metadata is set, allocate a new one.
+	if opts.UserDefined == nil {
+		opts.UserDefined = make(map[string]string)
+	}
+
+	// Validate input data size and it can never be less than zero.
+	if data.Size() < -1 {
+		logger.LogIf(ctx, errInvalidArgument, logger.Application)
+		return ObjectInfo{}, toObjectErr(errInvalidArgument)
+	}
+
+	fi := FileInfo{
+		Metadata: cloneMSS(opts.UserDefined),
+	}
 
 	// This is a special case with size as '0' and object ends
 	// with a slash separator, we treat it like a valid operation
 	// and return success.
 	if isObjectDir(object, data.Size()) {
 		// Check if an object is present as one of the parent dir.
-		if fs.parentDirIsObject(ctx, bucket, path.Dir(object)) {
+		if opts.ParentIsObject != nil && opts.ParentIsObject(ctx, bucket, path.Dir(object)) {
 			return ObjectInfo{}, toObjectErr(errFileParentIsFile, bucket, object)
 		}
 		if err = mkdirAll(pathJoin(fs.disk.String(), bucket, object), 0777); err != nil {
 			logger.LogIf(ctx, err)
 			return ObjectInfo{}, toObjectErr(err, bucket, object)
 		}
-		var fi os.FileInfo
-		if fi, err = fsStatDir(ctx, pathJoin(fs.disk.String(), bucket, object)); err != nil {
+		if fi, err = fs.disk.ReadVersion(ctx, bucket, object, "", false); err != nil {
 			return ObjectInfo{}, toObjectErr(err, bucket, object)
 		}
-		return fsMeta.ToObjectInfo(bucket, object, fi), nil
+		return fi.ToObjectInfo(bucket, object), nil
 	}
+
+	// TODO: Locking on meta file removed from this level -> correct behaviour?
+	// TODO: fi.DataDir, fileParts...
 
 	// Check if an object is present as one of the parent dir.
 	if fs.parentDirIsObject(ctx, bucket, path.Dir(object)) {
 		return ObjectInfo{}, toObjectErr(errFileParentIsFile, bucket, object)
 	}
 
-	// Validate input data size and it can never be less than zero.
-	if data.Size() < -1 {
-		logger.LogIf(ctx, errInvalidArgument, logger.Application)
-		return ObjectInfo{}, errInvalidArgument
-	}
-
-	var wlk *lock.LockedFile
-	if bucket != minioMetaBucket {
-		bucketMetaDir := pathJoin(fs.disk.String(), minioMetaBucket, bucketMetaPrefix)
-		fsMetaPath := pathJoin(bucketMetaDir, bucket, object, fsMetaJSONFile)
-		wlk, err = fs.rwPool.Write(fsMetaPath)
-		var freshFile bool
-		if err != nil {
-			wlk, err = fs.rwPool.Create(fsMetaPath)
-			if err != nil {
-				logger.LogIf(ctx, err)
-				return ObjectInfo{}, toObjectErr(err, bucket, object)
-			}
-			freshFile = true
-		}
-		// This close will allow for locks to be synchronized on `fs.json`.
-		defer wlk.Close()
-		defer func() {
-			// Remove meta file when PutObject encounters
-			// any error and it is a fresh file.
-			//
-			// We should preserve the `fs.json` of any
-			// existing object
-			if retErr != nil && freshFile {
-				tmpDir := pathJoin(fs.disk.String(), minioMetaTmpBucket, fs.fsUUID)
-				fsRemoveMeta(ctx, bucketMetaDir, fsMetaPath, tmpDir)
-			}
-		}()
-	}
-
 	// Uploaded object will first be written to the temporary location which will eventually
 	// be renamed to the actual location. It is first written to the temporary location
 	// so that cleaning it up will be easy if the server goes down.
-	tempObj := mustGetUUID()
-
-	fsTmpObjPath := pathJoin(fs.disk.String(), minioMetaTmpBucket, fs.fsUUID, tempObj)
-	bytesWritten, err := fsCreateFile(ctx, fsTmpObjPath, data, data.Size())
+	err = fs.disk.CreateFile(ctx, minioMetaTmpBucket, pathJoin(fs.fsUUID, tempObj), data.Size(), data)
+	if err != nil {
+		// Should return IncompleteBody{} error when reader has fewer
+		// bytes than specified in request header.
+		if err == errLessData || err == errMoreData {
+			return ObjectInfo{}, IncompleteBody{Bucket: bucket, Object: object}
+		}
+		return ObjectInfo{}, toObjectErr(err, bucket, object)
+	}
 
 	// Delete the temporary object in the case of a
 	// failure. If PutObject succeeds, then there would be
 	// nothing to delete.
-	defer fsRemoveFile(ctx, fsTmpObjPath)
-
-	if err != nil {
-		return ObjectInfo{}, toObjectErr(err, bucket, object)
-	}
-	fsMeta.Meta["etag"] = r.MD5CurrentHexString()
-
-	// Should return IncompleteBody{} error when reader has fewer
-	// bytes than specified in request header.
-	if bytesWritten < data.Size() {
-		return ObjectInfo{}, IncompleteBody{Bucket: bucket, Object: object}
-	}
-
-	// Entire object was written to the temp location, now it's safe to rename it to the actual location.
-	fsNSObjPath := pathJoin(fs.disk.String(), bucket, object)
-	if err = fsRenameFile(ctx, fsTmpObjPath, fsNSObjPath); err != nil {
-		return ObjectInfo{}, toObjectErr(err, bucket, object)
-	}
-
-	if bucket != minioMetaBucket {
-		// Write FS metadata after a successful namespace operation.
-		if _, err = fsMeta.WriteTo(wlk); err != nil {
-			return ObjectInfo{}, toObjectErr(err, bucket, object)
+	defer func() {
+		if err != nil {
+			fs.disk.Delete(ctx, minioMetaTmpBucket, pathJoin(fs.fsUUID, tempObj), true)
 		}
+	}()
+
+	if !opts.NoLock {
+		var err error
+		lk := fs.NewNSLock(bucket, object)
+		ctx, err = lk.GetLock(ctx, globalOperationTimeout)
+		if err != nil {
+			return ObjectInfo{}, err
+		}
+		defer lk.Unlock()
 	}
+
+	if opts.UserDefined["etag"] == "" {
+		fi.Metadata["etag"] = r.MD5CurrentHexString()
+	}
+
+	// Guess content-type from the extension if possible.
+	if opts.UserDefined["content-type"] == "" {
+		fi.Metadata["content-type"] = mimedb.TypeByExtension(path.Ext(object))
+	}
+
+	modTime := opts.MTime
+	if opts.MTime.IsZero() {
+		modTime = UTCNow()
+	}
+
+	fi.Size = data.Size()
+	fi.ModTime = modTime
+
+	if err = fs.disk.WriteMetadata(ctx, minioMetaTmpBucket, pathJoin(fs.fsUUID, tempObj), fi); err != nil {
+		return ObjectInfo{}, toObjectErr(err, bucket, object)
+	}
+
+	// rename
+	defer ObjectPathUpdated(pathJoin(minioMetaTmpBucket, pathJoin(fs.fsUUID, tempObj)))
+	defer ObjectPathUpdated(pathJoin(bucket, object))
+	fs.disk.RenameData(ctx, minioMetaTmpBucket, pathJoin(fs.fsUUID, tempObj), fi.DataDir, bucket, object)
 
 	// Stat the file to fetch timestamp, size.
-	fi, err := fsStatFile(ctx, pathJoin(fs.disk.String(), bucket, object))
+	fi, err = fs.disk.ReadVersion(ctx, bucket, object, "", false)
 	if err != nil {
 		return ObjectInfo{}, toObjectErr(err, bucket, object)
 	}
 
 	// Success.
-	return fsMeta.ToObjectInfo(bucket, object, fi), nil
+	return fi.ToObjectInfo(bucket, object), nil
 }
 
 // DeleteObjects - deletes an object from a bucket, this operation is destructive

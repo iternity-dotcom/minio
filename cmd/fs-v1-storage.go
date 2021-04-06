@@ -22,6 +22,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	xioutil "github.com/minio/minio/pkg/ioutil"
 	"io"
 	"io/fs"
 	"io/ioutil"
@@ -29,6 +30,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	jsoniter "github.com/json-iterator/go"
@@ -46,6 +48,9 @@ import (
 type fsv1Storage struct {
 	diskPath string
 	endpoint Endpoint
+
+	poolLarge sync.Pool
+	poolSmall sync.Pool
 
 	diskID        string
 	rootDisk      bool
@@ -394,8 +399,83 @@ func (s *fsv1Storage) AppendFile(ctx context.Context, volume string, path string
 	return NotImplemented{}
 }
 
-func (s *fsv1Storage) CreateFile(ctx context.Context, volume, path string, size int64, reader io.Reader) error {
-	return NotImplemented{}
+func (s *fsv1Storage) CreateFile(ctx context.Context, volume, path string, fileSize int64, r io.Reader) error {
+	// TODO: handle locking with rwPool
+	if fileSize < -1 {
+		return errInvalidArgument
+	}
+
+	volumeDir, err := s.getVolDir(volume)
+	if err != nil {
+		return err
+	}
+
+	filePath := pathJoin(volumeDir, path)
+	if err = checkPathLength(filePath); err != nil {
+		return err
+	}
+
+	parentFilePath := pathutil.Dir(filePath)
+	defer func() {
+		if err != nil {
+			if volume == minioMetaTmpBucket {
+				removeAll(parentFilePath)
+			}
+		}
+	}()
+
+	if fileSize >= 0 && fileSize <= smallFileThreshold {
+		// For streams smaller than 128KiB we simply write them as O_DSYNC (fdatasync)
+		// and not O_DIRECT to avoid the complexities of aligned I/O.
+		w, err := openFile(filePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC)
+		if err != nil {
+			return err
+		}
+		defer w.Close()
+
+		written, err := io.Copy(w, r)
+		if err != nil {
+			return osErrToFileErr(err)
+		}
+
+		if written > fileSize {
+			return errMoreData
+		}
+
+		return nil
+	}
+
+	// Create top level directories if they don't exist.
+	// with mode 0777 mkdir honors system umask.
+	if err = mkdirAll(parentFilePath, 0777); err != nil {
+		return osErrToFileErr(err)
+	}
+
+	w, err := OpenFileDirectIO(filePath, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0666)
+	if err != nil {
+		return osErrToFileErr(err)
+	}
+
+	defer func() {
+		disk.Fdatasync(w) // Only interested in flushing the size_t not mtime/atime
+		w.Close()
+	}()
+
+	bufp := s.poolLarge.Get().(*[]byte)
+	defer s.poolLarge.Put(bufp)
+
+	written, err := xioutil.CopyAligned(w, r, *bufp, fileSize)
+	if err != nil {
+		return err
+	}
+
+	if written < fileSize && fileSize >= 0 {
+		return errLessData
+	} else if written > fileSize && fileSize >= 0 {
+		return errMoreData
+	}
+
+	return nil
 }
 
 func (s *fsv1Storage) WriteMetadata(ctx context.Context, volume, path string, fi FileInfo) error {
