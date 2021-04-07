@@ -479,7 +479,16 @@ func (s *fsv1Storage) CreateFile(ctx context.Context, volume, path string, fileS
 }
 
 func (s *fsv1Storage) WriteMetadata(ctx context.Context, volume, path string, fi FileInfo) error {
-	return NotImplemented{}
+	fsMeta := &fsMetaV1{}
+	fsMeta.FromFileInfo(fi)
+
+	var json = jsoniter.ConfigCompatibleWithStandardLibrary
+	buf, err := json.Marshal(&fsMeta)
+	if err != nil {
+		return err
+	}
+
+	return s.WriteAll(ctx, volume, pathJoin(path, fsMetaJSONFile), buf)
 }
 
 func (s *fsv1Storage) DeleteVersion(ctx context.Context, volume, path string, fi FileInfo, forceDelMarker bool) error {
@@ -539,6 +548,11 @@ func (s *fsv1Storage) CheckParts(ctx context.Context, volume string, path string
 	return NotImplemented{}
 }
 
+// srcVolume: srcBucket
+// srcPath: path to folder that contains fs.json (meta) and <dataDir>/part.1 (object)
+// dstVolume: dstBucket
+// dstPath: 1. destination path for "object": <dstVolume>/<dstPath>
+//          2. destination path for "meta": <minioMetaBucket>/<bucketMetaPrefix>/<dstVolume>/dstPath/fs.json
 func (s *fsv1Storage) RenameData(ctx context.Context, srcVolume, srcPath, dataDir, dstVolume, dstPath string) (err error) {
 	return NotImplemented{}
 }
@@ -647,7 +661,7 @@ func (s *fsv1Storage) getMetaWriteLock(ctx context.Context, volume, path string)
 	}, cleanUp, nil
 }
 
-// ReadVersion - reads metadata and returns FileInfo at path `xl.meta`
+// ReadVersion - reads metadata and returns FileInfo at path `fs.json`
 // for all objects less than `32KiB` this call returns data as well
 // along with metadata.
 func (s *fsv1Storage) ReadVersion(ctx context.Context, volume, path, versionID string, readData bool) (fi FileInfo, err error) {
@@ -934,7 +948,87 @@ func (s *fsv1Storage) ListDir(ctx context.Context, volume, dirPath string, count
 }
 
 func (s *fsv1Storage) Delete(ctx context.Context, volume string, path string, recursive bool) error {
-	return NotImplemented{}
+	volumeDir, err := s.getVolDir(volume)
+	if err != nil {
+		return err
+	}
+
+	// Stat a volume entry.
+	_, err = Lstat(volumeDir)
+	if err != nil {
+		if osIsNotExist(err) {
+			return errVolumeNotFound
+		} else if osIsPermission(err) {
+			return errVolumeAccessDenied
+		} else if isSysErrIO(err) {
+			return errFaultyDisk
+		}
+		return err
+	}
+
+	// Following code is needed so that we retain SlashSeparator suffix if any in
+	// path argument.
+	filePath := pathJoin(volumeDir, path)
+	if err = checkPathLength(filePath); err != nil {
+		return err
+	}
+
+	// Delete file and delete parent directory as well if it's empty.
+	return s.deleteFile(volumeDir, filePath, recursive)
+}
+
+// deleteFile deletes a file or a directory if its empty unless recursive
+// is set to true. If the target is successfully deleted, it will recursively
+// move up the tree, deleting empty parent directories until it finds one
+// with files in it. Returns nil for a non-empty directory even when
+// recursive is set to false.
+func (s *fsv1Storage) deleteFile(basePath, deletePath string, recursive bool) error {
+	if basePath == "" || deletePath == "" {
+		return nil
+	}
+	isObjectDir := HasSuffix(deletePath, SlashSeparator)
+	basePath = pathutil.Clean(basePath)
+	deletePath = pathutil.Clean(deletePath)
+	if !strings.HasPrefix(deletePath, basePath) || deletePath == basePath {
+		return nil
+	}
+
+	var err error
+	if recursive {
+		err = renameAll(deletePath, pathutil.Join(s.diskPath, minioMetaTmpDeletedBucket, mustGetUUID()))
+	} else {
+		err = Remove(deletePath)
+	}
+	if err != nil {
+		switch {
+		case isSysErrNotEmpty(err):
+			// if object is a directory, but if its not empty
+			// return FileNotFound to indicate its an empty prefix.
+			if isObjectDir {
+				return errFileNotFound
+			}
+			// Ignore errors if the directory is not empty. The server relies on
+			// this functionality, and sometimes uses recursion that should not
+			// error on parent directories.
+			return nil
+		case osIsNotExist(err):
+			return errFileNotFound
+		case osIsPermission(err):
+			return errFileAccessDenied
+		case isSysErrIO(err):
+			return errFaultyDisk
+		default:
+			return err
+		}
+	}
+
+	deletePath = pathutil.Dir(deletePath)
+
+	// Delete parent directory obviously not recursively. Errors for
+	// parent directories shouldn't trickle down.
+	s.deleteFile(basePath, deletePath, false)
+
+	return nil
 }
 
 func (s *fsv1Storage) DeleteVersions(ctx context.Context, volume string, versions []FileInfo) (errs []error) {

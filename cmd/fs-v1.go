@@ -843,7 +843,8 @@ func (fs *FSObjects) putObject(ctx context.Context, bucket string, object string
 	data := r.Reader
 
 	uniqueID := mustGetUUID()
-	tempObj := uniqueID
+	tempObjFolder := uniqueID
+
 	// No metadata is set, allocate a new one.
 	if opts.UserDefined == nil {
 		opts.UserDefined = make(map[string]string)
@@ -878,17 +879,27 @@ func (fs *FSObjects) putObject(ctx context.Context, bucket string, object string
 	}
 
 	// TODO: Locking on meta file removed from this level -> correct behaviour?
-	// TODO: fi.DataDir, fileParts...
-
 	// Check if an object is present as one of the parent dir.
 	if fs.parentDirIsObject(ctx, bucket, path.Dir(object)) {
 		return ObjectInfo{}, toObjectErr(errFileParentIsFile, bucket, object)
 	}
 
+	fi.DataDir = mustGetUUID()
+	partName := "part.1"
+
+	// Delete the temporary object in the case of a
+	// failure. If PutObject succeeds, then there would be
+	// nothing to delete.
+	defer func() {
+		if err != nil {
+			fs.disk.Delete(ctx, minioMetaTmpBucket, pathJoin(fs.fsUUID, tempObjFolder), true)
+		}
+	}()
+
 	// Uploaded object will first be written to the temporary location which will eventually
 	// be renamed to the actual location. It is first written to the temporary location
 	// so that cleaning it up will be easy if the server goes down.
-	err = fs.disk.CreateFile(ctx, minioMetaTmpBucket, pathJoin(fs.fsUUID, tempObj), data.Size(), data)
+	err = fs.disk.CreateFile(ctx, minioMetaTmpBucket, pathJoin(fs.fsUUID, tempObjFolder, fi.DataDir, partName), data.Size(), data)
 	if err != nil {
 		// Should return IncompleteBody{} error when reader has fewer
 		// bytes than specified in request header.
@@ -898,14 +909,7 @@ func (fs *FSObjects) putObject(ctx context.Context, bucket string, object string
 		return ObjectInfo{}, toObjectErr(err, bucket, object)
 	}
 
-	// Delete the temporary object in the case of a
-	// failure. If PutObject succeeds, then there would be
-	// nothing to delete.
-	defer func() {
-		if err != nil {
-			fs.disk.Delete(ctx, minioMetaTmpBucket, pathJoin(fs.fsUUID, tempObj), true)
-		}
-	}()
+
 
 	if !opts.NoLock {
 		var err error
@@ -916,6 +920,9 @@ func (fs *FSObjects) putObject(ctx context.Context, bucket string, object string
 		}
 		defer lk.Unlock()
 	}
+
+	fi.AddObjectPart(1, "", data.Size(), data.ActualSize())
+	// TODO: Checksum info not copied - seems like it is not used for fs (see unused struct in fs-v1-metadata)
 
 	if opts.UserDefined["etag"] == "" {
 		fi.Metadata["etag"] = r.MD5CurrentHexString()
@@ -934,14 +941,14 @@ func (fs *FSObjects) putObject(ctx context.Context, bucket string, object string
 	fi.Size = data.Size()
 	fi.ModTime = modTime
 
-	if err = fs.disk.WriteMetadata(ctx, minioMetaTmpBucket, pathJoin(fs.fsUUID, tempObj), fi); err != nil {
+	if err = fs.disk.WriteMetadata(ctx, minioMetaTmpBucket, pathJoin(fs.fsUUID, tempObjFolder), fi); err != nil {
 		return ObjectInfo{}, toObjectErr(err, bucket, object)
 	}
 
 	// rename
-	defer ObjectPathUpdated(pathJoin(minioMetaTmpBucket, pathJoin(fs.fsUUID, tempObj)))
+	defer ObjectPathUpdated(pathJoin(minioMetaTmpBucket, pathJoin(fs.fsUUID, tempObjFolder)))
 	defer ObjectPathUpdated(pathJoin(bucket, object))
-	fs.disk.RenameData(ctx, minioMetaTmpBucket, pathJoin(fs.fsUUID, tempObj), fi.DataDir, bucket, object)
+	fs.disk.RenameData(ctx, minioMetaTmpBucket, pathJoin(fs.fsUUID, tempObjFolder), fi.DataDir, bucket, object)
 
 	// Stat the file to fetch timestamp, size.
 	fi, err = fs.disk.ReadVersion(ctx, bucket, object, "", false)

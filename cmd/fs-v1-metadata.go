@@ -130,7 +130,7 @@ func (m fsMetaV1) IsValid() bool {
 // Verifies if the backend format metadata is same by validating
 // the version string.
 func isFSMetaValid(version string) bool {
-	return (version == fsMetaVersion || version == fsMetaVersion100 || version == fsMetaVersion101)
+	return version == fsMetaVersion || version == fsMetaVersion100 || version == fsMetaVersion101
 }
 
 // Converts metadata to object info.
@@ -237,6 +237,12 @@ func (m fsMetaV1) ToFileInfo(bucket, object string, fi os.FileInfo) FileInfo {
 	}
 
 	return fileInfo
+}
+
+func (m *fsMetaV1) FromFileInfo(fi FileInfo) {
+	m.Version = fsMetaVersion
+	m.Parts = fi.Parts
+	m.Meta = fi.Metadata
 }
 
 func (m *fsMetaV1) WriteTo(lk *lock.LockedFile) (n int64, err error) {
