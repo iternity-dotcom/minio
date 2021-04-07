@@ -892,7 +892,7 @@ func (fs *FSObjects) putObject(ctx context.Context, bucket string, object string
 	// nothing to delete.
 	defer func() {
 		if err != nil {
-			fs.disk.Delete(ctx, minioMetaTmpBucket, pathJoin(fs.fsUUID, tempObjFolder), true)
+			_ = fs.disk.Delete(ctx, minioMetaTmpBucket, pathJoin(fs.fsUUID, tempObjFolder), true)
 		}
 	}()
 

@@ -130,6 +130,18 @@ func newFSV1Storage(ep Endpoint) (*fsv1Storage, error) {
 		rwPool: &fsIOPool{
 			readersMap: make(map[string]*lock.RLockedFile),
 		},
+		poolLarge: sync.Pool{
+			New: func() interface{} {
+				b := disk.AlignedBlock(blockSizeLarge)
+				return &b
+			},
+		},
+		poolSmall: sync.Pool{
+			New: func() interface{} {
+				b := disk.AlignedBlock(blockSizeSmall)
+				return &b
+			},
+		},
 		poolIndex: -1,
 		setIndex:  -1,
 		diskIndex: -1,
