@@ -948,7 +948,10 @@ func (fs *FSObjects) putObject(ctx context.Context, bucket string, object string
 	// rename
 	defer ObjectPathUpdated(pathJoin(minioMetaTmpBucket, pathJoin(fs.fsUUID, tempObjFolder)))
 	defer ObjectPathUpdated(pathJoin(bucket, object))
-	fs.disk.RenameData(ctx, minioMetaTmpBucket, pathJoin(fs.fsUUID, tempObjFolder), fi.DataDir, bucket, object)
+	err = fs.disk.RenameData(ctx, minioMetaTmpBucket, pathJoin(fs.fsUUID, tempObjFolder), fi.DataDir, bucket, object)
+	if err != nil {
+		return ObjectInfo{}, toObjectErr(err, bucket, object)
+	}
 
 	// Stat the file to fetch timestamp, size.
 	fi, err = fs.disk.ReadVersion(ctx, bucket, object, "", false)
