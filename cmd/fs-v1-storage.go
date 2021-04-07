@@ -601,7 +601,7 @@ func (s *fsv1Storage) RenameData(ctx context.Context, srcVolume, srcPath, dataDi
 		if err != nil {
 			return err
 		}
-		dstMetaFilePath = pathutil.Join(metaVolume, bucketMetaPrefix, dstVolumeDir, pathJoin(dstPath, fsMetaJSONFile))
+		dstMetaFilePath = pathutil.Join(metaVolume, bucketMetaPrefix, dstVolume, pathJoin(dstPath, fsMetaJSONFile))
 	}
 
 	objectSrcPath := pathutil.Join(srcVolumeDir, pathJoin(srcPath, dataDir, "part.1"))
