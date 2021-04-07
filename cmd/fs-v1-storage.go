@@ -506,34 +506,43 @@ func (s *fsv1Storage) WriteAll(ctx context.Context, volume string, path string, 
 		return err
 	}
 
-	metaLock, unlocker, cleanUp, err := s.getMetaWriteLock(ctx, volume, path)
-	defer unlocker()
+	//metaLock, unlocker, cleanUp, err := s.getMetaWriteLock(ctx, volume, path)
+	//defer unlocker()
+	//
+	//if err != nil {
+	//	return err
+	//}
+	//
+	//var w io.WriteCloser
+	//if volume != minioMetaBucket {
+	//	w, err = openFile(filePath, writeMode)
+	//	if err != nil {
+	//		logger.LogIf(ctx, err)
+	//		cleanUp()
+	//		return err
+	//	}
+	//	defer w.Close()
+	//} else {
+	//	w = metaLock
+	//}
 
+	w, err := openFile(filePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC)
 	if err != nil {
+		logger.LogIf(ctx, err)
+		// cleanUp()
 		return err
 	}
+	defer w.Close()
 
-	var w io.WriteCloser
-	if volume != minioMetaBucket {
-		w, err = openFile(filePath, writeMode)
-		if err != nil {
-			logger.LogIf(ctx, err)
-			cleanUp()
-			return err
-		}
-		defer w.Close()
-	} else {
-		w = metaLock
-	}
 
 	n, err := w.Write(b)
 	if err != nil {
-		cleanUp()
+		// cleanUp()
 		return err
 	}
 
 	if n != len(b) {
-		cleanUp()
+		// cleanUp()
 		return io.ErrShortWrite
 	}
 

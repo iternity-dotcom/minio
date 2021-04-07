@@ -954,11 +954,10 @@ func (fs *FSObjects) putObject(ctx context.Context, bucket string, object string
 	}
 
 	// Stat the file to fetch timestamp, size.
-	fi, err = fs.disk.ReadVersion(ctx, bucket, object, "", false)
-	if err != nil {
-		return ObjectInfo{}, toObjectErr(err, bucket, object)
-	}
-
+	//fi, err = fs.disk.ReadVersion(ctx, bucket, object, "", false)
+	//if err != nil {
+	//	return ObjectInfo{}, toObjectErr(err, bucket, object)
+	//}
 	// Success.
 	return fi.ToObjectInfo(bucket, object), nil
 }
