@@ -1045,7 +1045,91 @@ func (s *fsv1Storage) DeleteVersions(ctx context.Context, volume string, version
 }
 
 func (s *fsv1Storage) RenameFile(ctx context.Context, srcVolume, srcPath, dstVolume, dstPath string) (err error) {
-	return NotImplemented{}
+	srcVolumeDir, err := s.getVolDir(srcVolume)
+	if err != nil {
+		return err
+	}
+	dstVolumeDir, err := s.getVolDir(dstVolume)
+	if err != nil {
+		return err
+	}
+	// Stat a volume entry.
+	_, err = Lstat(srcVolumeDir)
+	if err != nil {
+		if osIsNotExist(err) {
+			return errVolumeNotFound
+		} else if isSysErrIO(err) {
+			return errFaultyDisk
+		}
+		return err
+	}
+	_, err = Lstat(dstVolumeDir)
+	if err != nil {
+		if osIsNotExist(err) {
+			return errVolumeNotFound
+		} else if isSysErrIO(err) {
+			return errFaultyDisk
+		}
+		return err
+	}
+
+	srcIsDir := HasSuffix(srcPath, SlashSeparator)
+	dstIsDir := HasSuffix(dstPath, SlashSeparator)
+	// Either src and dst have to be directories or files, else return error.
+	if !(srcIsDir && dstIsDir || !srcIsDir && !dstIsDir) {
+		return errFileAccessDenied
+	}
+	srcFilePath := pathutil.Join(srcVolumeDir, srcPath)
+	if err = checkPathLength(srcFilePath); err != nil {
+		return err
+	}
+	dstFilePath := pathutil.Join(dstVolumeDir, dstPath)
+	if err = checkPathLength(dstFilePath); err != nil {
+		return err
+	}
+	if srcIsDir {
+		// If source is a directory, we expect the destination to be non-existent but we
+		// we still need to allow overwriting an empty directory since it represents
+		// an object empty directory.
+		dirInfo, err := Lstat(dstFilePath)
+		if isSysErrIO(err) {
+			return errFaultyDisk
+		}
+		if err != nil {
+			if !osIsNotExist(err) {
+				return err
+			}
+		} else {
+			if !dirInfo.IsDir() {
+				return errFileAccessDenied
+			}
+			if err = Remove(dstFilePath); err != nil {
+				if isSysErrNotEmpty(err) {
+					return errFileAccessDenied
+				}
+				return err
+			}
+		}
+	}
+
+	if err = renameAll(srcFilePath, dstFilePath); err != nil {
+		return osErrToFileErr(err)
+	}
+
+	if !HasPrefix(srcVolume, minioMetaBucket) && dstVolume == minioMetaTmpBucket {
+		metaVolumeDir, err := s.getVolDir(minioMetaBucket)
+		if err != nil {
+			return err
+		}
+		srcMetaDir := pathutil.Join(metaVolumeDir, bucketMetaPrefix, srcVolume, srcFilePath)
+		dstMetaDir := pathutil.Join(dstVolumeDir, minioMetaBucket, dstPath)
+	}
+
+	// Remove parent dir of the source file if empty
+	parentDir := pathutil.Dir(srcFilePath)
+	s.deleteFile(srcVolumeDir, parentDir, false)
+
+	return nil
 }
 
 func (s *fsv1Storage) VerifyFile(ctx context.Context, volume, path string, fi FileInfo) error {

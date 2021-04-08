@@ -898,8 +898,7 @@ func (fs *FSObjects) putObject(ctx context.Context, bucket string, object string
 	// failure. If PutObject succeeds, then there would be
 	// nothing to delete.
 	defer func() {
-		// hide in deleteObject function because non 'minioMetaTmpBucket' objects need to be deleted differently
-		_ = fs.disk.Delete(ctx, minioMetaTmpBucket, pathJoin(fs.fsUUID, tempObjFolder), true)
+		fs.deleteObject(ctx, minioMetaTmpBucket, pathJoin(fs.fsUUID, tempObjFolder))
 	}()
 
 	// Uploaded object will first be written to the temporary location which will eventually
@@ -943,6 +942,7 @@ func (fs *FSObjects) putObject(ctx context.Context, bucket string, object string
 	defer ObjectPathUpdated(pathJoin(minioMetaTmpBucket, pathJoin(fs.fsUUID, tempObjFolder)))
 	defer ObjectPathUpdated(pathJoin(bucket, object))
 	err = fs.disk.RenameData(ctx, minioMetaTmpBucket, pathJoin(fs.fsUUID, tempObjFolder), fi.DataDir, bucket, object)
+
 	if err != nil {
 		return ObjectInfo{}, toObjectErr(err, bucket, object)
 	}
@@ -955,6 +955,28 @@ func (fs *FSObjects) putObject(ctx context.Context, bucket string, object string
 	// Success.
 	return fi.ToObjectInfo(bucket, object), nil
 }
+
+// deleteObject - wrapper for delete object, deletes an object from
+// all the disks in parallel, including `fs.json` associated with the
+// object.
+func (fs *FSObjects) deleteObject(ctx context.Context, bucket, object string) error {
+	var err error
+	defer ObjectPathUpdated(pathJoin(bucket, object))
+
+	tmpObj := mustGetUUID()
+	if bucket == minioMetaTmpBucket {
+		tmpObj = object
+	} else {
+
+		err = fs.disk.RenameFile(ctx, bucket, object, minioMetaTmpBucket, tmpObj)
+		if err != nil {
+			return toObjectErr(err, bucket, object)
+		}
+	}
+
+	return fs.disk.Delete(ctx, minioMetaTmpBucket, tmpObj, true)
+}
+
 
 // DeleteObjects - deletes an object from a bucket, this operation is destructive
 // and there are no rollbacks supported.
