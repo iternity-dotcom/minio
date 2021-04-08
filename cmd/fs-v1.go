@@ -838,7 +838,7 @@ func (fs *FSObjects) PutObject(ctx context.Context, bucket string, object string
 }
 
 // putObject - wrapper for PutObject
-func (fs *FSObjects) putObject(ctx context.Context, bucket string, object string, r *PutObjReader, opts ObjectOptions) (objInfo ObjectInfo, retErr error) {
+func (fs *FSObjects) putObject(ctx context.Context, bucket string, object string, r *PutObjReader, opts ObjectOptions) (ObjectInfo, error) {
 	// No metadata is set, allocate a new one.
 	var err error
 
@@ -898,10 +898,8 @@ func (fs *FSObjects) putObject(ctx context.Context, bucket string, object string
 	// failure. If PutObject succeeds, then there would be
 	// nothing to delete.
 	defer func() {
-		if err != nil {
-			// hide in deleteObject function because non 'minioMetaTmpBucket' objects need to be deleted differently
-			_ = fs.disk.Delete(ctx, minioMetaTmpBucket, pathJoin(fs.fsUUID, tempObjFolder), true)
-		}
+		// hide in deleteObject function because non 'minioMetaTmpBucket' objects need to be deleted differently
+		_ = fs.disk.Delete(ctx, minioMetaTmpBucket, pathJoin(fs.fsUUID, tempObjFolder), true)
 	}()
 
 	// Uploaded object will first be written to the temporary location which will eventually
