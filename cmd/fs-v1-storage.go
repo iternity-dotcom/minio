@@ -419,10 +419,8 @@ func (s *fsv1Storage) CreateFile(ctx context.Context, volume, path string, fileS
 		return err
 	}
 
-	if written < fileSize && fileSize >= 0 {
+	if written < fileSize {
 		return errLessData
-	} else if written > fileSize {
-		return errMoreData
 	}
 
 	return nil
@@ -687,10 +685,6 @@ func (s *fsv1Storage) ReadVersion(ctx context.Context, volume, path, versionID s
 	volumeDir, err := s.getVolDir(volume)
 	if err != nil {
 		return fi, err
-	}
-
-	if strings.HasSuffix(path, SlashSeparator) && !s.isObjectDir(volume, path) {
-		return fi, errFileNotFound
 	}
 
 	fsMeta := fsMetaV1{}
