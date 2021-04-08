@@ -819,6 +819,14 @@ func (fs *FSObjects) PutObject(ctx context.Context, bucket string, object string
 		return ObjectInfo{}, err
 	}
 
+	// Lock the object.
+	lk := fs.NewNSLock(bucket, object)
+	ctx, err = lk.GetLock(ctx, globalOperationTimeout)
+	if err != nil {
+		logger.LogIf(ctx, err)
+		return objInfo, err
+	}
+	defer lk.Unlock()
 	defer ObjectPathUpdated(path.Join(bucket, object))
 
 	atomic.AddInt64(&fs.activeIOCount, 1)
@@ -826,7 +834,6 @@ func (fs *FSObjects) PutObject(ctx context.Context, bucket string, object string
 		atomic.AddInt64(&fs.activeIOCount, -1)
 	}()
 
-	opts.ParentIsObject = fs.parentDirIsObject
 	return fs.putObject(ctx, bucket, object, r, opts)
 }
 
@@ -865,7 +872,7 @@ func (fs *FSObjects) putObject(ctx context.Context, bucket string, object string
 	// and return success.
 	if isObjectDir(object, data.Size()) {
 		// Check if an object is present as one of the parent dir.
-		if opts.ParentIsObject != nil && opts.ParentIsObject(ctx, bucket, path.Dir(object)) {
+		if fs.parentDirIsObject(ctx, bucket, path.Dir(object)) {
 			return ObjectInfo{}, toObjectErr(errFileParentIsFile, bucket, object)
 		}
 		if err = mkdirAll(pathJoin(fs.disk.String(), bucket, object), 0777); err != nil {
@@ -892,6 +899,7 @@ func (fs *FSObjects) putObject(ctx context.Context, bucket string, object string
 	// nothing to delete.
 	defer func() {
 		if err != nil {
+			// hide in deleteObject function because non 'minioMetaTmpBucket' objects need to be deleted differently
 			_ = fs.disk.Delete(ctx, minioMetaTmpBucket, pathJoin(fs.fsUUID, tempObjFolder), true)
 		}
 	}()
@@ -907,18 +915,6 @@ func (fs *FSObjects) putObject(ctx context.Context, bucket string, object string
 			return ObjectInfo{}, IncompleteBody{Bucket: bucket, Object: object}
 		}
 		return ObjectInfo{}, toObjectErr(err, bucket, object)
-	}
-
-
-
-	if !opts.NoLock {
-		var err error
-		lk := fs.NewNSLock(bucket, object)
-		ctx, err = lk.GetLock(ctx, globalOperationTimeout)
-		if err != nil {
-			return ObjectInfo{}, err
-		}
-		defer lk.Unlock()
 	}
 
 	fi.AddObjectPart(1, "", data.Size(), data.ActualSize())
