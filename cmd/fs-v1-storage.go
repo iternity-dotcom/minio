@@ -448,7 +448,7 @@ func (s *fsv1Storage) DeleteVersion(ctx context.Context, volume, path string, fi
 		return err
 	}
 
-	err = s.deleteFile(volumeDir, pathJoin(volumeDir, path), false)
+	err = s.deleteFile(volumeDir, pathJoin(volumeDir, path), true)
 	if err != nil {
 		return err
 	}
@@ -458,7 +458,7 @@ func (s *fsv1Storage) DeleteVersion(ctx context.Context, volume, path string, fi
 			return err
 		}
 		fsMetaPath := pathJoin(minioMetaBucketDir, bucketMetaPrefix, volume, path, fsMetaJSONFile)
-		err = s.deleteFile(minioMetaBucketDir, fsMetaPath, false)
+		err = s.deleteFile(minioMetaBucketDir, fsMetaPath, true)
 		if err != nil && err != errFileNotFound {
 			return err
 		}
