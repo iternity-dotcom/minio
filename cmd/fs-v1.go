@@ -22,6 +22,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/minio/minio/pkg/bucket/replication"
 	"io"
 	"io/ioutil"
 	"net/http"
@@ -906,7 +907,6 @@ func (fs *FSObjects) putObject(ctx context.Context, bucket string, object string
 	}
 
 	fi.AddObjectPart(1, "", data.Size(), data.ActualSize())
-	// TODO: Checksum info not copied - seems like it is not used for fs (see unused struct in fs-v1-metadata)
 
 	if opts.UserDefined["etag"] == "" {
 		fi.Metadata["etag"] = r.MD5CurrentHexString()
@@ -1004,62 +1004,122 @@ func (fs *FSObjects) DeleteObject(ctx context.Context, bucket, object string, op
 		}
 	}
 
-	// Acquire a write lock before deleting the object.
-	lk := fs.NewNSLock(bucket, object)
-	ctx, err = lk.GetLock(ctx, globalOperationTimeout)
-	if err != nil {
-		return objInfo, err
-	}
-	defer lk.Unlock()
-
 	if err = checkDelObjArgs(ctx, bucket, object); err != nil {
 		return objInfo, err
 	}
-
-	defer ObjectPathUpdated(path.Join(bucket, object))
 
 	atomic.AddInt64(&fs.activeIOCount, 1)
 	defer func() {
 		atomic.AddInt64(&fs.activeIOCount, -1)
 	}()
 
-	if _, err = fs.disk.StatVol(ctx, bucket); err != nil {
-		return objInfo, toObjectErr(err, bucket)
-	}
-
-	var rwlk *lock.LockedFile
-
-	minioMetaBucketDir := pathJoin(fs.disk.String(), minioMetaBucket)
-	fsMetaPath := pathJoin(minioMetaBucketDir, bucketMetaPrefix, bucket, object, fsMetaJSONFile)
-	if bucket != minioMetaBucket {
-		rwlk, err = fs.rwPool.Write(fsMetaPath)
-		if err != nil && err != errFileNotFound {
-			logger.LogIf(ctx, err)
-			return objInfo, toObjectErr(err, bucket, object)
+	versionFound := true
+	objInfo = ObjectInfo{VersionID: opts.VersionID} // version id needed in Delete API response.
+	goi, gerr := fs.GetObjectInfo(ctx, bucket, object, opts)
+	if gerr != nil && goi.Name == "" {
+		switch gerr.(type) {
+		case InsufficientReadQuorum:
+			return objInfo, InsufficientWriteQuorum{}
+		}
+		// For delete marker replication, versionID being replicated will not exist on disk
+		if opts.DeleteMarker {
+			versionFound = false
+		} else {
+			return objInfo, gerr
 		}
 	}
 
-	// Delete the object.
-	if err = fsDeleteFile(ctx, pathJoin(fs.disk.String(), bucket), pathJoin(fs.disk.String(), bucket, object)); err != nil {
-		if rwlk != nil {
-			rwlk.Close()
+	// Acquire a write lock before deleting the object.
+	lk := fs.NewNSLock(bucket, object)
+	ctx, err = lk.GetLock(ctx, globalDeleteOperationTimeout)
+	if err != nil {
+		return ObjectInfo{}, err
+	}
+	defer lk.Unlock()
+
+	defer ObjectPathUpdated(path.Join(bucket, object))
+
+	var markDelete bool
+	// Determine whether to mark object deleted for replication
+	if goi.VersionID != "" {
+		markDelete = true
+	}
+
+	// Default deleteMarker to true if object is under versioning
+	deleteMarker := opts.Versioned
+
+	if opts.VersionID != "" {
+		// case where replica version needs to be deleted on target cluster
+		if versionFound && opts.DeleteMarkerReplicationStatus == replication.Replica.String() {
+			markDelete = false
 		}
+		if opts.VersionPurgeStatus.Empty() && opts.DeleteMarkerReplicationStatus == "" {
+			markDelete = false
+		}
+		if opts.VersionPurgeStatus == Complete {
+			markDelete = false
+		}
+		// determine if the version represents an object delete
+		// deleteMarker = true
+		if versionFound && !goi.DeleteMarker { // implies a versioned delete of object
+			deleteMarker = false
+		}
+	}
+
+	modTime := opts.MTime
+	if opts.MTime.IsZero() {
+		modTime = UTCNow()
+	}
+	if markDelete {
+		if opts.Versioned || opts.VersionSuspended {
+			fi := FileInfo{
+				Name:                          object,
+				Deleted:                       deleteMarker,
+				MarkDeleted:                   markDelete,
+				ModTime:                       modTime,
+				DeleteMarkerReplicationStatus: opts.DeleteMarkerReplicationStatus,
+				VersionPurgeStatus:            opts.VersionPurgeStatus,
+			}
+			if opts.Versioned {
+				fi.VersionID = mustGetUUID()
+				if opts.VersionID != "" {
+					fi.VersionID = opts.VersionID
+				}
+			}
+			fi.TransitionStatus = opts.TransitionStatus
+
+			// versioning suspended means we add `null`
+			// version as delete marker
+			// Add delete marker, since we don't have any version specified explicitly.
+			// Or if a particular version id needs to be replicated.
+			if err = fs.disk.DeleteVersion(ctx, bucket, object, fi, opts.DeleteMarker); err != nil {
+				return objInfo, toObjectErr(err, bucket, object)
+			}
+			return fi.ToObjectInfo(bucket, object), nil
+		}
+	}
+
+	// Delete the object version on all disks.
+	if err = fs.disk.DeleteVersion(ctx, bucket, object, FileInfo{
+		Name:                          object,
+		VersionID:                     opts.VersionID,
+		MarkDeleted:                   markDelete,
+		Deleted:                       deleteMarker,
+		ModTime:                       modTime,
+		DeleteMarkerReplicationStatus: opts.DeleteMarkerReplicationStatus,
+		VersionPurgeStatus:            opts.VersionPurgeStatus,
+		TransitionStatus:              opts.TransitionStatus,
+	}, opts.DeleteMarker); err != nil {
 		return objInfo, toObjectErr(err, bucket, object)
 	}
 
-	// Close fsMetaPath before deletion
-	if rwlk != nil {
-		rwlk.Close()
-	}
-
-	if bucket != minioMetaBucket {
-		// Delete the metadata object.
-		err = fsDeleteFile(ctx, minioMetaBucketDir, fsMetaPath)
-		if err != nil && err != errFileNotFound {
-			return objInfo, toObjectErr(err, bucket, object)
-		}
-	}
-	return ObjectInfo{Bucket: bucket, Name: object}, nil
+	return ObjectInfo{
+		Bucket:             bucket,
+		Name:               object,
+		VersionID:          opts.VersionID,
+		VersionPurgeStatus: opts.VersionPurgeStatus,
+		ReplicationStatus:  replication.StatusType(opts.DeleteMarkerReplicationStatus),
+	}, nil
 }
 
 // getObjectETag is a helper function, which returns only the md5sum
