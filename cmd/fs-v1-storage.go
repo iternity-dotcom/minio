@@ -440,7 +440,31 @@ func (s *fsv1Storage) WriteMetadata(ctx context.Context, volume, path string, fi
 }
 
 func (s *fsv1Storage) DeleteVersion(ctx context.Context, volume, path string, fi FileInfo, forceDelMarker bool) error {
-	return NotImplemented{}
+	if HasSuffix(path, SlashSeparator) {
+		return s.Delete(ctx, volume, path, false)
+	}
+	volumeDir, err := s.getVolDir(volume)
+	if err != nil {
+		return err
+	}
+
+	err = s.deleteFile(volumeDir, pathJoin(volumeDir, path), false)
+	if err != nil {
+		return err
+	}
+	if volume != minioMetaBucket {
+		minioMetaBucketDir, err := s.getVolDir(minioMetaBucket)
+		if err != nil {
+			return err
+		}
+		fsMetaPath := pathJoin(minioMetaBucketDir, bucketMetaPrefix, volume, path, fsMetaJSONFile)
+		err = s.deleteFile(minioMetaBucketDir, fsMetaPath, false)
+		if err != nil && err != errFileNotFound {
+			return err
+		}
+	}
+
+	return nil
 }
 
 func (s *fsv1Storage) WriteAll(ctx context.Context, volume string, path string, b []byte) error {
@@ -555,13 +579,13 @@ func (s *fsv1Storage) RenameData(ctx context.Context, srcVolume, srcPath, dataDi
 	objectSrcPath := pathutil.Join(srcVolumeDir, pathJoin(srcPath, dataDir, "part.1"))
 	objectDstPath := pathutil.Join(dstVolumeDir, pathJoin(dstPath))
 
-	err = fsRenameFile(ctx, objectSrcPath, objectDstPath)
+	err = renameAll(objectSrcPath, objectDstPath)
 	if err != nil {
 		return err
 	}
 
 	if dstVolume != minioMetaBucket { // TODO: unlock
-		err = fsRenameFile(ctx, srcMetaFilePath, dstMetaFilePath)
+		err = renameAll(srcMetaFilePath, dstMetaFilePath)
 		if err != nil {
 			return err
 		}
@@ -1121,8 +1145,13 @@ func (s *fsv1Storage) RenameFile(ctx context.Context, srcVolume, srcPath, dstVol
 		if err != nil {
 			return err
 		}
-		srcMetaDir := pathutil.Join(metaVolumeDir, bucketMetaPrefix, srcVolume, srcFilePath)
-		dstMetaDir := pathutil.Join(dstVolumeDir, minioMetaBucket, dstPath)
+		metaSrcPath := pathutil.Join(metaVolumeDir, bucketMetaPrefix, srcVolume, srcFilePath)
+		metaDstPath := pathutil.Join(dstVolumeDir, minioMetaBucket, dstPath)
+		if err = renameAll(metaSrcPath, metaDstPath); err != nil {
+	        return osErrToFileErr(err)
+        }
+		metaSrcPathParentDir := pathutil.Dir(metaSrcPath)
+		s.deleteFile(metaVolumeDir, metaSrcPathParentDir, false)
 	}
 
 	// Remove parent dir of the source file if empty

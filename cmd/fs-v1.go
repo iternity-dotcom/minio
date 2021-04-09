@@ -482,6 +482,7 @@ func (fs *FSObjects) DeleteBucket(ctx context.Context, bucket string, forceDelet
 		return toObjectErr(err, bucket)
 	}
 
+	// TODO: move all metadata handling in storage
 	// Cleanup all the bucket metadata.
 	minioMetadataBucket := pathJoin(minioMetaBucket, bucketMetaPrefix, bucket)
 	if err := fs.disk.DeleteVol(ctx, minioMetadataBucket, true); err != nil {
@@ -690,22 +691,8 @@ func (fs *FSObjects) GetObjectNInfo(ctx context.Context, bucket, object string, 
 	return objReaderFn(reader, h, opts.CheckPrecondFn, closeFn)
 }
 
-// Create a new fs.json file, if the existing one is corrupt. Should happen very rarely.
-func (fs *FSObjects) createFsJSON(object, fsMetaPath string) error {
-	fsMeta := newFSMetaV1()
-	fsMeta.Meta = map[string]string{
-		"etag":         GenETag(),
-		"content-type": mimedb.TypeByExtension(path.Ext(object)),
-	}
-	wlk, werr := fs.rwPool.Create(fsMetaPath)
-	if werr == nil {
-		_, err := fsMeta.WriteTo(wlk)
-		wlk.Close()
-		return err
-	}
-	return werr
-}
 
+// TODO: delete
 // Used to return default etag values when a pre-existing object's meta data is queried.
 func defaultFsJSON(object string) fsMetaV1 {
 	fsMeta := newFSMetaV1()
@@ -749,9 +736,13 @@ func (fs *FSObjects) GetObjectInfo(ctx context.Context, bucket, object string, o
 	fi, err := fs.disk.ReadVersion(ctx, bucket, object, opts.VersionID, false)
 
 	if err == errCorruptedFormat || err == io.EOF {
-		// TODO: replace with fs.disk.WriteMetadata
-		fsMetaPath := pathJoin(fs.disk.String(), minioMetaBucket, bucketMetaPrefix, bucket, object, fsMetaJSONFile)
-		err = fs.createFsJSON(object, fsMetaPath)
+		fi := FileInfo{
+			Metadata: map[string]string{
+				"etag":         defaultEtag,
+				"content-type": mimedb.TypeByExtension(path.Ext(object)),
+			},
+		}
+		err = fs.disk.WriteMetadata(ctx, minioMetaBucket, pathJoin(bucketMetaPrefix, bucket, object), fi)
 		if err != nil {
 			return oi, toObjectErr(err, bucket, object)
 		}
@@ -967,7 +958,6 @@ func (fs *FSObjects) deleteObject(ctx context.Context, bucket, object string) er
 	if bucket == minioMetaTmpBucket {
 		tmpObj = object
 	} else {
-
 		err = fs.disk.RenameFile(ctx, bucket, object, minioMetaTmpBucket, tmpObj)
 		if err != nil {
 			return toObjectErr(err, bucket, object)
