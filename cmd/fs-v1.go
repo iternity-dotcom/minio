@@ -22,9 +22,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/minio/minio-go/v7/pkg/set"
 	"github.com/minio/minio/pkg/bucket/replication"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"os"
 	"os/user"
@@ -971,25 +971,122 @@ func (fs *FSObjects) deleteObject(ctx context.Context, bucket, object string) er
 // DeleteObjects - deletes an object from a bucket, this operation is destructive
 // and there are no rollbacks supported.
 func (fs *FSObjects) DeleteObjects(ctx context.Context, bucket string, objects []ObjectToDelete, opts ObjectOptions) ([]DeletedObject, []error) {
-	errs := make([]error, len(objects))
 	dobjects := make([]DeletedObject, len(objects))
-	for idx, object := range objects {
-		if object.VersionID != "" {
-			errs[idx] = VersionNotFound{
+	errs := make([]error, len(objects))
+	objSets := set.NewStringSet()
+	for i := range objects {
+		if objects[i].VersionID != "" {
+			errs[i] = VersionNotFound{
 				Bucket:    bucket,
-				Object:    object.ObjectName,
-				VersionID: object.VersionID,
+				Object:    objects[i].ObjectName,
+				VersionID: objects[i].VersionID,
 			}
 			continue
 		}
-		_, errs[idx] = fs.DeleteObject(ctx, bucket, object.ObjectName, opts)
-		if errs[idx] == nil || isErrObjectNotFound(errs[idx]) {
-			dobjects[idx] = DeletedObject{
-				ObjectName: object.ObjectName,
-			}
-			errs[idx] = nil
+		errs[i] = checkDelObjArgs(ctx, bucket, objects[i].ObjectName)
+		if errs[i] == nil {
+			objSets.Add(objects[i].ObjectName)
 		}
 	}
+
+	// Acquire a bulk write lock across 'objects'
+	multiDeleteLock := fs.NewNSLock(bucket, objSets.ToSlice()...)
+	ctx, err := multiDeleteLock.GetLock(ctx, globalOperationTimeout)
+	if err != nil {
+		for i := range errs {
+			errs[i] = err
+		}
+		return dobjects, errs
+	}
+	defer multiDeleteLock.Unlock()
+
+	versions := make([]FileInfo, 0)
+	objIdxToVerIdx := make(map[int]int, len(objects))
+	for i := range objects {
+		if errs[i] != nil {
+			continue
+		}
+		objIdxToVerIdx[i] = len(versions)
+		if objects[i].VersionID == "" {
+			modTime := opts.MTime
+			if opts.MTime.IsZero() {
+				modTime = UTCNow()
+			}
+			uuid := opts.VersionID
+			if uuid == "" {
+				uuid = mustGetUUID()
+			}
+			if opts.Versioned || opts.VersionSuspended {
+				version := FileInfo{
+					Name:                          objects[i].ObjectName,
+					ModTime:                       modTime,
+					Deleted:                       true, // delete marker
+					DeleteMarkerReplicationStatus: objects[i].DeleteMarkerReplicationStatus,
+					VersionPurgeStatus:            objects[i].VersionPurgeStatus,
+				}
+				if opts.Versioned {
+					version.VersionID = uuid
+				}
+				versions = append(versions, version)
+				continue
+			}
+		}
+		versions = append(versions, FileInfo{
+			Name:                          objects[i].ObjectName,
+			VersionID:                     objects[i].VersionID,
+			DeleteMarkerReplicationStatus: objects[i].DeleteMarkerReplicationStatus,
+			VersionPurgeStatus:            objects[i].VersionPurgeStatus,
+		})
+	}
+
+	// Initialize list of errors.
+	delObjErrs := fs.disk.DeleteVersions(ctx, bucket, versions)
+
+	// Reduce errors for each object
+
+
+	for objIndex := range objects {
+		verIdx := objIdxToVerIdx[objIndex]
+
+		var err error
+		if errs[objIndex] != nil {
+			err = errs[objIndex]
+		} else if delObjErrs[verIdx] != errFileNotFound {
+			err = delObjErrs[verIdx]
+		}
+
+		if objects[objIndex].VersionID != "" {
+			errs[objIndex] = toObjectErr(err, bucket, objects[objIndex].ObjectName, objects[objIndex].VersionID)
+		} else {
+			errs[objIndex] = toObjectErr(err, bucket, objects[objIndex].ObjectName)
+		}
+
+		if errs[objIndex] != nil {
+			continue
+		}
+		ObjectPathUpdated(pathJoin(bucket, objects[objIndex].ObjectName))
+
+		if versions[verIdx].Deleted {
+			dobjects[objIndex] = DeletedObject{
+				DeleteMarker:                  versions[verIdx].Deleted,
+				DeleteMarkerVersionID:         versions[verIdx].VersionID,
+				DeleteMarkerMTime:             DeleteMarkerMTime{versions[verIdx].ModTime},
+				DeleteMarkerReplicationStatus: versions[verIdx].DeleteMarkerReplicationStatus,
+				ObjectName:                    versions[verIdx].Name,
+				VersionPurgeStatus:            versions[verIdx].VersionPurgeStatus,
+				PurgeTransitioned:             objects[objIndex].PurgeTransitioned,
+			}
+		} else {
+			dobjects[objIndex] = DeletedObject{
+				ObjectName:                    versions[verIdx].Name,
+				VersionID:                     versions[verIdx].VersionID,
+				VersionPurgeStatus:            versions[verIdx].VersionPurgeStatus,
+				DeleteMarkerReplicationStatus: versions[verIdx].DeleteMarkerReplicationStatus,
+				PurgeTransitioned:             objects[objIndex].PurgeTransitioned,
+			}
+		}
+	}
+
 	return dobjects, errs
 }
 
@@ -1120,77 +1217,6 @@ func (fs *FSObjects) DeleteObject(ctx context.Context, bucket, object string, op
 		VersionPurgeStatus: opts.VersionPurgeStatus,
 		ReplicationStatus:  replication.StatusType(opts.DeleteMarkerReplicationStatus),
 	}, nil
-}
-
-// getObjectETag is a helper function, which returns only the md5sum
-// of the file on the disk.
-func (fs *FSObjects) getObjectETag(ctx context.Context, bucket, entry string, lock bool) (string, error) {
-	fsMetaPath := pathJoin(fs.disk.String(), minioMetaBucket, bucketMetaPrefix, bucket, entry, fsMetaJSONFile)
-
-	var reader io.Reader
-	var fi os.FileInfo
-	var size int64
-	if lock {
-		// Read `fs.json` to perhaps contend with
-		// parallel Put() operations.
-		rlk, err := fs.rwPool.Open(fsMetaPath)
-		// Ignore if `fs.json` is not available, this is true for pre-existing data.
-		if err != nil && err != errFileNotFound {
-			logger.LogIf(ctx, err)
-			return "", toObjectErr(err, bucket, entry)
-		}
-
-		// If file is not found, we don't need to proceed forward.
-		if err == errFileNotFound {
-			return "", nil
-		}
-
-		// Read from fs metadata only if it exists.
-		defer fs.rwPool.Close(fsMetaPath)
-
-		// Fetch the size of the underlying file.
-		fi, err = rlk.LockedFile.Stat()
-		if err != nil {
-			logger.LogIf(ctx, err)
-			return "", toObjectErr(err, bucket, entry)
-		}
-
-		size = fi.Size()
-		reader = io.NewSectionReader(rlk.LockedFile, 0, fi.Size())
-	} else {
-		var err error
-		reader, size, err = fsOpenFile(ctx, fsMetaPath, 0)
-		if err != nil {
-			return "", toObjectErr(err, bucket, entry)
-		}
-	}
-
-	// `fs.json` can be empty due to previously failed
-	// PutObject() transaction, if we arrive at such
-	// a situation we just ignore and continue.
-	if size == 0 {
-		return "", nil
-	}
-
-	fsMetaBuf, err := ioutil.ReadAll(reader)
-	if err != nil {
-		logger.LogIf(ctx, err)
-		return "", toObjectErr(err, bucket, entry)
-	}
-
-	var fsMeta fsMetaV1
-	var json = jsoniter.ConfigCompatibleWithStandardLibrary
-	if err = json.Unmarshal(fsMetaBuf, &fsMeta); err != nil {
-		return "", err
-	}
-
-	// Check if FS metadata is valid, if not return error.
-	if !isFSMetaValid(fsMeta.Version) {
-		logger.LogIf(ctx, errCorruptedFormat)
-		return "", toObjectErr(errCorruptedFormat, bucket, entry)
-	}
-
-	return extractETag(fsMeta.Meta), nil
 }
 
 // ListObjectVersions not implemented for FS mode.

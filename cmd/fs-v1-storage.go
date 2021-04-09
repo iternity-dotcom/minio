@@ -1064,8 +1064,16 @@ func (s *fsv1Storage) deleteFile(basePath, deletePath string, recursive bool) er
 	return nil
 }
 
-func (s *fsv1Storage) DeleteVersions(ctx context.Context, volume string, versions []FileInfo) (errs []error) {
-	return nil
+func (s *fsv1Storage) DeleteVersions(ctx context.Context, volume string, versions []FileInfo) []error {
+	errs := make([]error, len(versions))
+
+	for i, version := range versions {
+		if err := s.DeleteVersion(ctx, volume, version.Name, version, false); err != nil {
+			errs[i] = err
+		}
+	}
+
+	return errs
 }
 
 func (s *fsv1Storage) RenameFile(ctx context.Context, srcVolume, srcPath, dstVolume, dstPath string) (err error) {
