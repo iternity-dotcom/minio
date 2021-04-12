@@ -522,11 +522,32 @@ func (s *fsv1Storage) WriteAll(ctx context.Context, volume string, path string, 
 }
 
 func (s *fsv1Storage) CheckFile(ctx context.Context, volume string, path string) error {
-	return NotImplemented{}
+	var isParentDirObject func(string) error
+	isParentDirObject = func(p string) error {
+		if p == "." || p == SlashSeparator {
+			return errPathNotFound
+		}
+		if fsIsFile(ctx, pathJoin(s.String(), volume, p)) {
+			// If there is already a file at prefix "p", return true.
+			return nil
+		}
+
+		// Check if there is a file as one of the parent paths.
+		return isParentDirObject(pathutil.Dir(p))
+	}
+	return isParentDirObject(path)
 }
 
 func (s *fsv1Storage) CheckParts(ctx context.Context, volume string, path string, fi FileInfo) error {
 	return NotImplemented{}
+}
+
+func (s *fsv1Storage) RenameData(ctx context.Context, srcVolume, srcPath, dataDir, dstVolume, dstPath string) (err error) {
+	if dataDir == "" {
+		return s.commitMetaFile(srcVolume, srcPath, dstVolume, dstPath)
+	}
+
+	return s.commitObject(srcVolume, srcPath, dataDir, dstVolume, dstPath)
 }
 
 // srcVolume: srcBucket
@@ -534,7 +555,7 @@ func (s *fsv1Storage) CheckParts(ctx context.Context, volume string, path string
 // dstVolume: dstBucket
 // dstPath: 1. destination path for "object": <dstVolume>/<dstPath>
 //          2. destination path for "meta": <minioMetaBucket>/<bucketMetaPrefix>/<dstVolume>/dstPath/fs.json
-func (s *fsv1Storage) RenameData(ctx context.Context, srcVolume, srcPath, dataDir, dstVolume, dstPath string) (err error) {
+func (s *fsv1Storage) commitObject(srcVolume, srcPath, dataDir, dstVolume, dstPath string) (err error) {
 	srcVolumeDir, err := s.getVolDir(srcVolume)
 	if err != nil {
 		return err
@@ -565,16 +586,14 @@ func (s *fsv1Storage) RenameData(ctx context.Context, srcVolume, srcPath, dataDi
 		return err
 	}
 
-	srcMetaFilePath := pathutil.Join(srcVolumeDir, pathJoin(srcPath, fsMetaJSONFile))
-
 	var dstMetaFilePath string
-	if dstVolume != minioMetaBucket { // TODO: lock
-		metaVolume, err := s.getVolDir(minioMetaBucket)
-		if err != nil {
-			return err
-		}
-		dstMetaFilePath = pathutil.Join(metaVolume, bucketMetaPrefix, dstVolume, pathJoin(dstPath, fsMetaJSONFile))
+	metaVolumeDir, err := s.getVolDir(minioMetaBucket)
+	if err != nil {
+		return err
 	}
+
+	srcMetaFilePath := pathutil.Join(srcVolumeDir, pathJoin(srcPath, fsMetaJSONFile))
+	dstMetaFilePath = pathutil.Join(metaVolumeDir, bucketMetaPrefix, dstVolume, pathJoin(dstPath, fsMetaJSONFile))
 
 	objectSrcPath := pathutil.Join(srcVolumeDir, pathJoin(srcPath, dataDir, "part.1"))
 	objectDstPath := pathutil.Join(dstVolumeDir, pathJoin(dstPath))
@@ -584,11 +603,43 @@ func (s *fsv1Storage) RenameData(ctx context.Context, srcVolume, srcPath, dataDi
 		return err
 	}
 
-	if dstVolume != minioMetaBucket { // TODO: unlock
-		err = renameAll(srcMetaFilePath, dstMetaFilePath)
-		if err != nil {
-			return err
+	err = renameAll(srcMetaFilePath, dstMetaFilePath)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (s *fsv1Storage) commitMetaFile(srcVolume, srcPath, dstVolume, dstPath string) (err error) {
+	srcVolumeDir, err := s.getVolDir(srcVolume)
+	if err != nil {
+		return err
+	}
+
+	// Stat a volume entry.
+	_, err = Lstat(srcVolumeDir)
+	if err != nil {
+		if osIsNotExist(err) {
+			return errVolumeNotFound
+		} else if isSysErrIO(err) {
+			return errFaultyDisk
 		}
+		return err
+	}
+
+	var dstMetaFilePath string
+	metaVolumeDir, err := s.getVolDir(minioMetaBucket)
+	if err != nil {
+		return err
+	}
+
+	srcMetaFilePath := pathutil.Join(srcVolumeDir, pathJoin(srcPath, fsMetaJSONFile))
+	dstMetaFilePath = pathutil.Join(metaVolumeDir, bucketMetaPrefix, dstVolume, pathJoin(dstPath, fsMetaJSONFile))
+
+	err = renameAll(srcMetaFilePath, dstMetaFilePath)
+	if err != nil {
+		return err
 	}
 
 	return nil

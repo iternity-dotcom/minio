@@ -168,7 +168,9 @@ func (fs *FSObjects) Shutdown(ctx context.Context) error {
 	fs.fsFormatRlk.Close()
 
 	// Cleanup and delete tmp uuid.
-	return fs.disk.DeleteVol(ctx, pathJoin(minioMetaTmpBucket, fs.fsUUID), true)
+	fs.disk.DeleteVol(ctx, pathJoin(minioMetaTmpBucket, fs.fsUUID), true)
+
+	return fs.disk.Close()
 }
 
 // BackendInfo - returns backend information
@@ -782,20 +784,7 @@ func (fs *FSObjects) GetObjectInfo(ctx context.Context, bucket, object string, o
 // object is "a/b/c/d", stat makes sure that objects ""a/b/c""
 // "a/b" and "a" do not exist.
 func (fs *FSObjects) parentDirIsObject(ctx context.Context, bucket, parent string) bool {
-	var isParentDirObject func(string) bool
-	isParentDirObject = func(p string) bool {
-		if p == "." || p == SlashSeparator {
-			return false
-		}
-		if fsIsFile(ctx, pathJoin(fs.disk.String(), bucket, p)) {
-			// If there is already a file at prefix "p", return true.
-			return true
-		}
-
-		// Check if there is a file as one of the parent paths.
-		return isParentDirObject(path.Dir(p))
-	}
-	return isParentDirObject(parent)
+	return fs.disk.CheckFile(ctx, bucket, parent) == nil
 }
 
 // PutObject - creates an object upon reading from the input stream
@@ -1443,44 +1432,52 @@ func (fs *FSObjects) PutObjectTags(ctx context.Context, bucket, object string, t
 		}
 	}
 
-	fsMetaPath := pathJoin(fs.disk.String(), minioMetaBucket, bucketMetaPrefix, bucket, object, fsMetaJSONFile)
-	fsMeta := fsMetaV1{}
-	wlk, err := fs.rwPool.Write(fsMetaPath)
-	if err != nil {
-		wlk, err = fs.rwPool.Create(fsMetaPath)
-		if err != nil {
-			logger.LogIf(ctx, err)
-			return ObjectInfo{}, toObjectErr(err, bucket, object)
-		}
-	}
-	// This close will allow for locks to be synchronized on `fs.json`.
-	defer wlk.Close()
-
-	// Read objects' metadata in `fs.json`.
-	if _, err = fsMeta.ReadFrom(ctx, wlk); err != nil {
-		// For any error to read fsMeta, set default ETag and proceed.
-		fsMeta = defaultFsJSON(object)
-	}
-
-	// clean fsMeta.Meta of tag key, before updating the new tags
-	delete(fsMeta.Meta, xhttp.AmzObjectTagging)
-
-	// Do not update for empty tags
-	if tags != "" {
-		fsMeta.Meta[xhttp.AmzObjectTagging] = tags
-	}
-
-	if _, err = fsMeta.WriteTo(wlk); err != nil {
-		return ObjectInfo{}, toObjectErr(err, bucket, object)
-	}
-
-	// Stat the file to get file size.
-	fi, err := fsStatFile(ctx, pathJoin(fs.disk.String(), bucket, object))
+	var err error
+	// Lock the object before updating tags.
+	lk := fs.NewNSLock(bucket, object)
+	ctx, err = lk.GetLock(ctx, globalOperationTimeout)
 	if err != nil {
 		return ObjectInfo{}, err
 	}
+	defer lk.Unlock()
 
-	return fsMeta.ToObjectInfo(bucket, object, fi), nil
+	fi, err := fs.disk.ReadVersion(ctx, bucket, object, opts.VersionID, false)
+	if err != nil {
+		return ObjectInfo{}, toObjectErr(err, bucket, object)
+	}
+
+	if fi.Deleted {
+		if opts.VersionID == "" {
+			return ObjectInfo{}, toObjectErr(errFileNotFound, bucket, object)
+		}
+		return ObjectInfo{}, toObjectErr(errMethodNotAllowed, bucket, object)
+	}
+
+	// clean fi.Meta of tag key, before updating the new tags
+	delete(fi.Metadata, xhttp.AmzObjectTagging)
+	// Don't update for empty tags
+	if tags != "" {
+		fi.Metadata[xhttp.AmzObjectTagging] = tags
+	}
+	for k, v := range opts.UserDefined {
+		fi.Metadata[k] = v
+	}
+
+	tempObj := mustGetUUID()
+
+	if err = fs.disk.WriteMetadata(ctx, minioMetaTmpBucket, tempObj, fi); err != nil {
+		return ObjectInfo{}, toObjectErr(err, bucket, object)
+	}
+
+	// Atomically rename metadata from tmp location to destination for each disk.
+	if err = fs.disk.RenameData(ctx, minioMetaTmpBucket, tempObj, "", bucket, object); err != nil {
+		return ObjectInfo{}, toObjectErr(err, bucket, object)
+	}
+
+	objInfo := fi.ToObjectInfo(bucket, object)
+	objInfo.UserTags = tags
+
+	return objInfo, nil
 }
 
 // DeleteObjectTags - delete object tags from an existing object
