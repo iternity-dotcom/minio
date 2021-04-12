@@ -513,16 +513,6 @@ func (fs *FSObjects) CopyObject(ctx context.Context, srcBucket, srcObject, dstBu
 	}
 
 	cpSrcDstSame := isStringEqual(pathJoin(srcBucket, srcObject), pathJoin(dstBucket, dstObject))
-	defer ObjectPathUpdated(path.Join(dstBucket, dstObject))
-
-	if !cpSrcDstSame {
-		objectDWLock := fs.NewNSLock(dstBucket, dstObject)
-		ctx, err = objectDWLock.GetLock(ctx, globalOperationTimeout)
-		if err != nil {
-			return oi, err
-		}
-		defer objectDWLock.Unlock()
-	}
 
 	atomic.AddInt64(&fs.activeIOCount, 1)
 	defer func() {
@@ -534,51 +524,100 @@ func (fs *FSObjects) CopyObject(ctx context.Context, srcBucket, srcObject, dstBu
 	}
 
 	if cpSrcDstSame && srcInfo.metadataOnly {
-		fsMetaPath := pathJoin(fs.disk.String(), minioMetaBucket, bucketMetaPrefix, srcBucket, srcObject, fsMetaJSONFile)
-		wlk, err := fs.rwPool.Write(fsMetaPath)
-		if err != nil {
-			wlk, err = fs.rwPool.Create(fsMetaPath)
-			if err != nil {
-				logger.LogIf(ctx, err)
-				return oi, toObjectErr(err, srcBucket, srcObject)
-			}
+		// Version ID is set for the destination and source == destination version ID.
+		// perform an in-place update.
+		if dstOpts.VersionID != "" && srcOpts.VersionID == dstOpts.VersionID {
+			return fs.updateMetaObject(ctx, srcBucket, srcObject, srcInfo, srcOpts, dstOpts)
 		}
-		// This close will allow for locks to be synchronized on `fs.json`.
-		defer wlk.Close()
-
-		// Save objects' metadata in `fs.json`.
-		fsMeta := newFSMetaV1()
-		if _, err = fsMeta.ReadFrom(ctx, wlk); err != nil {
-			// For any error to read fsMeta, set default ETag and proceed.
-			fsMeta = defaultFsJSON(srcObject)
+		// Destination is not versioned and source version ID is empty
+		// perform an in-place update.
+		if !dstOpts.Versioned && srcOpts.VersionID == "" {
+			return fs.updateMetaObject(ctx, srcBucket, srcObject, srcInfo, srcOpts, dstOpts)
 		}
-
-		fsMeta.Meta = cloneMSS(srcInfo.UserDefined)
-		fsMeta.Meta["etag"] = srcInfo.ETag
-		if _, err = fsMeta.WriteTo(wlk); err != nil {
-			return oi, toObjectErr(err, srcBucket, srcObject)
+		// CopyObject optimization where we don't create an entire copy
+		// of the content, instead we add a reference, we disallow legacy
+		// objects to be self referenced in this manner so make sure
+		// that we actually create a new dataDir for legacy objects.
+		if dstOpts.Versioned && srcOpts.VersionID != dstOpts.VersionID && !srcInfo.Legacy {
+			srcInfo.versionOnly = true
+			return fs.updateMetaObject(ctx, srcBucket, srcObject, srcInfo, srcOpts, dstOpts)
 		}
-
-		// Stat the file to get file size.
-		fi, err := fsStatFile(ctx, pathJoin(fs.disk.String(), srcBucket, srcObject))
-		if err != nil {
-			return oi, toObjectErr(err, srcBucket, srcObject)
-		}
-
-		// Return the new object info.
-		return fsMeta.ToObjectInfo(srcBucket, srcObject, fi), nil
 	}
 
-	if err := checkPutObjectArgs(ctx, dstBucket, dstObject, fs); err != nil {
-		return ObjectInfo{}, err
+	putOpts := ObjectOptions{
+		ServerSideEncryption: dstOpts.ServerSideEncryption,
+		UserDefined:          srcInfo.UserDefined,
+		Versioned:            dstOpts.Versioned,
+		VersionID:            dstOpts.VersionID,
+		MTime:                dstOpts.MTime,
 	}
 
-	objInfo, err := fs.putObject(ctx, dstBucket, dstObject, srcInfo.PutObjReader, ObjectOptions{ServerSideEncryption: dstOpts.ServerSideEncryption, UserDefined: srcInfo.UserDefined})
+	return fs.PutObject(ctx, dstBucket, dstObject, srcInfo.PutObjReader, putOpts)
+}
+
+func (fs *FSObjects) updateMetaObject(ctx context.Context, bucket, object string, info ObjectInfo, srcOpts, dstOpts ObjectOptions) (oi ObjectInfo, err error) {
+	// This call shouldn't be used for anything other than metadata updates or adding self referential versions.
+	if !info.metadataOnly {
+		return oi, NotImplemented{}
+	}
+
+	defer ObjectPathUpdated(pathJoin(bucket, object))
+
+	lk := fs.NewNSLock(bucket, object)
+	ctx, err = lk.GetLock(ctx, globalOperationTimeout)
 	if err != nil {
-		return oi, toObjectErr(err, dstBucket, dstObject)
+		return oi, err
+	}
+	defer lk.Unlock()
+
+	fi, err := fs.disk.ReadVersion(ctx, bucket, object, srcOpts.VersionID, false)
+	if err != nil {
+		return oi, toObjectErr(err, bucket, object)
 	}
 
-	return objInfo, nil
+	if fi.Deleted {
+		if srcOpts.VersionID == "" {
+			return oi, toObjectErr(errFileNotFound, bucket, object)
+		}
+		return fi.ToObjectInfo(bucket, object), toObjectErr(errMethodNotAllowed, bucket, object)
+	}
+
+	modTime := fi.ModTime
+	versionID := info.VersionID
+	if info.versionOnly {
+		versionID = dstOpts.VersionID
+		// preserve destination versionId if specified.
+		if versionID == "" {
+			versionID = mustGetUUID()
+		}
+		modTime = UTCNow()
+	}
+
+	fi.VersionID = versionID // set any new versionID we might have created
+	fi.ModTime = modTime     // set modTime for the new versionID
+	if !dstOpts.MTime.IsZero() {
+		modTime = dstOpts.MTime
+		fi.ModTime = dstOpts.MTime
+	}
+	fi.Metadata = info.UserDefined
+	info.UserDefined["etag"] = info.ETag
+
+	tempObj := mustGetUUID()
+
+	defer func() {
+		fs.deleteObject(context.Background(), minioMetaTmpBucket, tempObj)
+	}()
+
+	if err = fs.disk.WriteMetadata(ctx, minioMetaTmpBucket, tempObj, fi); err != nil {
+		return ObjectInfo{}, toObjectErr(err, bucket, object)
+	}
+
+	// Atomically rename metadata from tmp location to destination for each disk.
+	if err = fs.disk.RenameData(ctx, minioMetaTmpBucket, tempObj, "", bucket, object); err != nil {
+		return ObjectInfo{}, toObjectErr(err, bucket, object)
+	}
+
+	return fi.ToObjectInfo(bucket, object), nil
 }
 
 // GetObjectNInfo - returns object info and a reader for object
@@ -879,7 +918,7 @@ func (fs *FSObjects) putObject(ctx context.Context, bucket string, object string
 	// failure. If PutObject succeeds, then there would be
 	// nothing to delete.
 	defer func() {
-		fs.deleteObject(ctx, minioMetaTmpBucket, pathJoin(fs.fsUUID, tempObjFolder))
+		fs.deleteObject(context.Background(), minioMetaTmpBucket, pathJoin(fs.fsUUID, tempObjFolder))
 	}()
 
 	// Uploaded object will first be written to the temporary location which will eventually

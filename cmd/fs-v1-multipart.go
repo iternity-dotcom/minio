@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/minio/minio/pkg/mimedb"
 	"io/ioutil"
 	"os"
 	pathutil "path"
@@ -35,6 +36,14 @@ import (
 	xioutil "github.com/minio/minio/pkg/ioutil"
 	"github.com/minio/minio/pkg/trie"
 )
+
+func (fs *FSObjects) tmpGetUploadIDDir(bucket, object, uploadID string) string {
+	return pathJoin(fs.tmpGetMultipartSHADir(bucket, object), uploadID)
+}
+
+func (fs *FSObjects) tmpGetMultipartSHADir(bucket, object string) string {
+	return getSHA256Hash([]byte(pathJoin(bucket, object)))
+}
 
 // Returns EXPORT/.minio.sys/multipart/SHA256/UPLOADID
 func (fs *FSObjects) getUploadIDDir(bucket, object, uploadID string) string {
@@ -222,28 +231,44 @@ func (fs *FSObjects) NewMultipartUpload(ctx context.Context, bucket, object stri
 		return "", toObjectErr(err, bucket)
 	}
 
+	// No metadata is set, allocate a new one.
+	if opts.UserDefined == nil {
+		opts.UserDefined = make(map[string]string)
+	}
+
+	if opts.UserDefined["content-type"] == "" {
+		contentType := mimedb.TypeByExtension(pathutil.Ext(object))
+		opts.UserDefined["content-type"] = contentType
+	}
+
+	fi := FileInfo{}
+
+	// Calculate the version to be saved.
+	if opts.Versioned {
+		fi.VersionID = opts.VersionID
+		if fi.VersionID == "" {
+			fi.VersionID = mustGetUUID()
+		}
+	}
+
+	fi.DataDir = mustGetUUID()
+	fi.ModTime = UTCNow()
+	fi.Metadata = cloneMSS(opts.UserDefined)
+
 	uploadID := mustGetUUID()
-	uploadIDDir := fs.getUploadIDDir(bucket, object, uploadID)
+	uploadIDPath := fs.tmpGetUploadIDDir(bucket, object, uploadID)
+	tempUploadIDPath := uploadID
 
-	err := mkdirAll(uploadIDDir, 0755)
-	if err != nil {
-		logger.LogIf(ctx, err)
-		return "", err
+	defer func() {
+		fs.deleteObject(context.Background(), minioMetaTmpBucket, tempUploadIDPath)
+	}()
+
+	if err := fs.disk.WriteMetadata(ctx, minioMetaTmpBucket, tempUploadIDPath, fi); err != nil {
+		return "", toObjectErr(err, minioMetaTmpBucket, tempUploadIDPath)
 	}
 
-	// Initialize fs.json values.
-	fsMeta := newFSMetaV1()
-	fsMeta.Meta = opts.UserDefined
-
-	fsMetaBytes, err := json.Marshal(fsMeta)
-	if err != nil {
-		logger.LogIf(ctx, err)
-		return "", err
-	}
-
-	if err = ioutil.WriteFile(pathJoin(uploadIDDir, fsMetaJSONFile), fsMetaBytes, 0644); err != nil {
-		logger.LogIf(ctx, err)
-		return "", err
+	if err := fs.disk.RenameFile(ctx, minioMetaTmpBucket, tempUploadIDPath, minioMetaMultipartBucket, uploadIDPath); err != nil {
+		return "", toObjectErr(err, minioMetaMultipartBucket, uploadIDPath)
 	}
 
 	return uploadID, nil
