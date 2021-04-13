@@ -84,7 +84,7 @@ func (fs *FSObjects) backgroundAppend(ctx context.Context, bucket, object, uploa
 	file := fs.appendFileMap[uploadID]
 	if file == nil {
 		file = &fsAppendFile{
-			filePath: pathJoin(fs.disk.String(), minioMetaTmpBucket, fs.fsUUID, fmt.Sprintf("%s.%s", uploadID, mustGetUUID())),
+			filePath: pathJoin(fs.fsUUID, fmt.Sprintf("%s.%s", uploadID, mustGetUUID())),
 		}
 		fs.appendFileMap[uploadID] = file
 	}
@@ -95,11 +95,11 @@ func (fs *FSObjects) backgroundAppend(ctx context.Context, bucket, object, uploa
 
 	// Since we append sequentially nextPartNumber will always be len(file.parts)+1
 	nextPartNumber := len(file.parts) + 1
-	uploadIDDir := fs.getUploadIDDir(bucket, object, uploadID)
+	uploadIDPath := fs.tmpGetUploadIDDir(bucket, object, uploadID)
 
-	entries, err := readDir(uploadIDDir)
+	entries, err := fs.disk.ListDir(ctx, minioMetaMultipartBucket, uploadIDPath, -1)
 	if err != nil {
-		logger.GetReqInfo(ctx).AppendTags("uploadIDDir", uploadIDDir)
+		logger.GetReqInfo(ctx).AppendTags("uploadIDDir", uploadIDPath)
 		logger.LogIf(ctx, err)
 		return
 	}
@@ -123,8 +123,16 @@ func (fs *FSObjects) backgroundAppend(ctx context.Context, bucket, object, uploa
 			return
 		}
 
-		partPath := pathJoin(uploadIDDir, entry)
-		err = xioutil.AppendFile(file.filePath, partPath, globalFSOSync)
+		partPath := pathJoin(uploadIDPath, entry)
+		entryBuf, err := fs.disk.ReadAll(ctx, minioMetaMultipartBucket, partPath)
+		if err != nil {
+			reqInfo := logger.GetReqInfo(ctx).AppendTags("partPath", partPath)
+			reqInfo.AppendTags("filepath", file.filePath)
+			logger.LogIf(ctx, err)
+			return
+		}
+		err = fs.disk.AppendFile(ctx, minioMetaTmpBucket, file.filePath, entryBuf)
+		xioutil.AppendFile(file.filePath, partPath, globalFSOSync)
 		if err != nil {
 			reqInfo := logger.GetReqInfo(ctx).AppendTags("partPath", partPath)
 			reqInfo.AppendTags("filepath", file.filePath)
@@ -257,7 +265,7 @@ func (fs *FSObjects) NewMultipartUpload(ctx context.Context, bucket, object stri
 
 	uploadID := mustGetUUID()
 	uploadIDPath := fs.tmpGetUploadIDDir(bucket, object, uploadID)
-	tempUploadIDPath := uploadID
+	tempUploadIDPath := pathJoin(fs.fsUUID, uploadID)
 
 	defer func() {
 		fs.deleteObject(context.Background(), minioMetaTmpBucket, tempUploadIDPath)
@@ -300,6 +308,7 @@ func (fs *FSObjects) CopyObjectPart(ctx context.Context, srcBucket, srcObject, d
 	return partInfo, nil
 }
 
+
 // PutObjectPart - reads incoming data until EOF for the part file on
 // an ongoing multipart transaction. Internally incoming data is
 // written to '.minio.sys/tmp' location and safely renamed to
@@ -313,10 +322,23 @@ func (fs *FSObjects) PutObjectPart(ctx context.Context, bucket, object, uploadID
 		}
 	}
 
-	data := r.Reader
 	if err := checkPutObjectPartArgs(ctx, bucket, object, fs); err != nil {
 		return pi, toObjectErr(err, bucket)
 	}
+
+	uploadIDLock := fs.NewNSLock(bucket, pathJoin(object, uploadID))
+	ctx, err := uploadIDLock.GetRLock(ctx, globalOperationTimeout)
+	if err != nil {
+		return pi, err
+	}
+	readLocked := true
+	defer func() {
+		if readLocked {
+			uploadIDLock.RUnlock()
+		}
+	}()
+
+	data := r.Reader
 
 	if _, err := fs.disk.StatVol(ctx, bucket); err != nil {
 		return pi, toObjectErr(err, bucket)
@@ -328,10 +350,10 @@ func (fs *FSObjects) PutObjectPart(ctx context.Context, bucket, object, uploadID
 		return pi, toObjectErr(errInvalidArgument)
 	}
 
-	uploadIDDir := fs.getUploadIDDir(bucket, object, uploadID)
+	uploadIDPath := fs.tmpGetUploadIDDir(bucket, object, uploadID)
 
 	// Just check if the uploadID exists to avoid copy if it doesn't.
-	_, err := fsStatFile(ctx, pathJoin(uploadIDDir, fsMetaJSONFile))
+	fi, err := fs.disk.ReadVersion(ctx, minioMetaMultipartBucket, uploadIDPath, "", false)
 	if err != nil {
 		if err == errFileNotFound || err == errFileAccessDenied {
 			return pi, InvalidUploadID{Bucket: bucket, Object: object, UploadID: uploadID}
@@ -339,51 +361,67 @@ func (fs *FSObjects) PutObjectPart(ctx context.Context, bucket, object, uploadID
 		return pi, toObjectErr(err, bucket, object)
 	}
 
-	tmpPartPath := pathJoin(fs.disk.String(), minioMetaTmpBucket, fs.fsUUID, uploadID+"."+mustGetUUID()+"."+strconv.Itoa(partID))
-	bytesWritten, err := fsCreateFile(ctx, tmpPartPath, data, data.Size())
 
-	// Delete temporary part in case of failure. If
-	// PutObjectPart succeeds then there would be nothing to
-	// delete in which case we just ignore the error.
-	defer fsRemoveFile(ctx, tmpPartPath)
+	tmpPartPath := pathJoin(fs.fsUUID, uploadID+"."+mustGetUUID()+"."+strconv.Itoa(partID))
 
+	defer func() {
+		fs.deleteObject(context.Background(), minioMetaTmpBucket, tmpPartPath)
+	}()
+
+	err = fs.disk.CreateFile(ctx, minioMetaTmpBucket, tmpPartPath, data.Size(), r)
 	if err != nil {
-		return pi, toObjectErr(err, minioMetaTmpBucket, tmpPartPath)
+		// Should return IncompleteBody{} error when reader has fewer
+		// bytes than specified in request header.
+		if err == errLessData || err == errMoreData {
+			return pi, IncompleteBody{Bucket: bucket, Object: object}
+		}
+		return pi, toObjectErr(err, minioMetaTmpBucket, object)
 	}
 
-	// Should return IncompleteBody{} error when reader has fewer
-	// bytes than specified in request header.
-	if bytesWritten < data.Size() {
-		return pi, IncompleteBody{Bucket: bucket, Object: object}
+	uploadIDLock.RUnlock()
+	readLocked = false
+	ctx, err = uploadIDLock.GetLock(ctx, globalOperationTimeout)
+	if err != nil {
+		return pi, err
+	}
+	defer uploadIDLock.Unlock()
+
+	fi, err = fs.disk.ReadVersion(ctx, minioMetaMultipartBucket, uploadIDPath, "", false)
+	if err != nil {
+		if err == errFileNotFound || err == errFileAccessDenied {
+			return pi, InvalidUploadID{Bucket: bucket, Object: object, UploadID: uploadID}
+		}
+		return pi, toObjectErr(err, bucket, object)
 	}
 
 	etag := r.MD5CurrentHexString()
-
-	if etag == "" {
-		etag = GenETag()
-	}
-
-	partPath := pathJoin(uploadIDDir, fs.encodePartFile(partID, etag, data.ActualSize()))
-
-	// Make sure not to create parent directories if they don't exist - the upload might have been aborted.
-	if err = fsSimpleRenameFile(ctx, tmpPartPath, partPath); err != nil {
+	// Rename temporary part file to its final location.
+	partPath := pathJoin(uploadIDPath, fs.encodePartFile(partID, etag, data.ActualSize()))
+	err = fs.disk.RenameFile(ctx, minioMetaTmpBucket, tmpPartPath, minioMetaMultipartBucket, partPath)
+	if err != nil {
 		if err == errFileNotFound || err == errFileAccessDenied {
 			return pi, InvalidUploadID{Bucket: bucket, Object: object, UploadID: uploadID}
 		}
 		return pi, toObjectErr(err, minioMetaMultipartBucket, partPath)
 	}
 
+	fi.ModTime = UTCNow()
+	if etag == "" {
+		etag = GenETag()
+	}
+	fi.AddObjectPart(partID, etag, data.Size(), data.ActualSize())
+
+	if err = fs.disk.WriteMetadata(ctx, minioMetaMultipartBucket, uploadIDPath, fi); err != nil {
+		return pi, toObjectErr(err, minioMetaMultipartBucket, uploadIDPath)
+	}
+
 	go fs.backgroundAppend(ctx, bucket, object, uploadID)
 
-	fi, err := fsStatFile(ctx, partPath)
-	if err != nil {
-		return pi, toObjectErr(err, minioMetaMultipartBucket, partPath)
-	}
 	return PartInfo{
 		PartNumber:   partID,
-		LastModified: fi.ModTime(),
+		LastModified: fi.ModTime,
 		ETag:         etag,
-		Size:         fi.Size(),
+		Size:         fi.Size,
 		ActualSize:   data.ActualSize(),
 	}, nil
 }

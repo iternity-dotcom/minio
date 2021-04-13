@@ -18,6 +18,7 @@ package cmd
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -391,7 +392,33 @@ func (s *fsv1Storage) DeleteVol(ctx context.Context, volume string, forceDelete 
 }
 
 func (s *fsv1Storage) AppendFile(ctx context.Context, volume string, path string, buf []byte) error {
-	return NotImplemented{}
+	volumeDir, err := s.getVolDir(volume)
+	if err != nil {
+		return err
+	}
+	filePath := pathJoin(volumeDir, path)
+	if err = checkPathLength(filePath); err != nil {
+		return err
+	}
+
+	w, err := openFile(filePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND)
+	if err != nil {
+		logger.LogIf(ctx, err)
+		return err
+	}
+	defer w.Close()
+
+
+	n, err := io.Copy(w, bytes.NewBuffer(buf))
+	if err != nil {
+		return err
+	}
+
+	if n != int64(len(buf)) {
+		return io.ErrShortWrite
+	}
+
+	return nil
 }
 
 func (s *fsv1Storage) CreateFile(ctx context.Context, volume, path string, fileSize int64, r io.Reader) error {
@@ -771,7 +798,13 @@ func (s *fsv1Storage) ReadVersion(ctx context.Context, volume, path, versionID s
 		return fsMeta.ToFileInfo(volume, path, dirInfo), nil
 	}
 
-	buf, err := s.ReadAll(ctx, minioMetaBucket, pathJoin(bucketMetaPrefix, volume, path, fsMetaJSONFile))
+	var buf []byte
+	if volume == minioMetaMultipartBucket {
+		buf, err = s.ReadAll(ctx, volume, pathJoin(path, fsMetaJSONFile))
+	} else {
+		buf, err = s.ReadAll(ctx, minioMetaBucket, pathJoin(bucketMetaPrefix, volume, path, fsMetaJSONFile))
+	}
+
 	if err != nil {
 		if err == errFileNotFound {
 			fsMeta = defaultFsJSON(path)
