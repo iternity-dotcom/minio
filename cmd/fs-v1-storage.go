@@ -408,7 +408,6 @@ func (s *fsv1Storage) AppendFile(ctx context.Context, volume string, path string
 	}
 	defer w.Close()
 
-
 	n, err := io.Copy(w, bytes.NewBuffer(buf))
 	if err != nil {
 		return err
@@ -532,7 +531,6 @@ func (s *fsv1Storage) WriteAll(ctx context.Context, volume string, path string, 
 		return err
 	}
 	defer w.Close()
-
 
 	n, err := w.Write(b)
 	if err != nil {
@@ -780,6 +778,15 @@ func (s *fsv1Storage) getMetaWriteLock(ctx context.Context, volume, path string)
 // for all objects less than `32KiB` this call returns data as well
 // along with metadata.
 func (s *fsv1Storage) ReadVersion(ctx context.Context, volume, path, versionID string, readData bool) (fi FileInfo, err error) {
+	if volume == minioMetaMultipartBucket {
+		return s.readMultipartVersion(ctx, volume, path, versionID)
+	} else {
+		return s.readObjectVersion(ctx, volume, path, versionID, readData)
+	}
+
+}
+
+func (s *fsv1Storage) readObjectVersion(ctx context.Context, volume, path, versionID string, readData bool) (fi FileInfo, err error) {
 	if _, err := s.StatVol(ctx, volume); err != nil {
 		return fi, err
 	}
@@ -798,12 +805,7 @@ func (s *fsv1Storage) ReadVersion(ctx context.Context, volume, path, versionID s
 		return fsMeta.ToFileInfo(volume, path, dirInfo), nil
 	}
 
-	var buf []byte
-	if volume == minioMetaMultipartBucket {
-		buf, err = s.ReadAll(ctx, volume, pathJoin(path, fsMetaJSONFile))
-	} else {
-		buf, err = s.ReadAll(ctx, minioMetaBucket, pathJoin(bucketMetaPrefix, volume, path, fsMetaJSONFile))
-	}
+	buf, err := s.ReadAll(ctx, minioMetaBucket, pathJoin(bucketMetaPrefix, volume, path, fsMetaJSONFile))
 
 	if err != nil {
 		if err == errFileNotFound {
@@ -856,6 +858,54 @@ func (s *fsv1Storage) ReadVersion(ctx context.Context, volume, path, versionID s
 	return fi, nil
 }
 
+func (s *fsv1Storage) readMultipartVersion(ctx context.Context, volume, path, versionID string) (fi FileInfo, err error) {
+	if _, err := s.StatVol(ctx, volume); err != nil {
+		return fi, err
+	}
+
+	volumeDir, err := s.getVolDir(volume)
+	if err != nil {
+		return fi, err
+	}
+
+	fsMeta := fsMetaV1{}
+
+	buf, err := s.ReadAll(ctx, volume, pathJoin(path, fsMetaJSONFile))
+
+	if err != nil {
+		logger.LogIf(ctx, err)
+		return fi, err
+	}
+
+	if len(buf) == 0 {
+		if versionID != "" {
+			return fi, errFileVersionNotFound
+		}
+		return fi, errFileNotFound
+	}
+
+	var json = jsoniter.ConfigCompatibleWithStandardLibrary
+	err = json.Unmarshal(buf, &fsMeta)
+	if err != nil {
+		logger.LogIf(ctx, err)
+		return fi, errCorruptedFormat
+	}
+
+	if !isFSMetaValid(fsMeta.Version) {
+		return fi, errCorruptedFormat
+	}
+
+	// Stat the file to get file size.
+	fileInfo, err := fsStatDir(ctx, pathJoin(volumeDir, path))
+	if err != nil {
+		return fi, err
+	}
+
+	fi = fsMeta.ToFileInfo(volume, path, fileInfo)
+
+	return fi, nil
+}
+
 func (s *fsv1Storage) ReadAll(ctx context.Context, volume string, path string) ([]byte, error) {
 	volumeDir, err := s.getVolDir(volume)
 	if err != nil {
@@ -875,7 +925,7 @@ func (s *fsv1Storage) ReadAll(ctx context.Context, volume string, path string) (
 	metaFile, unlockMeta, err := s.getOptionalMetaReadLock(ctx, lockType, volume, path)
 	defer unlockMeta()
 
-	if  err != nil &&
+	if err != nil &&
 		(volume == minioMetaBucket || (volume != minioMetaBucket && err != errFileNotFound)) {
 		return nil, err
 	}
@@ -953,7 +1003,7 @@ func (s *fsv1Storage) ReadFileStream(ctx context.Context, volume, path string, o
 
 	_, unlockMeta, err := s.getOptionalMetaReadLock(ctx, lockType, volume, path)
 	defer unlockMeta()
-	if  err != nil &&
+	if err != nil &&
 		(volume == minioMetaBucket || (volume != minioMetaBucket && err != errFileNotFound)) {
 		return nil, err
 	}
@@ -1240,8 +1290,8 @@ func (s *fsv1Storage) RenameFile(ctx context.Context, srcVolume, srcPath, dstVol
 		metaSrcPath := pathutil.Join(metaVolumeDir, bucketMetaPrefix, srcVolume, srcFilePath)
 		metaDstPath := pathutil.Join(dstVolumeDir, minioMetaBucket, dstPath)
 		if err = renameAll(metaSrcPath, metaDstPath); err != nil {
-	        return osErrToFileErr(err)
-        }
+			return osErrToFileErr(err)
+		}
 		metaSrcPathParentDir := pathutil.Dir(metaSrcPath)
 		s.deleteFile(metaVolumeDir, metaSrcPathParentDir, false)
 	}

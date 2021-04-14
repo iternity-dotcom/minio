@@ -223,11 +223,11 @@ func (m fsMetaV1) ToFileInfo(bucket, object string, fi os.FileInfo) FileInfo {
 		Parts: m.Parts,
 		XLV1: false,
 		Metadata: m.Meta,
-		Mode: uint32(fi.Mode()),
 		NumVersions: 1,
 	}
 
 	if fi != nil {
+		fileInfo.Mode = uint32(fi.Mode())
 		fileInfo.ModTime = fi.ModTime()
 		fileInfo.Size = fi.Size()
 		if fi.IsDir() {
