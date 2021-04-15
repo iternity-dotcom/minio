@@ -88,7 +88,7 @@ type FSObjects struct {
 // Represents the background append file.
 type fsAppendFile struct {
 	sync.Mutex
-	parts    []PartInfo // List of parts appended.
+	parts    []int      // List of parts appended.
 	filePath string     // Absolute path of the file in the temp location.
 }
 
@@ -778,7 +778,7 @@ func (fs *FSObjects) GetObjectInfo(ctx context.Context, bucket, object string, o
 	fi, err := fs.disk.ReadVersion(ctx, bucket, object, opts.VersionID, false)
 
 	if err == errCorruptedFormat || err == io.EOF {
-		fi := FileInfo{
+		fi = FileInfo{
 			Metadata: map[string]string{
 				"etag":         defaultEtag,
 				"content-type": mimedb.TypeByExtension(path.Ext(object)),
