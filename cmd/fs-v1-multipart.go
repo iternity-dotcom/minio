@@ -20,7 +20,6 @@ package cmd
 import (
 	"context"
 	"fmt"
-	"github.com/minio/minio/pkg/mimedb"
 	"io"
 	"path"
 	pathutil "path"
@@ -28,6 +27,9 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/minio/minio-go/v7/pkg/set"
+	"github.com/minio/minio/pkg/mimedb"
 
 	"github.com/minio/minio/cmd/logger"
 )
@@ -128,45 +130,56 @@ func (fs *FSObjects) backgroundAppend(ctx context.Context, bucket, object, uploa
 
 // ListMultipartUploads - lists all the uploadIDs for the specified object.
 // We do not support prefix based listing.
-func (fs *FSObjects) ListMultipartUploads(ctx context.Context, bucket, object, keyMarker, uploadIDMarker, delimiter string, maxUploads int) (result ListMultipartsInfo, e error) {
+func (fs *FSObjects) ListMultipartUploads(ctx context.Context, bucket, object, keyMarker, uploadIDMarker, delimiter string, maxUploads int) (ListMultipartsInfo, error) {
+	var result ListMultipartsInfo
+	var err error
+
 	if err := checkListMultipartArgs(ctx, bucket, object, keyMarker, uploadIDMarker, delimiter, fs); err != nil {
-		return result, toObjectErr(err)
+		return ListMultipartsInfo{}, toObjectErr(err)
 	}
 
 	if _, err := fs.disk.StatVol(ctx, bucket); err != nil {
-		return result, toObjectErr(err, bucket)
+		return ListMultipartsInfo{}, toObjectErr(err, bucket)
 	}
 
 	result.MaxUploads = maxUploads
 	result.KeyMarker = keyMarker
 	result.Prefix = object
 	result.Delimiter = delimiter
-	result.NextKeyMarker = object
-	result.UploadIDMarker = uploadIDMarker
 
-	uploadIDs, err := readDir(fs.getMultipartSHADir(bucket, object))
+	var uploadIDs []string
+	uploadIDs, err = fs.disk.ListDir(ctx, minioMetaMultipartBucket, fs.tmpGetMultipartSHADir(bucket, object), -1)
 	if err != nil {
 		if err == errFileNotFound {
-			result.IsTruncated = false
 			return result, nil
 		}
 		logger.LogIf(ctx, err)
-		return result, toObjectErr(err)
+		return ListMultipartsInfo{}, toObjectErr(err, bucket, object)
 	}
 
-	// S3 spec says uploadIDs should be sorted based on initiated time. ModTime of fs.json
-	// is the creation time of the uploadID, hence we will use that.
+	for i := range uploadIDs {
+		uploadIDs[i] = strings.TrimSuffix(uploadIDs[i], SlashSeparator)
+	}
+
+	// S3 spec says uploadIDs should be sorted based on initiated time, we need
+	// to read the metadata entry.
 	var uploads []MultipartInfo
+
+	populatedUploadIds := set.NewStringSet()
+
 	for _, uploadID := range uploadIDs {
-		metaFilePath := pathJoin(fs.getMultipartSHADir(bucket, object), uploadID, fsMetaJSONFile)
-		fi, err := fsStatFile(ctx, metaFilePath)
-		if err != nil {
-			return result, toObjectErr(err, bucket, object)
+		if populatedUploadIds.Contains(uploadID) {
+			continue
 		}
+		fi, err := fs.disk.ReadVersion(ctx, minioMetaMultipartBucket, pathJoin(fs.tmpGetUploadIDDir(bucket, object, uploadID)), "", false)
+		if err != nil {
+			return ListMultipartsInfo{}, toObjectErr(err, bucket, object)
+		}
+		populatedUploadIds.Add(uploadID)
 		uploads = append(uploads, MultipartInfo{
 			Object:    object,
-			UploadID:  strings.TrimSuffix(uploadID, SlashSeparator),
-			Initiated: fi.ModTime(),
+			UploadID:  uploadID,
+			Initiated: fi.ModTime,
 		})
 	}
 	sort.Slice(uploads, func(i int, j int) bool {
@@ -482,7 +495,6 @@ func (fs *FSObjects) ListObjectParts(ctx context.Context, bucket, object, upload
 		return ListPartsInfo{}, err
 	}
 	defer uploadIDLock.RUnlock()
-
 
 	// Check if bucket exists
 	if _, err := fs.disk.StatVol(ctx, bucket); err != nil {
