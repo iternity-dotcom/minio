@@ -18,11 +18,8 @@
 package cmd
 
 import (
-	"context"
 	"encoding/hex"
 	"encoding/json"
-	"io"
-	"io/ioutil"
 	"net/http"
 	"os"
 	pathutil "path"
@@ -30,8 +27,6 @@ import (
 
 	jsoniter "github.com/json-iterator/go"
 	xhttp "github.com/minio/minio/cmd/http"
-	"github.com/minio/minio/cmd/logger"
-	"github.com/minio/minio/pkg/lock"
 	"github.com/minio/minio/pkg/mimedb"
 )
 
@@ -216,13 +211,13 @@ func (m fsMetaV1) ToFileInfo(bucket, object string, fi os.FileInfo) FileInfo {
 	}
 
 	fileInfo := FileInfo{
-		Volume: bucket,
-		Name:  object,
-		IsLatest:  true,
-		Deleted: false,
-		Parts: m.Parts,
-		XLV1: false,
-		Metadata: m.Meta,
+		Volume:      bucket,
+		Name:        object,
+		IsLatest:    true,
+		Deleted:     false,
+		Parts:       m.Parts,
+		XLV1:        false,
+		Metadata:    m.Meta,
 		NumVersions: 1,
 	}
 
@@ -243,52 +238,6 @@ func (m *fsMetaV1) FromFileInfo(fi FileInfo) {
 	m.Version = fsMetaVersion
 	m.Parts = fi.Parts
 	m.Meta = fi.Metadata
-}
-
-func (m *fsMetaV1) WriteTo(lk *lock.LockedFile) (n int64, err error) {
-	if err = jsonSave(lk, m); err != nil {
-		return 0, err
-	}
-	fi, err := lk.Stat()
-	if err != nil {
-		return 0, err
-	}
-	return fi.Size(), nil
-}
-
-func (m *fsMetaV1) ReadFrom(ctx context.Context, lk *lock.LockedFile) (n int64, err error) {
-	var fsMetaBuf []byte
-	fi, err := lk.Stat()
-	if err != nil {
-		logger.LogIf(ctx, err)
-		return 0, err
-	}
-
-	fsMetaBuf, err = ioutil.ReadAll(io.NewSectionReader(lk, 0, fi.Size()))
-	if err != nil {
-		logger.LogIf(ctx, err)
-		return 0, err
-	}
-
-	if len(fsMetaBuf) == 0 {
-		return 0, io.EOF
-	}
-
-	var json = jsoniter.ConfigCompatibleWithStandardLibrary
-	if err = json.Unmarshal(fsMetaBuf, m); err != nil {
-		return 0, err
-	}
-
-	// Verify if the format is valid, return corrupted format
-	// for unrecognized formats.
-	if !isFSMetaValid(m.Version) {
-		logger.GetReqInfo(ctx).AppendTags("file", lk.Name())
-		logger.LogIf(ctx, errCorruptedFormat)
-		return 0, errCorruptedFormat
-	}
-
-	// Success.
-	return int64(len(fsMetaBuf)), nil
 }
 
 // newFSMetaV1 - initializes new fsMetaV1.

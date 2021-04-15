@@ -18,9 +18,6 @@
 package cmd
 
 import (
-	"bytes"
-	"os"
-	"path/filepath"
 	"reflect"
 	"testing"
 )
@@ -40,80 +37,6 @@ func TestFSV1MetadataObjInfo(t *testing.T) {
 	}
 	if !objInfo.Expires.IsZero() {
 		t.Fatal("Unexpected object info value for Expires ", objInfo.Expires)
-	}
-}
-
-// TestReadFSMetadata - readFSMetadata testing with a healthy and faulty disk
-func TestReadFSMetadata(t *testing.T) {
-	disk := filepath.Join(globalTestTmpDir, "minio-"+nextSuffix())
-	defer os.RemoveAll(disk)
-
-	obj := initFSObjects(disk, t)
-	fs := obj.(*FSObjects)
-
-	bucketName := "bucket"
-	objectName := "object"
-
-	if err := obj.MakeBucketWithLocation(GlobalContext, bucketName, BucketOptions{}); err != nil {
-		t.Fatal("Unexpected err: ", err)
-	}
-	if _, err := obj.PutObject(GlobalContext, bucketName, objectName, mustGetPutObjReader(t, bytes.NewReader([]byte("abcd")), int64(len("abcd")), "", ""), ObjectOptions{}); err != nil {
-		t.Fatal("Unexpected err: ", err)
-	}
-
-	// Construct the full path of fs.json
-	fsPath := pathJoin(bucketMetaPrefix, bucketName, objectName, "fs.json")
-	fsPath = pathJoin(fs.disk.String(), minioMetaBucket, fsPath)
-
-	rlk, err := fs.rwPool.Open(fsPath)
-	if err != nil {
-		t.Fatal("Unexpected error ", err)
-	}
-	defer rlk.Close()
-
-	// Regular fs metadata reading, no errors expected
-	fsMeta := fsMetaV1{}
-	if _, err = fsMeta.ReadFrom(GlobalContext, rlk.LockedFile); err != nil {
-		t.Fatal("Unexpected error ", err)
-	}
-}
-
-// TestWriteFSMetadata - tests of writeFSMetadata with healthy disk.
-func TestWriteFSMetadata(t *testing.T) {
-	disk := filepath.Join(globalTestTmpDir, "minio-"+nextSuffix())
-	defer os.RemoveAll(disk)
-
-	obj := initFSObjects(disk, t)
-	fs := obj.(*FSObjects)
-
-	bucketName := "bucket"
-	objectName := "object"
-
-	if err := obj.MakeBucketWithLocation(GlobalContext, bucketName, BucketOptions{}); err != nil {
-		t.Fatal("Unexpected err: ", err)
-	}
-	if _, err := obj.PutObject(GlobalContext, bucketName, objectName, mustGetPutObjReader(t, bytes.NewReader([]byte("abcd")), int64(len("abcd")), "", ""), ObjectOptions{}); err != nil {
-		t.Fatal("Unexpected err: ", err)
-	}
-
-	// Construct the full path of fs.json
-	fsPath := pathJoin(bucketMetaPrefix, bucketName, objectName, "fs.json")
-	fsPath = pathJoin(fs.disk.String(), minioMetaBucket, fsPath)
-
-	rlk, err := fs.rwPool.Open(fsPath)
-	if err != nil {
-		t.Fatal("Unexpected error ", err)
-	}
-	defer rlk.Close()
-
-	// FS metadata reading, no errors expected (healthy disk)
-	fsMeta := fsMetaV1{}
-	_, err = fsMeta.ReadFrom(GlobalContext, rlk.LockedFile)
-	if err != nil {
-		t.Fatal("Unexpected error ", err)
-	}
-	if fsMeta.Version != fsMetaVersion {
-		t.Fatalf("Unexpected version %s", fsMeta.Version)
 	}
 }
 
