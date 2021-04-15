@@ -22,7 +22,6 @@ import (
 	"fmt"
 	"github.com/minio/minio/pkg/mimedb"
 	"io"
-	"io/ioutil"
 	"path"
 	pathutil "path"
 	"sort"
@@ -30,9 +29,7 @@ import (
 	"strings"
 	"time"
 
-	jsoniter "github.com/json-iterator/go"
 	"github.com/minio/minio/cmd/logger"
-	xioutil "github.com/minio/minio/pkg/ioutil"
 )
 
 func (fs *FSObjects) tmpGetUploadIDDir(bucket, object, uploadID string) string {
@@ -439,32 +436,29 @@ func (fs *FSObjects) GetMultipartInfo(ctx context.Context, bucket, object, uploa
 		return minfo, toObjectErr(err)
 	}
 
-	// Check if bucket exists
-	if _, err := fs.disk.StatVol(ctx, bucket); err != nil {
-		return minfo, toObjectErr(err, bucket)
-	}
-
-	uploadIDDir := fs.getUploadIDDir(bucket, object, uploadID)
-	if _, err := fsStatFile(ctx, pathJoin(uploadIDDir, fsMetaJSONFile)); err != nil {
-		if err == errFileNotFound || err == errFileAccessDenied {
-			return minfo, InvalidUploadID{Bucket: bucket, Object: object, UploadID: uploadID}
-		}
-		return minfo, toObjectErr(err, bucket, object)
-	}
-
-	fsMetaBytes, err := xioutil.ReadFile(pathJoin(uploadIDDir, fsMetaJSONFile))
+	var err error
+	uploadIDLock := fs.NewNSLock(bucket, pathJoin(object, uploadID))
+	ctx, err = uploadIDLock.GetRLock(ctx, globalOperationTimeout)
 	if err != nil {
-		logger.LogIf(ctx, err)
-		return minfo, toObjectErr(err, bucket, object)
+		return MultipartInfo{}, err
+	}
+	defer uploadIDLock.RUnlock()
+
+	if _, err := fs.disk.StatVol(ctx, bucket); err != nil {
+		return MultipartInfo{}, toObjectErr(err, bucket)
 	}
 
-	var fsMeta fsMetaV1
-	var json = jsoniter.ConfigCompatibleWithStandardLibrary
-	if err = json.Unmarshal(fsMetaBytes, &fsMeta); err != nil {
-		return minfo, toObjectErr(err, bucket, object)
+	uploadIDPath := fs.tmpGetUploadIDDir(bucket, object, uploadID)
+	// Just check if the uploadID exists to avoid copy if it doesn't.
+	fi, err := fs.disk.ReadVersion(ctx, minioMetaMultipartBucket, uploadIDPath, "", false)
+	if err != nil {
+		if err == errFileNotFound || err == errFileAccessDenied {
+			return MultipartInfo{}, InvalidUploadID{Bucket: bucket, Object: object, UploadID: uploadID}
+		}
+		return MultipartInfo{}, toObjectErr(err, bucket, object)
 	}
 
-	minfo.UserDefined = fsMeta.Meta
+	minfo.UserDefined = cloneMSS(fi.Metadata)
 	return minfo, nil
 }
 
@@ -475,125 +469,81 @@ func (fs *FSObjects) GetMultipartInfo(ctx context.Context, bucket, object, uploa
 // Implements S3 compatible ListObjectParts API. The resulting
 // ListPartsInfo structure is unmarshalled directly into XML and
 // replied back to the client.
-func (fs *FSObjects) ListObjectParts(ctx context.Context, bucket, object, uploadID string, partNumberMarker, maxParts int, opts ObjectOptions) (result ListPartsInfo, e error) {
+func (fs *FSObjects) ListObjectParts(ctx context.Context, bucket, object, uploadID string, partNumberMarker, maxParts int, opts ObjectOptions) (ListPartsInfo, error) {
+	result := ListPartsInfo{}
+
 	if err := checkListPartsArgs(ctx, bucket, object, fs); err != nil {
-		return result, toObjectErr(err)
+		return ListPartsInfo{}, toObjectErr(err)
 	}
+
+	uploadIDLock := fs.NewNSLock(bucket, pathJoin(object, uploadID))
+	ctx, err := uploadIDLock.GetRLock(ctx, globalOperationTimeout)
+	if err != nil {
+		return ListPartsInfo{}, err
+	}
+	defer uploadIDLock.RUnlock()
+
+
+	// Check if bucket exists
+	if _, err := fs.disk.StatVol(ctx, bucket); err != nil {
+		return ListPartsInfo{}, toObjectErr(err, bucket)
+	}
+
+	uploadIDPath := fs.tmpGetUploadIDDir(bucket, object, uploadID)
+
+	// Just check if the uploadID exists to avoid copy if it doesn't.
+	fi, err := fs.disk.ReadVersion(ctx, minioMetaMultipartBucket, uploadIDPath, "", false)
+	if err != nil {
+		if err == errFileNotFound || err == errFileAccessDenied {
+			return ListPartsInfo{}, InvalidUploadID{Bucket: bucket, Object: object, UploadID: uploadID}
+		}
+		return ListPartsInfo{}, toObjectErr(err, bucket, object)
+	}
+
 	result.Bucket = bucket
 	result.Object = object
 	result.UploadID = uploadID
 	result.MaxParts = maxParts
 	result.PartNumberMarker = partNumberMarker
+	result.UserDefined = cloneMSS(fi.Metadata)
 
-	// Check if bucket exists
-	if _, err := fs.disk.StatVol(ctx, bucket); err != nil {
-		return result, toObjectErr(err, bucket)
+	// For empty number of parts or maxParts as zero, return right here.
+	if len(fi.Parts) == 0 || maxParts == 0 {
+		return result, nil
 	}
 
-	uploadIDDir := fs.getUploadIDDir(bucket, object, uploadID)
-	if _, err := fsStatFile(ctx, pathJoin(uploadIDDir, fsMetaJSONFile)); err != nil {
-		if err == errFileNotFound || err == errFileAccessDenied {
-			return result, InvalidUploadID{Bucket: bucket, Object: object, UploadID: uploadID}
-		}
-		return result, toObjectErr(err, bucket, object)
+	// Limit output to maxPartsList.
+	if maxParts > maxPartsList {
+		maxParts = maxPartsList
 	}
 
-	entries, err := readDir(uploadIDDir)
-	if err != nil {
-		logger.LogIf(ctx, err)
-		return result, toObjectErr(err, bucket)
+	// Only parts with higher part numbers will be listed.
+	partIdx := objectPartIndex(fi.Parts, partNumberMarker)
+	parts := fi.Parts
+	if partIdx != -1 {
+		parts = fi.Parts[partIdx+1:]
 	}
-
-	partsMap := make(map[int]PartInfo)
-	for _, entry := range entries {
-		if entry == fsMetaJSONFile {
-			continue
-		}
-
-		partNumber, currentEtag, actualSize, derr := fs.decodePartFile(entry)
-		if derr != nil {
-			// Skip part files whose name don't match expected format. These could be backend filesystem specific files.
-			continue
-		}
-
-		entryStat, err := fsStatFile(ctx, pathJoin(uploadIDDir, entry))
-		if err != nil {
-			continue
-		}
-
-		currentMeta := PartInfo{
-			PartNumber:   partNumber,
-			ETag:         currentEtag,
-			ActualSize:   actualSize,
-			Size:         entryStat.Size(),
-			LastModified: entryStat.ModTime(),
-		}
-
-		cachedMeta, ok := partsMap[partNumber]
-		if !ok {
-			partsMap[partNumber] = currentMeta
-			continue
-		}
-
-		if currentMeta.LastModified.After(cachedMeta.LastModified) {
-			partsMap[partNumber] = currentMeta
+	count := maxParts
+	for _, part := range parts {
+		result.Parts = append(result.Parts, PartInfo{
+			PartNumber:   part.Number,
+			ETag:         part.ETag,
+			LastModified: fi.ModTime,
+			Size:         part.Size,
+		})
+		count--
+		if count == 0 {
+			break
 		}
 	}
-
-	var parts []PartInfo
-	for _, partInfo := range partsMap {
-		parts = append(parts, partInfo)
-	}
-
-	sort.Slice(parts, func(i int, j int) bool {
-		return parts[i].PartNumber < parts[j].PartNumber
-	})
-
-	i := 0
-	if partNumberMarker != 0 {
-		// If the marker was set, skip the entries till the marker.
-		for _, part := range parts {
-			i++
-			if part.PartNumber == partNumberMarker {
-				break
-			}
-		}
-	}
-
-	partsCount := 0
-	for partsCount < maxParts && i < len(parts) {
-		result.Parts = append(result.Parts, parts[i])
-		i++
-		partsCount++
-	}
-	if i < len(parts) {
+	// If listed entries are more than maxParts, we set IsTruncated as true.
+	if len(parts) > len(result.Parts) {
 		result.IsTruncated = true
-		if partsCount != 0 {
-			result.NextPartNumberMarker = result.Parts[partsCount-1].PartNumber
-		}
+		// Make sure to fill next part number marker if IsTruncated is
+		// true for subsequent listing.
+		nextPartNumberMarker := result.Parts[len(result.Parts)-1].PartNumber
+		result.NextPartNumberMarker = nextPartNumberMarker
 	}
-
-	rc, _, err := fsOpenFile(ctx, pathJoin(uploadIDDir, fsMetaJSONFile), 0)
-	if err != nil {
-		if err == errFileNotFound || err == errFileAccessDenied {
-			return result, InvalidUploadID{Bucket: bucket, Object: object, UploadID: uploadID}
-		}
-		return result, toObjectErr(err, bucket, object)
-	}
-	defer rc.Close()
-
-	fsMetaBytes, err := ioutil.ReadAll(rc)
-	if err != nil {
-		return result, toObjectErr(err, bucket, object)
-	}
-
-	var fsMeta fsMetaV1
-	var json = jsoniter.ConfigCompatibleWithStandardLibrary
-	if err = json.Unmarshal(fsMetaBytes, &fsMeta); err != nil {
-		return result, err
-	}
-
-	result.UserDefined = fsMeta.Meta
 	return result, nil
 }
 
@@ -825,22 +775,21 @@ func (fs *FSObjects) AbortMultipartUpload(ctx context.Context, bucket, object, u
 		return err
 	}
 
+	lk := fs.NewNSLock(bucket, pathJoin(object, uploadID))
+	ctx, err := lk.GetLock(ctx, globalOperationTimeout)
+	if err != nil {
+		return err
+	}
+	defer lk.Unlock()
+
 	if _, err := fs.disk.StatVol(ctx, bucket); err != nil {
 		return toObjectErr(err, bucket)
 	}
 
-	fs.appendFileMapMu.Lock()
-	// Remove file in tmp folder
-	file := fs.appendFileMap[uploadID]
-	if file != nil {
-		fsRemoveFile(ctx, file.filePath)
-	}
-	delete(fs.appendFileMap, uploadID)
-	fs.appendFileMapMu.Unlock()
+	uploadIDPath := fs.tmpGetUploadIDDir(bucket, object, uploadID)
 
-	uploadIDDir := fs.getUploadIDDir(bucket, object, uploadID)
 	// Just check if the uploadID exists to avoid copy if it doesn't.
-	_, err := fsStatFile(ctx, pathJoin(uploadIDDir, fsMetaJSONFile))
+	_, err = fs.disk.ReadVersion(ctx, minioMetaMultipartBucket, uploadIDPath, "", false)
 	if err != nil {
 		if err == errFileNotFound || err == errFileAccessDenied {
 			return InvalidUploadID{Bucket: bucket, Object: object, UploadID: uploadID}
@@ -848,15 +797,17 @@ func (fs *FSObjects) AbortMultipartUpload(ctx context.Context, bucket, object, u
 		return toObjectErr(err, bucket, object)
 	}
 
-	// Purge multipart folders
-	{
-		fsTmpObjPath := pathJoin(fs.disk.String(), minioMetaTmpBucket, fs.fsUUID, mustGetUUID())
-		defer fsRemoveAll(ctx, fsTmpObjPath) // remove multipart temporary files in background.
+	fs.appendFileMapMu.Lock()
+	// Remove file in tmp folder
+	file := fs.appendFileMap[uploadID]
+	if file != nil {
+		fs.disk.Delete(ctx, minioMetaTmpBucket, file.filePath, false)
+	}
+	delete(fs.appendFileMap, uploadID)
+	fs.appendFileMapMu.Unlock()
 
-		fsSimpleRenameFile(ctx, uploadIDDir, fsTmpObjPath)
-
-		// It is safe to ignore any directory not empty error (in case there were multiple uploadIDs on the same object)
-		fsRemoveDir(ctx, fs.getMultipartSHADir(bucket, object))
+	if err = fs.disk.Delete(ctx, minioMetaMultipartBucket, uploadIDPath, true); err != nil {
+		return toObjectErr(err, bucket, object)
 	}
 
 	return nil
