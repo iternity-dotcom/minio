@@ -841,12 +841,12 @@ func (fs *FSObjects) cleanupStaleUploads(ctx context.Context, cleanupInterval, e
 			timer.Reset(cleanupInterval)
 
 			now := time.Now()
-			entries, err := readDir(pathJoin(fs.disk.String(), minioMetaMultipartBucket))
+			entries, err := fs.disk.ListDir(ctx, minioMetaMultipartBucket, "", -1)
 			if err != nil {
 				continue
 			}
 			for _, entry := range entries {
-				uploadIDs, err := readDir(pathJoin(fs.disk.String(), minioMetaMultipartBucket, entry))
+				uploadIDs, err := fs.disk.ListDir(ctx, minioMetaMultipartBucket, entry, -1)
 				if err != nil {
 					continue
 				}
@@ -857,23 +857,12 @@ func (fs *FSObjects) cleanupStaleUploads(ctx context.Context, cleanupInterval, e
 				}
 
 				for _, uploadID := range uploadIDs {
-					fi, err := fsStatDir(ctx, pathJoin(fs.disk.String(), minioMetaMultipartBucket, entry, uploadID))
+					fi, err := fs.disk.ReadVersion(ctx, minioMetaMultipartBucket, pathJoin(entry, uploadID), "", false)
 					if err != nil {
 						continue
 					}
-					if now.Sub(fi.ModTime()) > expiry {
-						fsRemoveAll(ctx, pathJoin(fs.disk.String(), minioMetaMultipartBucket, entry, uploadID))
-						// It is safe to ignore any directory not empty error (in case there were multiple uploadIDs on the same object)
-						fsRemoveDir(ctx, pathJoin(fs.disk.String(), minioMetaMultipartBucket, entry))
-
-						// Remove uploadID from the append file map and its corresponding temporary file
-						fs.appendFileMapMu.Lock()
-						bgAppend, ok := fs.appendFileMap[uploadID]
-						if ok {
-							_ = fsRemoveFile(ctx, bgAppend.filePath)
-							delete(fs.appendFileMap, uploadID)
-						}
-						fs.appendFileMapMu.Unlock()
+					if now.Sub(fi.ModTime) > expiry {
+						fs.AbortMultipartUpload(ctx, fi.Volume, fi.Name, uploadID, ObjectOptions{})
 					}
 				}
 			}
