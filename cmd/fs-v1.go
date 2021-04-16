@@ -1621,7 +1621,7 @@ func (fs *FSObjects) IsTaggingSupported() bool {
 
 // Health returns health of the object layer
 func (fs *FSObjects) Health(ctx context.Context, opts HealthOptions) HealthResult {
-	if _, err := os.Stat(fs.disk.String()); err != nil {
+	if _, err := fs.disk.StatVol(ctx, minioMetaBucket); err != nil {
 		return HealthResult{}
 	}
 	return HealthResult{
@@ -1631,7 +1631,7 @@ func (fs *FSObjects) Health(ctx context.Context, opts HealthOptions) HealthResul
 
 // ReadHealth returns "read" health of the object layer
 func (fs *FSObjects) ReadHealth(ctx context.Context) bool {
-	err := fs.disk.CheckFile(ctx, minioMetaBucket, "")
+	_, err := fs.disk.StatVol(ctx, minioMetaBucket)
 	return err == nil
 }
 
