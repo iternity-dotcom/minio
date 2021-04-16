@@ -45,7 +45,6 @@ import (
 	"github.com/minio/minio/cmd/logger"
 	"github.com/minio/minio/pkg/bucket/policy"
 	"github.com/minio/minio/pkg/color"
-	xioutil "github.com/minio/minio/pkg/ioutil"
 	"github.com/minio/minio/pkg/lock"
 	"github.com/minio/minio/pkg/madmin"
 	"github.com/minio/minio/pkg/mimedb"
@@ -245,7 +244,7 @@ func (fs *FSObjects) NSScanner(ctx context.Context, bf *bloomFilter, updates cha
 		}
 		bCache.Info.BloomFilter = totalCache.Info.BloomFilter
 
-		cache, err := fs.scanBucket(ctx, b.Name, bCache)
+		cache, err := fs.disk.NSScanner(ctx, bCache)
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -284,65 +283,10 @@ func (fs *FSObjects) NSScanner(ctx context.Context, bf *bloomFilter, updates cha
 	return nil
 }
 
-// scanBucket scans a single bucket in FS mode.
-// The updated cache for the bucket is returned.
-// A partially updated bucket may be returned.
-func (fs *FSObjects) scanBucket(ctx context.Context, bucket string, cache dataUsageCache) (dataUsageCache, error) {
-	// Get bucket policy
-	// Check if the current bucket has a configured lifecycle policy
-	lc, err := globalLifecycleSys.Get(bucket)
-	if err == nil && lc.HasActiveRules("", true) {
-		if intDataUpdateTracker.debug {
-			logger.Info(color.Green("scanBucket:") + " lifecycle: Active rules found")
-		}
-		cache.Info.lifeCycle = lc
-	}
-
-	// Load bucket info.
-	cache, err = scanDataFolder(ctx, fs.disk.String(), cache, func(item scannerItem) (sizeSummary, error) {
-		bucket, object := item.bucket, item.objectPath()
-		fsMetaBytes, err := xioutil.ReadFile(pathJoin(fs.disk.String(), minioMetaBucket, bucketMetaPrefix, bucket, object, fsMetaJSONFile))
-		if err != nil && !osIsNotExist(err) {
-			if intDataUpdateTracker.debug {
-				logger.Info(color.Green("scanBucket:")+" object return unexpected error: %v/%v: %w", item.bucket, item.objectPath(), err)
-			}
-			return sizeSummary{}, errSkipFile
-		}
-
-		fsMeta := newFSMetaV1()
-		metaOk := false
-		if len(fsMetaBytes) > 0 {
-			var json = jsoniter.ConfigCompatibleWithStandardLibrary
-			if err = json.Unmarshal(fsMetaBytes, &fsMeta); err == nil {
-				metaOk = true
-			}
-		}
-		if !metaOk {
-			fsMeta = defaultFsJSON(object)
-		}
-
-		// Stat the file.
-		fi, fiErr := os.Stat(item.Path)
-		if fiErr != nil {
-			if intDataUpdateTracker.debug {
-				logger.Info(color.Green("scanBucket:")+" object path missing: %v: %w", item.Path, fiErr)
-			}
-			return sizeSummary{}, errSkipFile
-		}
-
-		oi := fsMeta.ToObjectInfo(bucket, object, fi)
-		sz := item.applyActions(ctx, fs, actionMeta{oi: oi})
-		if sz >= 0 {
-			return sizeSummary{totalSize: sz}, nil
-		}
-
-		return sizeSummary{totalSize: fi.Size()}, nil
-	})
-
-	return cache, err
+// GetDisksID will return disk.
+func (fs *FSObjects) GetDisksID(_ ...string) []StorageAPI {
+	return []StorageAPI{fs.disk}
 }
-
-/// Bucket operations
 
 // MakeBucketWithLocation - create a new bucket, returns if it already exists.
 func (fs *FSObjects) MakeBucketWithLocation(ctx context.Context, bucket string, opts BucketOptions) error {

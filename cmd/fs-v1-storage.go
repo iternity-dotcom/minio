@@ -40,6 +40,7 @@ import (
 
 	pathutil "path"
 
+	"github.com/minio/minio/pkg/color"
 	"github.com/minio/minio/pkg/disk"
 	"github.com/minio/minio/pkg/env"
 )
@@ -232,10 +233,6 @@ func (s *fsv1Storage) DiskInfo(ctx context.Context) (info DiskInfo, err error) {
 	info = v.(DiskInfo)
 	return info, err
 
-}
-
-func (s *fsv1Storage) NSScanner(ctx context.Context, cache dataUsageCache) (dataUsageCache, error) {
-	return dataUsageCache{}, NotImplemented{}
 }
 
 func (s *fsv1Storage) MakeVolBulk(ctx context.Context, volumes ...string) (err error) {
@@ -450,6 +447,54 @@ func (s *fsv1Storage) CreateFile(ctx context.Context, volume, path string, fileS
 	}
 
 	return nil
+}
+
+func (s *fsv1Storage) NSScanner(ctx context.Context, cache dataUsageCache) (dataUsageCache, error) {
+	// Get bucket policy
+	// Check if the current bucket has a configured lifecycle policy
+	lc, err := globalLifecycleSys.Get(cache.Info.Name)
+	if err == nil && lc.HasActiveRules("", true) {
+		if intDataUpdateTracker.debug {
+			logger.Info(color.Green("scanBucket:") + " lifecycle: Active rules found")
+		}
+		cache.Info.lifeCycle = lc
+	}
+
+	// return initialized object layer
+	objAPI := newObjectLayerFn()
+
+	// Load bucket info.
+	cache, err = scanDataFolder(ctx, s.String(), cache, func(item scannerItem) (sizeSummary, error) {
+		bucket, object := item.bucket, item.objectPath()
+		metaFi, err := s.ReadVersion(ctx, bucket, object, "", false)
+		if err != nil {
+			if intDataUpdateTracker.debug {
+				logger.Info(color.Green("scanBucket:")+" object return unexpected error: %v/%v: %w", item.bucket, item.objectPath(), err)
+			}
+			return sizeSummary{}, errSkipFile
+		}
+
+		// Stat the file.
+		fi, fiErr := os.Stat(item.Path)
+		if fiErr != nil {
+			if intDataUpdateTracker.debug {
+				logger.Info(color.Green("scanBucket:")+" object path missing: %v: %w", item.Path, fiErr)
+			}
+			return sizeSummary{}, errSkipFile
+		}
+
+		fsMeta := fsMetaV1{}
+		fsMeta.FromFileInfo(metaFi)
+		oi := fsMeta.ToObjectInfo(bucket, object, fi)
+		sz := item.applyActions(ctx, objAPI, actionMeta{oi: oi})
+		if sz >= 0 {
+			return sizeSummary{totalSize: sz}, nil
+		}
+
+		return sizeSummary{totalSize: fi.Size()}, nil
+	})
+
+	return cache, err
 }
 
 func (s *fsv1Storage) WriteMetadata(ctx context.Context, volume, path string, fi FileInfo) error {

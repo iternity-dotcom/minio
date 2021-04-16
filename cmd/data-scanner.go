@@ -185,6 +185,10 @@ type folderScanner struct {
 	disks           []StorageAPI
 }
 
+type Disker interface {
+	GetDisksID(ids ...string) []StorageAPI
+}
+
 // scanDataFolder will scanner the basepath+cache.Info.Name and return an updated cache.
 // The returned cache will always be valid, but may not be updated from the existing.
 // Before each operation sleepDuration is called which can be used to temporarily halt the scanner.
@@ -222,9 +226,9 @@ func scanDataFolder(ctx context.Context, basePath string, cache dataUsageCache, 
 
 	// Add disks for set healing.
 	if len(cache.Disks) > 0 {
-		objAPI, ok := newObjectLayerFn().(*erasureServerPools)
+		disker, ok := newObjectLayerFn().(Disker)
 		if ok {
-			s.disks = objAPI.GetDisksID(cache.Disks...)
+			s.disks = disker.GetDisksID(cache.Disks...)
 			if len(s.disks) != len(cache.Disks) {
 				console.Debugf(logPrefix+"Missing disks, want %d, found %d. Cannot heal. %s\n", len(cache.Disks), len(s.disks), logSuffix)
 				s.disks = s.disks[:0]
