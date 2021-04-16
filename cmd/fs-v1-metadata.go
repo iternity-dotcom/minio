@@ -246,3 +246,13 @@ func newFSMetaV1() (fsMeta fsMetaV1) {
 	fsMeta.Version = fsMetaVersion
 	return fsMeta
 }
+
+// Used to return default etag values when a pre-existing object's meta data is queried.
+func defaultFsJSON(object string) fsMetaV1 {
+	fsMeta := newFSMetaV1()
+	fsMeta.Meta = map[string]string{
+		"etag":         defaultEtag,
+		"content-type": mimedb.TypeByExtension(pathutil.Ext(object)),
+	}
+	return fsMeta
+}

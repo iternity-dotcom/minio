@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"github.com/minio/minio-go/v7/pkg/set"
 	"github.com/minio/minio/pkg/bucket/replication"
+	"github.com/minio/minio/pkg/env"
 	"io"
 	"net/http"
 	"os"
@@ -48,7 +49,6 @@ import (
 	"github.com/minio/minio/pkg/lock"
 	"github.com/minio/minio/pkg/madmin"
 	"github.com/minio/minio/pkg/mimedb"
-	"github.com/minio/minio/pkg/mountinfo"
 )
 
 // Default etag is used for pre-existing objects.
@@ -71,17 +71,13 @@ type FSObjects struct {
 	// This value shouldn't be touched, once initialized.
 	fsFormatRlk *lock.RLockedFile // Is a read lock on `format.json`.
 
-	// TODO: delete, has been moved to fsV1Storage
-	// FS rw pool.
-	rwPool *fsIOPool
-
-	diskMount bool
-
 	appendFileMap   map[string]*fsAppendFile
 	appendFileMapMu sync.Mutex
 
 	// To manage the appendRoutine go-routines
 	nsMutex *nsLockMap
+
+	deletedCleanupSleeper *dynamicSleeper
 }
 
 // Represents the background append file.
@@ -124,12 +120,9 @@ func NewFSObjectLayer(fsPath string) (ObjectLayer, error) {
 	fs := &FSObjects{
 		disk:   disk,
 		fsUUID: diskID,
-		rwPool: &fsIOPool{
-			readersMap: make(map[string]*lock.RLockedFile),
-		},
 		nsMutex:       newNSLock(false),
 		appendFileMap: make(map[string]*fsAppendFile),
-		diskMount:     mountinfo.IsLikelyMountPoint(fsPath),
+		deletedCleanupSleeper: newDynamicSleeper(10, 2*time.Second),
 	}
 
 	// Initialize `format.json`, this function also returns.
@@ -145,10 +138,44 @@ func NewFSObjectLayer(fsPath string) (ObjectLayer, error) {
 	fs.fsFormatRlk = rlk
 
 	go fs.cleanupStaleUploads(ctx, GlobalStaleUploadsCleanupInterval, GlobalStaleUploadsExpiry)
+
+	// cleanup ".trash/" folder every 5m minutes with sufficient sleep cycles, between each
+	// deletes a dynamic sleeper is used with a factor of 10 ratio with max delay between
+	// deletes to be 2 seconds.
+	deletedObjectsCleanupInterval, err := time.ParseDuration(env.Get(envMinioDeleteCleanupInterval, "5m"))
+	if err != nil {
+		return nil, err
+	}
+	// start cleanup of deleted objects.
+	go fs.cleanupDeletedObjects(ctx, deletedObjectsCleanupInterval)
 	go intDataUpdateTracker.start(ctx, fsPath)
 
 	// Return successfully initialized object layer.
 	return fs, nil
+}
+
+func (fs *FSObjects) cleanupDeletedObjects(ctx context.Context, cleanupInterval time.Duration) {
+	timer := time.NewTimer(cleanupInterval)
+	defer timer.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+			// Reset for the next interval
+			timer.Reset(cleanupInterval)
+
+			trashDirs, err := fs.disk.ListDir(ctx, minioMetaTmpDeletedBucket, "", -1)
+			if err == nil {
+				for _, trashDir := range trashDirs {
+					wait := fs.deletedCleanupSleeper.Timer(ctx)
+					fs.disk.DeleteVol(ctx, pathJoin(minioMetaTmpDeletedBucket, trashDir), true)
+					wait()
+				}
+			}
+		}
+	}
 }
 
 // NewNSLock - initialize a new namespace RWLocker instance.
@@ -429,7 +456,6 @@ func (fs *FSObjects) DeleteBucket(ctx context.Context, bucket string, forceDelet
 		return toObjectErr(err, bucket)
 	}
 
-	// TODO: move all metadata handling in storage
 	// Cleanup all the bucket metadata.
 	minioMetadataBucket := pathJoin(minioMetaBucket, bucketMetaPrefix, bucket)
 	if err := fs.disk.DeleteVol(ctx, minioMetadataBucket, true); err != nil {
@@ -677,18 +703,6 @@ func (fs *FSObjects) GetObjectNInfo(ctx context.Context, bucket, object string, 
 	return objReaderFn(reader, h, opts.CheckPrecondFn, closeFn)
 }
 
-
-// TODO: delete
-// Used to return default etag values when a pre-existing object's meta data is queried.
-func defaultFsJSON(object string) fsMetaV1 {
-	fsMeta := newFSMetaV1()
-	fsMeta.Meta = map[string]string{
-		"etag":         defaultEtag,
-		"content-type": mimedb.TypeByExtension(path.Ext(object)),
-	}
-	return fsMeta
-}
-
 // GetObjectInfo - reads object metadata and replies back ObjectInfo.
 func (fs *FSObjects) GetObjectInfo(ctx context.Context, bucket, object string, opts ObjectOptions) (oi ObjectInfo, e error) {
 	if opts.VersionID != "" && opts.VersionID != nullVersionID {
@@ -849,7 +863,6 @@ func (fs *FSObjects) putObject(ctx context.Context, bucket string, object string
 		return fi.ToObjectInfo(bucket, object), nil
 	}
 
-	// TODO: Locking on meta file removed from this level -> correct behaviour?
 	// Check if an object is present as one of the parent dir.
 	if fs.parentDirIsObject(ctx, bucket, path.Dir(object)) {
 		return ObjectInfo{}, toObjectErr(errFileParentIsFile, bucket, object)
@@ -1264,7 +1277,6 @@ func (fs *FSObjects) fsListObjects(ctx context.Context, opts listPathOptions) (L
 	}
 
 	// Make sure we close the pipe so blocked writes doesn't stay around.
-	// todo - move to a pool
 	defer r.CloseWithError(context.Canceled)
 
 	go func() {
@@ -1619,7 +1631,7 @@ func (fs *FSObjects) Health(ctx context.Context, opts HealthOptions) HealthResul
 
 // ReadHealth returns "read" health of the object layer
 func (fs *FSObjects) ReadHealth(ctx context.Context) bool {
-	_, err := os.Stat(fs.disk.String())
+	err := fs.disk.CheckFile(ctx, minioMetaBucket, "")
 	return err == nil
 }
 
