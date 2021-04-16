@@ -34,22 +34,12 @@ import (
 	"github.com/minio/minio/cmd/logger"
 )
 
-func (fs *FSObjects) tmpGetUploadIDDir(bucket, object, uploadID string) string {
-	return pathJoin(fs.tmpGetMultipartSHADir(bucket, object), uploadID)
+func (fs *FSObjects) GetUploadIDDir(bucket, object, uploadID string) string {
+	return pathJoin(fs.GetMultipartSHADir(bucket, object), uploadID)
 }
 
-func (fs *FSObjects) tmpGetMultipartSHADir(bucket, object string) string {
+func (fs *FSObjects) GetMultipartSHADir(bucket, object string) string {
 	return getSHA256Hash([]byte(pathJoin(bucket, object)))
-}
-
-// Returns EXPORT/.minio.sys/multipart/SHA256/UPLOADID
-func (fs *FSObjects) getUploadIDDir(bucket, object, uploadID string) string {
-	return pathJoin(fs.disk.String(), minioMetaMultipartBucket, getSHA256Hash([]byte(pathJoin(bucket, object))), uploadID)
-}
-
-// Returns EXPORT/.minio.sys/multipart/SHA256
-func (fs *FSObjects) getMultipartSHADir(bucket, object string) string {
-	return pathJoin(fs.disk.String(), minioMetaMultipartBucket, getSHA256Hash([]byte(pathJoin(bucket, object))))
 }
 
 // Returns partNumber.etag
@@ -92,7 +82,7 @@ func (fs *FSObjects) backgroundAppend(ctx context.Context, bucket, object, uploa
 
 	// Since we append sequentially nextPartNumber will always be len(file.parts)+1
 	nextPartNumber := len(file.parts) + 1
-	uploadIDPath := fs.tmpGetUploadIDDir(bucket, object, uploadID)
+	uploadIDPath := fs.GetUploadIDDir(bucket, object, uploadID)
 
 	sort.Slice(metaFi.Parts, func(i, j int) bool { return metaFi.Parts[i].Number < metaFi.Parts[j].Number })
 
@@ -148,7 +138,7 @@ func (fs *FSObjects) ListMultipartUploads(ctx context.Context, bucket, object, k
 	result.Delimiter = delimiter
 
 	var uploadIDs []string
-	uploadIDs, err = fs.disk.ListDir(ctx, minioMetaMultipartBucket, fs.tmpGetMultipartSHADir(bucket, object), -1)
+	uploadIDs, err = fs.disk.ListDir(ctx, minioMetaMultipartBucket, fs.GetMultipartSHADir(bucket, object), -1)
 	if err != nil {
 		if err == errFileNotFound {
 			return result, nil
@@ -171,7 +161,7 @@ func (fs *FSObjects) ListMultipartUploads(ctx context.Context, bucket, object, k
 		if populatedUploadIds.Contains(uploadID) {
 			continue
 		}
-		fi, err := fs.disk.ReadVersion(ctx, minioMetaMultipartBucket, pathJoin(fs.tmpGetUploadIDDir(bucket, object, uploadID)), "", false)
+		fi, err := fs.disk.ReadVersion(ctx, minioMetaMultipartBucket, pathJoin(fs.GetUploadIDDir(bucket, object, uploadID)), "", false)
 		if err != nil {
 			return ListMultipartsInfo{}, toObjectErr(err, bucket, object)
 		}
@@ -258,7 +248,7 @@ func (fs *FSObjects) NewMultipartUpload(ctx context.Context, bucket, object stri
 	fi.Metadata = cloneMSS(opts.UserDefined)
 
 	uploadID := mustGetUUID()
-	uploadIDPath := fs.tmpGetUploadIDDir(bucket, object, uploadID)
+	uploadIDPath := fs.GetUploadIDDir(bucket, object, uploadID)
 	tempUploadIDPath := pathJoin(fs.fsUUID, uploadID)
 
 	defer func() {
@@ -358,7 +348,7 @@ func (fs *FSObjects) PutObjectPart(ctx context.Context, bucket, object, uploadID
 		return pi, toObjectErr(errInvalidArgument)
 	}
 
-	uploadIDPath := fs.tmpGetUploadIDDir(bucket, object, uploadID)
+	uploadIDPath := fs.GetUploadIDDir(bucket, object, uploadID)
 
 	// Just check if the uploadID exists to avoid copy if it doesn't.
 	fi, err := fs.disk.ReadVersion(ctx, minioMetaMultipartBucket, uploadIDPath, "", false)
@@ -461,7 +451,7 @@ func (fs *FSObjects) GetMultipartInfo(ctx context.Context, bucket, object, uploa
 		return MultipartInfo{}, toObjectErr(err, bucket)
 	}
 
-	uploadIDPath := fs.tmpGetUploadIDDir(bucket, object, uploadID)
+	uploadIDPath := fs.GetUploadIDDir(bucket, object, uploadID)
 	// Just check if the uploadID exists to avoid copy if it doesn't.
 	fi, err := fs.disk.ReadVersion(ctx, minioMetaMultipartBucket, uploadIDPath, "", false)
 	if err != nil {
@@ -501,7 +491,7 @@ func (fs *FSObjects) ListObjectParts(ctx context.Context, bucket, object, upload
 		return ListPartsInfo{}, toObjectErr(err, bucket)
 	}
 
-	uploadIDPath := fs.tmpGetUploadIDDir(bucket, object, uploadID)
+	uploadIDPath := fs.GetUploadIDDir(bucket, object, uploadID)
 
 	// Just check if the uploadID exists to avoid copy if it doesn't.
 	fi, err := fs.disk.ReadVersion(ctx, minioMetaMultipartBucket, uploadIDPath, "", false)
@@ -586,7 +576,7 @@ func (fs *FSObjects) CompleteMultipartUpload(ctx context.Context, bucket string,
 		return ObjectInfo{}, toObjectErr(err, bucket)
 	}
 
-	uploadIDPath := fs.tmpGetUploadIDDir(bucket, object, uploadID)
+	uploadIDPath := fs.GetUploadIDDir(bucket, object, uploadID)
 	// Just check if the uploadID exists to avoid copy if it doesn't.
 	fi, err := fs.disk.ReadVersion(ctx, minioMetaMultipartBucket, uploadIDPath, "", false)
 	if err != nil {
@@ -798,7 +788,7 @@ func (fs *FSObjects) AbortMultipartUpload(ctx context.Context, bucket, object, u
 		return toObjectErr(err, bucket)
 	}
 
-	uploadIDPath := fs.tmpGetUploadIDDir(bucket, object, uploadID)
+	uploadIDPath := fs.GetUploadIDDir(bucket, object, uploadID)
 
 	// Just check if the uploadID exists to avoid copy if it doesn't.
 	_, err = fs.disk.ReadVersion(ctx, minioMetaMultipartBucket, uploadIDPath, "", false)
@@ -809,6 +799,14 @@ func (fs *FSObjects) AbortMultipartUpload(ctx context.Context, bucket, object, u
 		return toObjectErr(err, bucket, object)
 	}
 
+	if err = fs.deleteUploadFiles(ctx, uploadID, uploadIDPath); err != nil {
+		return toObjectErr(err, bucket, object)
+	}
+
+	return nil
+}
+
+func (fs *FSObjects) deleteUploadFiles(ctx context.Context, uploadID string, uploadIDPath string) error {
 	fs.appendFileMapMu.Lock()
 	// Remove file in tmp folder
 	file := fs.appendFileMap[uploadID]
@@ -818,11 +816,7 @@ func (fs *FSObjects) AbortMultipartUpload(ctx context.Context, bucket, object, u
 	delete(fs.appendFileMap, uploadID)
 	fs.appendFileMapMu.Unlock()
 
-	if err = fs.disk.Delete(ctx, minioMetaMultipartBucket, uploadIDPath, true); err != nil {
-		return toObjectErr(err, bucket, object)
-	}
-
-	return nil
+	return fs.disk.Delete(ctx, minioMetaMultipartBucket, uploadIDPath, true)
 }
 
 // Removes multipart uploads if any older than `expiry` duration
@@ -862,7 +856,8 @@ func (fs *FSObjects) cleanupStaleUploads(ctx context.Context, cleanupInterval, e
 						continue
 					}
 					if now.Sub(fi.ModTime) > expiry {
-						fs.AbortMultipartUpload(ctx, fi.Volume, fi.Name, uploadID, ObjectOptions{})
+						uploadIDPath := fi.Name
+						fs.deleteUploadFiles(ctx, uploadID, uploadIDPath)
 					}
 				}
 			}
