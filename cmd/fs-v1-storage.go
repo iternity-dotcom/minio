@@ -59,6 +59,9 @@ type fsv1Storage struct {
 
 	ctx context.Context
 
+	// This value shouldn't be touched, once initialized.
+	fsFormatRlk *lock.RLockedFile // Is a read lock on `format.json`.
+
 	// FS rw pool.
 	rwPool *fsIOPool
 
@@ -158,6 +161,18 @@ func newFSV1Storage(ep Endpoint) (*fsv1Storage, error) {
 	}
 	w.Close()
 	defer Remove(filePath)
+
+	// Initialize `format.json`, this function also returns.
+	rlk, err := initFormatFS(context.TODO(), p)
+	if err != nil {
+		return nil, err
+	}
+
+	// Once the filesystem has initialized hold the read lock for
+	// the life time of the server. This is done to ensure that under
+	// shared backend mode for FS, remote servers do not migrate
+	// or cause changes on backend format.
+	p.fsFormatRlk = rlk
 
 	// Success.
 	return p, nil
@@ -1359,7 +1374,7 @@ func (s *fsv1Storage) VerifyFile(ctx context.Context, volume, path string, fi Fi
 }
 
 func (s *fsv1Storage) Close() error {
-	return nil
+	return s.fsFormatRlk.Close()
 }
 
 // isObjectDir returns true if the specified bucket & prefix exists

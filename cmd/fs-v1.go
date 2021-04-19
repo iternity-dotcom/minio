@@ -47,7 +47,6 @@ import (
 	"github.com/minio/minio/cmd/logger"
 	"github.com/minio/minio/pkg/bucket/policy"
 	"github.com/minio/minio/pkg/color"
-	"github.com/minio/minio/pkg/lock"
 	"github.com/minio/minio/pkg/madmin"
 	"github.com/minio/minio/pkg/mimedb"
 )
@@ -68,9 +67,6 @@ type FSObjects struct {
 	// Unique value to be used for all
 	// temporary transactions.
 	fsUUID string
-
-	// This value shouldn't be touched, once initialized.
-	fsFormatRlk *lock.RLockedFile // Is a read lock on `format.json`.
 
 	appendFileMap   map[string]*fsAppendFile
 	appendFileMapMu sync.Mutex
@@ -126,18 +122,6 @@ func NewFSObjectLayer(fsPath string) (ObjectLayer, error) {
 		deletedCleanupSleeper: newDynamicSleeper(10, 2*time.Second),
 	}
 
-	// Initialize `format.json`, this function also returns.
-	rlk, err := initFormatFS(ctx, disk)
-	if err != nil {
-		return nil, err
-	}
-
-	// Once the filesystem has initialized hold the read lock for
-	// the life time of the server. This is done to ensure that under
-	// shared backend mode for FS, remote servers do not migrate
-	// or cause changes on backend format.
-	fs.fsFormatRlk = rlk
-
 	go fs.cleanupStaleUploads(ctx, GlobalStaleUploadsCleanupInterval, GlobalStaleUploadsExpiry)
 
 	// cleanup ".trash/" folder every 5m minutes with sufficient sleep cycles, between each
@@ -192,8 +176,6 @@ func (fs *FSObjects) SetDriveCounts() []int {
 
 // Shutdown - should be called when process shuts down.
 func (fs *FSObjects) Shutdown(ctx context.Context) error {
-	fs.fsFormatRlk.Close()
-
 	// Cleanup and delete tmp uuid.
 	fs.disk.DeleteVol(ctx, pathJoin(minioMetaTmpBucket, fs.fsUUID), true)
 
@@ -933,9 +915,6 @@ func (fs *FSObjects) putObject(ctx context.Context, bucket string, object string
 	return fi.ToObjectInfo(bucket, object), nil
 }
 
-// deleteObject - wrapper for delete object, deletes an object from
-// all the disks in parallel, including `fs.json` associated with the
-// object.
 func (fs *FSObjects) deleteObject(ctx context.Context, bucket, object string) error {
 	var err error
 	defer ObjectPathUpdated(pathJoin(bucket, object))

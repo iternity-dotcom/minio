@@ -288,7 +288,7 @@ func formatFSGetDeploymentID(rlk *lock.RLockedFile) (id string, err error) {
 	return format.ID, nil
 }
 
-// Generate a deployment ID if one does not exist already.
+// Generate a deployment ID if a non-empty fsFormat file without deployment ID exists.
 func formatFSFixDeploymentID(ctx context.Context, fsFormatPath string) error {
 	rlk, err := lock.RLockedOpenFile(fsFormatPath)
 	if err == nil {
