@@ -118,6 +118,7 @@ func NewFSObjectLayer(fsPath string) (ObjectLayer, error) {
 	// Initialize fs objects.
 	fs := &FSObjects{
 		disk:                  disk,
+
 		nsMutex:               newNSLock(false),
 		appendFileMap:         make(map[string]*fsAppendFile),
 		deletedCleanupSleeper: newDynamicSleeper(10, 2*time.Second),
