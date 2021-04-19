@@ -45,6 +45,10 @@ import (
 	"github.com/minio/minio/pkg/env"
 )
 
+type contextKeys string
+
+const lockTypeKey contextKeys = "lockTypeKey"
+
 type fsv1Storage struct {
 	diskPath string
 	endpoint Endpoint
@@ -510,6 +514,10 @@ func (s *fsv1Storage) WriteMetadata(ctx context.Context, volume, path string, fi
 	return s.WriteAll(ctx, volume, pathJoin(path, fsMetaJSONFile), buf)
 }
 
+func (s *fsv1Storage) UpdateMetadata(ctx context.Context, volume, path string, fi FileInfo) error {
+	return NotImplemented{}
+}
+
 func (s *fsv1Storage) DeleteVersion(ctx context.Context, volume, path string, fi FileInfo, forceDelMarker bool) error {
 	if HasSuffix(path, SlashSeparator) {
 		return s.Delete(ctx, volume, path, false)
@@ -742,18 +750,18 @@ func openFile(filePath string, mode int) (f *os.File, err error) {
 	return w, nil
 }
 
-type StatReadSeekCloser interface {
+type statReadSeekCloser interface {
 	io.ReadSeekCloser
 	Stat() (fs.FileInfo, error)
 }
 
-type StatReadWriteSeekCloser interface {
+type statReadWriteSeekCloser interface {
 	io.ReadWriteCloser
 	io.Seeker
 	Stat() (fs.FileInfo, error)
 }
 
-func (s *fsv1Storage) getOptionalMetaReadLock(ctx context.Context, lockType LockType, volume, path string) (StatReadSeekCloser, func(), error) {
+func (s *fsv1Storage) getOptionalMetaReadLock(ctx context.Context, lockType LockType, volume, path string) (statReadSeekCloser, func(), error) {
 	volDir, err := s.getVolDir(minioMetaBucket)
 	if err != nil {
 		return nil, func() {}, err
@@ -787,7 +795,7 @@ func (s *fsv1Storage) getOptionalMetaReadLock(ctx context.Context, lockType Lock
 	}, nil
 }
 
-func (s *fsv1Storage) getMetaWriteLock(ctx context.Context, volume, path string) (StatReadWriteSeekCloser, func(), func(), error) {
+func (s *fsv1Storage) getMetaWriteLock(ctx context.Context, volume, path string) (statReadWriteSeekCloser, func(), func(), error) {
 	volDir, err := s.getVolDir(minioMetaBucket)
 	if err != nil {
 		return nil, func() {}, func() {}, err
@@ -825,10 +833,8 @@ func (s *fsv1Storage) getMetaWriteLock(ctx context.Context, volume, path string)
 func (s *fsv1Storage) ReadVersion(ctx context.Context, volume, path, versionID string, readData bool) (fi FileInfo, err error) {
 	if volume == minioMetaMultipartBucket {
 		return s.readMultipartVersion(ctx, volume, path, versionID)
-	} else {
-		return s.readObjectVersion(ctx, volume, path, versionID, readData)
 	}
-
+	return s.readObjectVersion(ctx, volume, path, versionID, readData)
 }
 
 func (s *fsv1Storage) readObjectVersion(ctx context.Context, volume, path, versionID string, readData bool) (fi FileInfo, err error) {
@@ -1541,7 +1547,3 @@ func (s *fsv1Storage) SetDiskLoc(poolIdx, setIdx, diskIdx int) {
 	s.setIndex = setIdx
 	s.diskIndex = diskIdx
 }
-
-type ContextKeys string
-
-const lockTypeKey ContextKeys = "lockTypeKey"

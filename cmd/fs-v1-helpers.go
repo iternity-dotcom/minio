@@ -320,6 +320,32 @@ func fsCreateFile(ctx context.Context, filePath string, reader io.Reader, falloc
 	return bytesWritten, nil
 }
 
+// fsFAllocate is similar to Fallocate but provides a convenient
+// wrapper to handle various operating system specific errors.
+func fsFAllocate(fd int, offset int64, len int64) (err error) {
+	e := Fallocate(fd, offset, len)
+	if e != nil {
+		switch {
+		case isSysErrNoSpace(e):
+			err = errDiskFull
+		case isSysErrNoSys(e) || isSysErrOpNotSupported(e):
+			// Ignore errors when Fallocate is not supported in the current system
+		case isSysErrInvalidArg(e):
+			// Workaround for Windows Docker Engine 19.03.8.
+			// See https://github.com/minio/minio/issues/9726
+		case isSysErrIO(e):
+			err = e
+		default:
+			// For errors: EBADF, EINTR, EINVAL, ENODEV, EPERM, ESPIPE  and ETXTBSY
+			// Appending was failed anyway, returns unexpected error
+			err = errUnexpected
+		}
+		return err
+	}
+
+	return nil
+}
+
 // Renames source path to destination path, fails if the destination path
 // parents are not already created.
 func fsSimpleRenameFile(ctx context.Context, sourcePath, destPath string) error {

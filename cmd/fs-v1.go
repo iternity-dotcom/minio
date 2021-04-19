@@ -22,9 +22,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/minio/minio-go/v7/pkg/set"
-	"github.com/minio/minio/pkg/bucket/replication"
-	"github.com/minio/minio/pkg/env"
 	"io"
 	"net/http"
 	"os"
@@ -35,6 +32,10 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/minio/minio-go/v7/pkg/set"
+	"github.com/minio/minio/pkg/bucket/replication"
+	"github.com/minio/minio/pkg/env"
 
 	"github.com/minio/minio/pkg/bucket/lifecycle"
 
@@ -83,8 +84,8 @@ type FSObjects struct {
 // Represents the background append file.
 type fsAppendFile struct {
 	sync.Mutex
-	parts    []int      // List of parts appended.
-	filePath string     // Absolute path of the file in the temp location.
+	parts    []int  // List of parts appended.
+	filePath string // Absolute path of the file in the temp location.
 }
 
 // NewFSObjectLayer - initialize new fs object layer.
@@ -118,10 +119,10 @@ func NewFSObjectLayer(fsPath string) (ObjectLayer, error) {
 
 	// Initialize fs objects.
 	fs := &FSObjects{
-		disk:   disk,
-		fsUUID: diskID,
-		nsMutex:       newNSLock(false),
-		appendFileMap: make(map[string]*fsAppendFile),
+		disk:                  disk,
+		fsUUID:                diskID,
+		nsMutex:               newNSLock(false),
+		appendFileMap:         make(map[string]*fsAppendFile),
 		deletedCleanupSleeper: newDynamicSleeper(10, 2*time.Second),
 	}
 
@@ -952,7 +953,6 @@ func (fs *FSObjects) deleteObject(ctx context.Context, bucket, object string) er
 	return fs.disk.Delete(ctx, minioMetaTmpBucket, tmpObj, true)
 }
 
-
 // DeleteObjects - deletes an object from a bucket, this operation is destructive
 // and there are no rollbacks supported.
 func (fs *FSObjects) DeleteObjects(ctx context.Context, bucket string, objects []ObjectToDelete, opts ObjectOptions) ([]DeletedObject, []error) {
@@ -1028,7 +1028,6 @@ func (fs *FSObjects) DeleteObjects(ctx context.Context, bucket string, objects [
 	delObjErrs := fs.disk.DeleteVersions(ctx, bucket, versions)
 
 	// Reduce errors for each object
-
 
 	for objIndex := range objects {
 		verIdx := objIdxToVerIdx[objIndex]
