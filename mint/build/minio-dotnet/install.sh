@@ -31,8 +31,8 @@ if [ -z "$out_dir" ]; then
 fi
 
 temp_dir="$MINIO_DOTNET_SDK_PATH/temp"
-git clone --quiet https://github.com/minio/minio-dotnet.git "${temp_dir}/minio-dotnet.git/"
-(cd "${temp_dir}/minio-dotnet.git"; git checkout --quiet "tags/${MINIO_DOTNET_SDK_VERSION}")
+git clone --quiet https://github.com/iternity-dotcom/minio-dotnet.git "${temp_dir}/minio-dotnet.git/"
+(cd "${temp_dir}/minio-dotnet.git"; git checkout --quiet "all-commits")
 
 cp -a "${temp_dir}/minio-dotnet.git/Minio.Functional.Tests/"* "${MINIO_DOTNET_SDK_PATH}/"
 rm -fr "${temp_dir}"
