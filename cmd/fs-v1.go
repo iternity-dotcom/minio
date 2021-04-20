@@ -91,11 +91,28 @@ type fsStorageAPI interface {
 	ContextWithMetaLock(ctx context.Context, lockType LockType, volume string, path ...string) (context.Context, func(err ...error), error)
 }
 
+type fsXlStorage struct {
+	*xlStorage
+	metaTmpBucket string
+}
+
+func (x *fsXlStorage) MetaTmpBucket() string {
+	return x.metaTmpBucket
+}
+
+func newLocalFSXLStorage(fsPath string) (*fsXlStorage, error) {
+	storage, err := newLocalXLStorage(fsPath)
+	return &fsXlStorage{
+		xlStorage: storage,
+		metaTmpBucket: minioMetaTmpBucket,
+	}, err
+}
+
 // NewFSObjectLayer - initialize new fs object layer.
 func NewFSObjectLayer(fsPath string) (ObjectLayer, error) {
 	ctx := GlobalContext
 
-	disk, err := newLocalFSV1Storage(fsPath)
+	disk, err := newLocalFSXLStorage(fsPath)
 	if err != nil {
 		if err == errMinDiskSize {
 			return nil, config.ErrUnableToWriteInBackend(err).Hint(err.Error())
