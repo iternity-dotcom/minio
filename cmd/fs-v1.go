@@ -22,6 +22,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/minio/minio/pkg/lock"
 	"io"
 	"net/http"
 	"os"
@@ -59,15 +60,13 @@ type FSObjects struct {
 	GatewayUnsupported
 
 	// The storage backend behind this object layer
-	disk StorageAPI
+	disk fsStorageAPI
 
 	// The count of concurrent calls on FSObjects API
 	activeIOCount int64
 
-	// Unique value to be used for all
-	// temporary transactions.
-	fsUUID string
-
+	// This value shouldn't be touched, once initialized.
+	fsFormatRlk *lock.RLockedFile // Is a read lock on `format.json`.
 	appendFileMap   map[string]*fsAppendFile
 	appendFileMapMu sync.Mutex
 
@@ -82,6 +81,11 @@ type fsAppendFile struct {
 	sync.Mutex
 	parts    []int  // List of parts appended.
 	filePath string // Absolute path of the file in the temp location.
+}
+
+type fsStorageAPI interface {
+	MetaTmpBucket() string
+	StorageAPI
 }
 
 // NewFSObjectLayer - initialize new fs object layer.
@@ -108,19 +112,26 @@ func NewFSObjectLayer(fsPath string) (ObjectLayer, error) {
 		return nil, err
 	}
 
-	diskID, err := disk.GetDiskID()
-	if err != nil {
-		return nil, err
-	}
 
 	// Initialize fs objects.
 	fs := &FSObjects{
 		disk:                  disk,
-		fsUUID:                diskID,
 		nsMutex:               newNSLock(false),
 		appendFileMap:         make(map[string]*fsAppendFile),
 		deletedCleanupSleeper: newDynamicSleeper(10, 2*time.Second),
 	}
+
+	// Initialize `format.json`, this function also returns.
+	rlk, err := initFormatFS(ctx, disk)
+	if err != nil {
+		return nil, err
+	}
+
+	// Once the filesystem has initialized hold the read lock for
+	// the life time of the server. This is done to ensure that under
+	// shared backend mode for FS, remote servers do not migrate
+	// or cause changes on backend format.
+	fs.fsFormatRlk = rlk
 
 	go fs.cleanupStaleUploads(ctx, GlobalStaleUploadsCleanupInterval, GlobalStaleUploadsExpiry)
 
@@ -174,10 +185,14 @@ func (fs *FSObjects) SetDriveCounts() []int {
 	return nil
 }
 
+func (fs *FSObjects) metaTmpBucket() string {
+	return fs.disk.MetaTmpBucket()
+}
 // Shutdown - should be called when process shuts down.
 func (fs *FSObjects) Shutdown(ctx context.Context) error {
+	fs.fsFormatRlk.Close()
 	// Cleanup and delete tmp uuid.
-	fs.disk.DeleteVol(ctx, pathJoin(minioMetaTmpBucket, fs.fsUUID), true)
+	fs.disk.DeleteVol(ctx, fs.metaTmpBucket(), true)
 
 	return fs.disk.Close()
 }
@@ -558,15 +573,15 @@ func (fs *FSObjects) updateMetaObject(ctx context.Context, bucket, object string
 	tempObj := mustGetUUID()
 
 	defer func() {
-		fs.deleteObject(context.Background(), minioMetaTmpBucket, tempObj)
+		fs.deleteObject(context.Background(), fs.metaTmpBucket(), tempObj)
 	}()
 
-	if err = fs.disk.WriteMetadata(ctx, minioMetaTmpBucket, tempObj, fi); err != nil {
+	if err = fs.disk.WriteMetadata(ctx, fs.metaTmpBucket(), tempObj, fi); err != nil {
 		return ObjectInfo{}, toObjectErr(err, bucket, object)
 	}
 
 	// Atomically rename metadata from tmp location to destination for each disk.
-	if err = fs.disk.RenameData(ctx, minioMetaTmpBucket, tempObj, "", bucket, object); err != nil {
+	if err = fs.disk.RenameData(ctx, fs.metaTmpBucket(), tempObj, "", bucket, object); err != nil {
 		return ObjectInfo{}, toObjectErr(err, bucket, object)
 	}
 
@@ -858,13 +873,13 @@ func (fs *FSObjects) putObject(ctx context.Context, bucket string, object string
 	// failure. If PutObject succeeds, then there would be
 	// nothing to delete.
 	defer func() {
-		fs.deleteObject(context.Background(), minioMetaTmpBucket, pathJoin(fs.fsUUID, tempObjFolder))
+		fs.deleteObject(context.Background(), fs.metaTmpBucket(), tempObjFolder)
 	}()
 
 	// Uploaded object will first be written to the temporary location which will eventually
 	// be renamed to the actual location. It is first written to the temporary location
 	// so that cleaning it up will be easy if the server goes down.
-	err = fs.disk.CreateFile(ctx, minioMetaTmpBucket, pathJoin(fs.fsUUID, tempObjFolder, fi.DataDir, partName), data.Size(), data)
+	err = fs.disk.CreateFile(ctx, fs.metaTmpBucket(), pathJoin(tempObjFolder, fi.DataDir, partName), data.Size(), data)
 	if err != nil {
 		// Should return IncompleteBody{} error when reader has fewer
 		// bytes than specified in request header.
@@ -893,14 +908,14 @@ func (fs *FSObjects) putObject(ctx context.Context, bucket string, object string
 	fi.Size = data.Size()
 	fi.ModTime = modTime
 
-	if err = fs.disk.WriteMetadata(ctx, minioMetaTmpBucket, pathJoin(fs.fsUUID, tempObjFolder), fi); err != nil {
+	if err = fs.disk.WriteMetadata(ctx, fs.metaTmpBucket(), pathJoin(tempObjFolder), fi); err != nil {
 		return ObjectInfo{}, toObjectErr(err, bucket, object)
 	}
 
 	// rename
-	defer ObjectPathUpdated(pathJoin(minioMetaTmpBucket, pathJoin(fs.fsUUID, tempObjFolder)))
+	defer ObjectPathUpdated(pathJoin(fs.metaTmpBucket(), pathJoin(tempObjFolder)))
 	defer ObjectPathUpdated(pathJoin(bucket, object))
-	err = fs.disk.RenameData(ctx, minioMetaTmpBucket, pathJoin(fs.fsUUID, tempObjFolder), fi.DataDir, bucket, object)
+	err = fs.disk.RenameData(ctx, fs.metaTmpBucket(), pathJoin(tempObjFolder), fi.DataDir, bucket, object)
 
 	if err != nil {
 		return ObjectInfo{}, toObjectErr(err, bucket, object)
@@ -920,16 +935,16 @@ func (fs *FSObjects) deleteObject(ctx context.Context, bucket, object string) er
 	defer ObjectPathUpdated(pathJoin(bucket, object))
 
 	tmpObj := mustGetUUID()
-	if bucket == minioMetaTmpBucket {
+	if bucket == fs.metaTmpBucket() {
 		tmpObj = object
 	} else {
-		err = fs.disk.RenameFile(ctx, bucket, object, minioMetaTmpBucket, tmpObj)
+		err = fs.disk.RenameFile(ctx, bucket, object, fs.metaTmpBucket(), tmpObj)
 		if err != nil {
 			return toObjectErr(err, bucket, object)
 		}
 	}
 
-	return fs.disk.Delete(ctx, minioMetaTmpBucket, tmpObj, true)
+	return fs.disk.Delete(ctx, fs.metaTmpBucket(), tmpObj, true)
 }
 
 // DeleteObjects - deletes an object from a bucket, this operation is destructive
@@ -1438,12 +1453,12 @@ func (fs *FSObjects) PutObjectTags(ctx context.Context, bucket, object string, t
 
 	tempObj := mustGetUUID()
 
-	if err = fs.disk.WriteMetadata(ctx, minioMetaTmpBucket, tempObj, fi); err != nil {
+	if err = fs.disk.WriteMetadata(ctx, fs.metaTmpBucket(), tempObj, fi); err != nil {
 		return ObjectInfo{}, toObjectErr(err, bucket, object)
 	}
 
 	// Atomically rename metadata from tmp location to destination for each disk.
-	if err = fs.disk.RenameData(ctx, minioMetaTmpBucket, tempObj, "", bucket, object); err != nil {
+	if err = fs.disk.RenameData(ctx, fs.metaTmpBucket(), tempObj, "", bucket, object); err != nil {
 		return ObjectInfo{}, toObjectErr(err, bucket, object)
 	}
 

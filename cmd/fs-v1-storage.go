@@ -53,14 +53,12 @@ type fsv1Storage struct {
 	diskPath string
 	endpoint Endpoint
 
-	diskID        string
 	rootDisk      bool
 	diskInfoCache timedValue
 
 	ctx context.Context
 
-	// This value shouldn't be touched, once initialized.
-	fsFormatRlk *lock.RLockedFile // Is a read lock on `format.json`.
+	metaTmpBucket string
 
 	// FS rw pool.
 	rwPool *fsIOPool
@@ -122,15 +120,16 @@ func newFSV1Storage(ep Endpoint) (*fsv1Storage, error) {
 		}
 	}
 
-	// Assign a new UUID for FS minio mode. Each server instance
-	// gets its own UUID for temporary file transaction.
-	diskID := mustGetUUID()
 	p := &fsv1Storage{
 		diskPath: path,
+
+		// Assign a new UUID for FS minio mode. Each server instance
+		// gets its own UUID for temporary file transaction.
+		metaTmpBucket: pathJoin(minioMetaTmpBucket, mustGetUUID()),
+
 		endpoint: ep,
 		ctx:      GlobalContext,
 		rootDisk: rootDisk,
-		diskID:   diskID,
 		rwPool: &fsIOPool{
 			readersMap: make(map[string]*lock.RLockedFile),
 		},
@@ -139,10 +138,8 @@ func newFSV1Storage(ep Endpoint) (*fsv1Storage, error) {
 		diskIndex: -1,
 	}
 
-	metaTmpPath := pathJoin(minioMetaTmpBucket, diskID)
-
 	// Create all necessary bucket folders if possible.
-	if err = p.MakeVolBulk(context.TODO(), minioMetaBucket, metaTmpPath, minioMetaMultipartBucket, dataUsageBucket); err != nil {
+	if err = p.MakeVolBulk(context.TODO(), minioMetaBucket, p.metaTmpBucket, minioMetaMultipartBucket, dataUsageBucket); err != nil {
 		return nil, err
 	}
 
@@ -150,7 +147,7 @@ func newFSV1Storage(ep Endpoint) (*fsv1Storage, error) {
 	var rnd [8]byte
 	_, _ = rand.Read(rnd[:])
 	tmpFile := ".writable-check-" + hex.EncodeToString(rnd[:]) + ".tmp"
-	filePath := pathJoin(p.diskPath, metaTmpPath, tmpFile)
+	filePath := pathJoin(p.diskPath, p.metaTmpBucket, tmpFile)
 	w, err := disk.OpenFileDirectIO(filePath, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0666)
 	if err != nil {
 		return p, err
@@ -162,22 +159,14 @@ func newFSV1Storage(ep Endpoint) (*fsv1Storage, error) {
 	w.Close()
 	defer Remove(filePath)
 
-	// Initialize `format.json`, this function also returns.
-	rlk, err := initFormatFS(context.TODO(), p)
-	if err != nil {
-		return nil, err
-	}
-
-	// Once the filesystem has initialized hold the read lock for
-	// the life time of the server. This is done to ensure that under
-	// shared backend mode for FS, remote servers do not migrate
-	// or cause changes on backend format.
-	p.fsFormatRlk = rlk
 
 	// Success.
 	return p, nil
 }
 
+func (s *fsv1Storage) MetaTmpBucket() string {
+	return s.metaTmpBucket
+}
 func (s *fsv1Storage) String() string {
 	return s.diskPath
 }
@@ -207,7 +196,7 @@ func (s *fsv1Storage) CrawlAndGetDataUsage(ctx context.Context, cache dataUsageC
 }
 
 func (s *fsv1Storage) GetDiskID() (string, error) {
-	return s.diskID, nil
+	return "", nil
 }
 
 func (s *fsv1Storage) SetDiskID(id string) {
@@ -369,11 +358,11 @@ func (s *fsv1Storage) DeleteVol(ctx context.Context, volume string, forceDelete 
 	}
 
 	if forceDelete {
-		if isMinioMetaBucketName(volume) || HasPrefix(volume, minioMetaBucket) {
+		if isMinioMetaBucketName(volume) || volume == s.metaTmpBucket || HasPrefix(volume, minioMetaBucket) {
 			err = os.RemoveAll(volumeDir)
 		} else {
 			var delDir string
-			delBucket := pathJoin(minioMetaTmpBucket, volume+"."+mustGetUUID())
+			delBucket := pathJoin(s.metaTmpBucket, volume+"."+mustGetUUID())
 			// move to a temporary directory and delete afterwards (move to deletefiles probably)
 			if delDir, err = s.getVolDir(delBucket); err != nil {
 				return err
@@ -451,7 +440,7 @@ func (s *fsv1Storage) CreateFile(ctx context.Context, volume, path string, fileS
 	parentFilePath := pathutil.Dir(filePath)
 	defer func() {
 		if err != nil {
-			if volume == minioMetaTmpBucket {
+			if volume == s.metaTmpBucket {
 				_ = removeAll(parentFilePath)
 			}
 		}
@@ -769,38 +758,6 @@ func (s *fsv1Storage) getOptionalMetaReadLock(ctx context.Context, lockType Lock
 	return rlk, func() {
 		s.rwPool.Close(fsMetaPath)
 	}, nil
-}
-
-func (s *fsv1Storage) getMetaWriteLock(ctx context.Context, volume, path string) (statReadWriteSeekCloser, func(), func(), error) {
-	volDir, err := s.getVolDir(minioMetaBucket)
-	if err != nil {
-		return nil, func() {}, func() {}, err
-	}
-
-	var fsMetaPath string
-	if volume == minioMetaBucket {
-		fsMetaPath = pathJoin(volDir, path)
-	} else {
-		fsMetaPath = pathJoin(volDir, bucketMetaPrefix, volume, path, fsMetaJSONFile)
-	}
-
-	cleanUp := func() {}
-	rlk, err := s.rwPool.Write(fsMetaPath)
-	if err != nil {
-		rlk, err = s.rwPool.Create(fsMetaPath)
-		if err != nil {
-			logger.LogIf(ctx, err)
-			return nil, func() {}, cleanUp, err
-		}
-
-		cleanUp = func() { // TODO: we create an empty meta file just for locking, the caller should delete this file if the caller function fails...
-			tmpDir := pathJoin(s.String(), minioMetaTmpBucket, s.diskID)
-			fsRemoveMeta(ctx, pathJoin(volDir, bucketMetaPrefix), fsMetaPath, tmpDir)
-		}
-	}
-	return rlk, func() {
-		s.rwPool.Close(fsMetaPath)
-	}, cleanUp, nil
 }
 
 // ReadVersion - reads metadata and returns FileInfo at path `fs.json`
@@ -1309,7 +1266,7 @@ func (s *fsv1Storage) RenameFile(ctx context.Context, srcVolume, srcPath, dstVol
 		return osErrToFileErr(err)
 	}
 
-	if !HasPrefix(srcVolume, minioMetaBucket) && dstVolume == minioMetaTmpBucket {
+	if !HasPrefix(srcVolume, minioMetaBucket) && dstVolume == s.metaTmpBucket {
 		metaVolumeDir, err := s.getVolDir(minioMetaBucket)
 		if err != nil {
 			return err
@@ -1335,7 +1292,7 @@ func (s *fsv1Storage) VerifyFile(ctx context.Context, volume, path string, fi Fi
 }
 
 func (s *fsv1Storage) Close() error {
-	return s.fsFormatRlk.Close()
+	return nil
 }
 
 // isObjectDir returns true if the specified bucket & prefix exists
