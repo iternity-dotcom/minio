@@ -100,6 +100,10 @@ func (x *fsXlStorage) MetaTmpBucket() string {
 	return x.metaTmpBucket
 }
 
+func (x *fsXlStorage) CacheEntriesToObjInfos(cacheEntries metaCacheEntriesSorted, opts listPathOptions) []ObjectInfo {
+	return cacheEntries.fileInfos(opts.Bucket, opts.Prefix, opts.Separator)
+}
+
 func newLocalFSXLStorage(fsPath string) (*fsXlStorage, error) {
 	storage, err := newLocalXLStorage(fsPath)
 	return &fsXlStorage{
