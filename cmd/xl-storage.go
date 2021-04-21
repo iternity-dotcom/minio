@@ -1700,7 +1700,7 @@ func (s *xlStorage) CheckFile(ctx context.Context, volume string, path string) e
 		if st == nil {
 
 			if !formatLegacy {
-				return errPathNotFound
+				return checkFile(pathutil.Dir(p))
 			}
 
 			filePathOld := pathJoin(volumeDir, p, xlStorageFormatFileV1)
@@ -1710,7 +1710,7 @@ func (s *xlStorage) CheckFile(ctx context.Context, volume string, path string) e
 
 			st, _ = Lstat(filePathOld)
 			if st == nil {
-				return errPathNotFound
+				return checkFile(pathutil.Dir(p))
 			}
 		}
 

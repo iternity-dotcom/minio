@@ -164,6 +164,14 @@ func newFSV1Storage(ep Endpoint) (*fsv1Storage, error) {
 	return p, nil
 }
 
+func (s *fsv1Storage) CacheEntriesToObjInfos(cacheEntries metaCacheEntriesSorted, opts listPathOptions) []ObjectInfo {
+	return cacheEntries.objectInfos(opts.Bucket, opts.Prefix, opts.Separator, func(objectInfoBuf []byte) (ObjectInfo, error) {
+		oi := ObjectInfo{}
+		var json = jsoniter.ConfigCompatibleWithStandardLibrary
+		err := json.Unmarshal(objectInfoBuf, &oi)
+		return oi, err
+	})
+}
 func (s *fsv1Storage) MetaTmpBucket() string {
 	return s.metaTmpBucket
 }

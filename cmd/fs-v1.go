@@ -85,6 +85,7 @@ type fsAppendFile struct {
 
 type fsStorageAPI interface {
 	MetaTmpBucket() string
+	CacheEntriesToObjInfos(cacheEntries metaCacheEntriesSorted, opts listPathOptions) []ObjectInfo
 	StorageAPI
 }
 
@@ -676,9 +677,13 @@ func (fs *FSObjects) GetObjectNInfo(ctx context.Context, bucket, object string, 
 		return nil, err
 	}
 
+	objectPath := object
+	if fi.DataDir != "" {
+		objectPath = pathJoin(object, fi.DataDir, "part.1")
+	}
 	// Read the object, doesn't exist returns an s3 compatible error.
 	ctxWithLockType := context.WithValue(ctx, lockTypeKey, lockType)
-	readCloser, err := fs.disk.ReadFileStream(ctxWithLockType, bucket, object, off, length)
+	readCloser, err := fs.disk.ReadFileStream(ctxWithLockType, bucket, objectPath, off, length)
 	if err != nil {
 		nsUnlocker()
 		return nil, toObjectErr(err, bucket, object)
@@ -843,15 +848,16 @@ func (fs *FSObjects) putObject(ctx context.Context, bucket string, object string
 		Metadata: cloneMSS(opts.UserDefined),
 	}
 
+	// Check if an object is present as one of the parent dir.
+	if fs.parentDirIsObject(ctx, bucket, path.Dir(object)) {
+		return ObjectInfo{}, toObjectErr(errFileParentIsFile, bucket, object)
+	}
 	// This is a special case with size as '0' and object ends
 	// with a slash separator, we treat it like a valid operation
 	// and return success.
 	if isObjectDir(object, data.Size()) {
-		// Check if an object is present as one of the parent dir.
-		if fs.parentDirIsObject(ctx, bucket, path.Dir(object)) {
-			return ObjectInfo{}, toObjectErr(errFileParentIsFile, bucket, object)
-		}
-		if err = mkdirAll(pathJoin(fs.disk.String(), bucket, object), 0777); err != nil {
+		err = fs.disk.MakeVol(ctx, pathJoin(bucket, object))
+		if err != nil && err != errVolumeExists {
 			logger.LogIf(ctx, err)
 			return ObjectInfo{}, toObjectErr(err, bucket, object)
 		}
@@ -859,11 +865,6 @@ func (fs *FSObjects) putObject(ctx context.Context, bucket string, object string
 			return ObjectInfo{}, toObjectErr(err, bucket, object)
 		}
 		return fi.ToObjectInfo(bucket, object), nil
-	}
-
-	// Check if an object is present as one of the parent dir.
-	if fs.parentDirIsObject(ctx, bucket, path.Dir(object)) {
-		return ObjectInfo{}, toObjectErr(errFileParentIsFile, bucket, object)
 	}
 
 	fi.DataDir = mustGetUUID()
@@ -1311,14 +1312,9 @@ func (fs *FSObjects) fsListObjects(ctx context.Context, opts listPathOptions) (L
 		entries.o = entries.o[1:]
 	}
 
-	objInfoFound := entries.objectInfos(opts.Bucket, opts.Prefix, opts.Separator, func(objectInfoBuf []byte) (ObjectInfo, error) {
-		oi := ObjectInfo{}
-		var json = jsoniter.ConfigCompatibleWithStandardLibrary
-		err := json.Unmarshal(objectInfoBuf, &oi)
-		return oi, err
-	})
+	objInfos := fs.disk.CacheEntriesToObjInfos(entries, opts)
 
-	for _, objInfo := range objInfoFound {
+	for _, objInfo := range objInfos {
 		if objInfo.IsDir && opts.Separator != "" {
 			result.Prefixes = append(result.Prefixes, objInfo.Name)
 			continue
@@ -1328,8 +1324,8 @@ func (fs *FSObjects) fsListObjects(ctx context.Context, opts listPathOptions) (L
 
 	if !eof {
 		result.IsTruncated = true
-		if len(objInfoFound) > 0 {
-			result.NextMarker = objInfoFound[len(objInfoFound)-1].Name
+		if len(objInfos) > 0 {
+			result.NextMarker = objInfos[len(objInfos)-1].Name
 		}
 	}
 
