@@ -22,7 +22,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/minio/minio/pkg/lock"
 	"io"
 	"net/http"
 	"os"
@@ -84,9 +83,10 @@ type fsAppendFile struct {
 }
 
 type fsStorageAPI interface {
+	StorageAPI
 	MetaTmpBucket() string
 	CacheEntriesToObjInfos(cacheEntries metaCacheEntriesSorted, opts listPathOptions) []ObjectInfo
-	StorageAPI
+	ContextWithMetaLock(ctx context.Context, volume string, path string, lockType LockType) (context.Context, func(err error), error)
 }
 
 // NewFSObjectLayer - initialize new fs object layer.
@@ -472,9 +472,9 @@ func (fs *FSObjects) DeleteBucket(ctx context.Context, bucket string, forceDelet
 // CopyObject - copy object source object to destination object.
 // if source object and destination object are same we only
 // update metadata.
-func (fs *FSObjects) CopyObject(ctx context.Context, srcBucket, srcObject, dstBucket, dstObject string, srcInfo ObjectInfo, srcOpts, dstOpts ObjectOptions) (oi ObjectInfo, err error) {
+func (fs *FSObjects) CopyObject(ctx context.Context, srcBucket, srcObject, dstBucket, dstObject string, srcInfo ObjectInfo, srcOpts, dstOpts ObjectOptions) (ObjectInfo, error) {
 	if srcOpts.VersionID != "" && srcOpts.VersionID != nullVersionID {
-		return oi, VersionNotFound{
+		return ObjectInfo{}, VersionNotFound{
 			Bucket:    srcBucket,
 			Object:    srcObject,
 			VersionID: srcOpts.VersionID,
@@ -489,7 +489,7 @@ func (fs *FSObjects) CopyObject(ctx context.Context, srcBucket, srcObject, dstBu
 	}()
 
 	if _, err := fs.disk.StatVol(ctx, srcBucket); err != nil {
-		return oi, toObjectErr(err, srcBucket)
+		return ObjectInfo{}, toObjectErr(err, srcBucket)
 	}
 
 	if cpSrcDstSame && srcInfo.metadataOnly {
@@ -524,31 +524,42 @@ func (fs *FSObjects) CopyObject(ctx context.Context, srcBucket, srcObject, dstBu
 	return fs.PutObject(ctx, dstBucket, dstObject, srcInfo.PutObjReader, putOpts)
 }
 
-func (fs *FSObjects) updateMetaObject(ctx context.Context, bucket, object string, info ObjectInfo, srcOpts, dstOpts ObjectOptions) (oi ObjectInfo, err error) {
+func (fs *FSObjects) updateMetaObject(ctx context.Context, bucket, object string, info ObjectInfo, srcOpts, dstOpts ObjectOptions) (ObjectInfo, error) {
 	// This call shouldn't be used for anything other than metadata updates or adding self referential versions.
 	if !info.metadataOnly {
-		return oi, NotImplemented{}
+		return ObjectInfo{}, NotImplemented{}
 	}
 
 	defer ObjectPathUpdated(pathJoin(bucket, object))
 
 	lk := fs.NewNSLock(bucket, object)
-	ctx, err = lk.GetLock(ctx, globalOperationTimeout)
+	ctx, err := lk.GetLock(ctx, globalOperationTimeout)
 	if err != nil {
-		return oi, err
+		return ObjectInfo{}, err
 	}
 	defer lk.Unlock()
 
-	fi, err := fs.disk.ReadVersion(ctx, bucket, object, srcOpts.VersionID, false)
+	ctx, cleanup, err := fs.disk.ContextWithMetaLock(ctx, bucket, object, writeLock)
 	if err != nil {
-		return oi, toObjectErr(err, bucket, object)
+		return ObjectInfo{}, toObjectErr(err, bucket, object)
+	}
+
+	defer func() {
+		cleanup(err)
+	}()
+	var fi FileInfo
+	fi, err = fs.disk.ReadVersion(ctx, bucket, object, srcOpts.VersionID, false)
+	if err != nil {
+		return ObjectInfo{}, toObjectErr(err, bucket, object)
 	}
 
 	if fi.Deleted {
 		if srcOpts.VersionID == "" {
-			return oi, toObjectErr(errFileNotFound, bucket, object)
+			err = errFileNotFound
+			return ObjectInfo{}, toObjectErr(err, bucket, object)
 		}
-		return fi.ToObjectInfo(bucket, object), toObjectErr(errMethodNotAllowed, bucket, object)
+		err = errMethodNotAllowed
+		return fi.ToObjectInfo(bucket, object), toObjectErr(err, bucket, object)
 	}
 
 	modTime := fi.ModTime
@@ -591,7 +602,9 @@ func (fs *FSObjects) updateMetaObject(ctx context.Context, bucket, object string
 
 // GetObjectNInfo - returns object info and a reader for object
 // content.
-func (fs *FSObjects) GetObjectNInfo(ctx context.Context, bucket, object string, rs *HTTPRangeSpec, h http.Header, lockType LockType, opts ObjectOptions) (gr *GetObjectReader, err error) {
+func (fs *FSObjects) GetObjectNInfo(ctx context.Context, bucket, object string, rs *HTTPRangeSpec, h http.Header, lockType LockType, opts ObjectOptions) (*GetObjectReader, error) {
+	var cleanup func(error)
+	var err error
 	if opts.VersionID != "" && opts.VersionID != nullVersionID {
 		return nil, VersionNotFound{
 			Bucket:    bucket,
@@ -614,28 +627,38 @@ func (fs *FSObjects) GetObjectNInfo(ctx context.Context, bucket, object string, 
 
 	var nsUnlocker = func() {}
 
-	if lockType != noLock {
+	switch lockType {
+	case writeLock:
 		// Lock the object before reading.
 		lock := fs.NewNSLock(bucket, object)
-		switch lockType {
-		case writeLock:
-			ctx, err = lock.GetLock(ctx, globalOperationTimeout)
-			if err != nil {
-				return nil, err
-			}
-			nsUnlocker = lock.Unlock
-		case readLock:
-			ctx, err = lock.GetRLock(ctx, globalOperationTimeout)
-			if err != nil {
-				return nil, err
-			}
-			nsUnlocker = lock.RUnlock
+		ctx, err = lock.GetLock(ctx, globalOperationTimeout)
+		if err != nil {
+			return nil, err
 		}
+		nsUnlocker = lock.Unlock
+	case readLock:
+		// Lock the object before reading.
+		lock := fs.NewNSLock(bucket, object)
+		ctx, err = lock.GetRLock(ctx, globalOperationTimeout)
+		if err != nil {
+			return nil, err
+		}
+		nsUnlocker = lock.RUnlock
+	}
+
+	ctx, cleanup, err = fs.disk.ContextWithMetaLock(ctx, bucket, object, lockType)
+	if err != nil {
+		return nil, toObjectErr(err, bucket, object)
+	}
+
+	cleanUpFn := func() {
+		cleanup(err)
 	}
 
 	fi, err := fs.disk.ReadVersion(ctx, bucket, object, opts.VersionID, false)
 
 	if err != nil {
+		cleanUpFn()
 		nsUnlocker()
 		return nil, toObjectErr(err, bucket, object)
 	}
@@ -645,34 +668,38 @@ func (fs *FSObjects) GetObjectNInfo(ctx context.Context, bucket, object string, 
 	if HasSuffix(object, SlashSeparator) {
 		// The lock taken above is released when
 		// objReader.Close() is called by the caller.
-		return NewGetObjectReaderFromReader(bytes.NewBuffer(nil), objInfo, opts, nsUnlocker)
+		return NewGetObjectReaderFromReader(bytes.NewBuffer(nil), objInfo, opts, nsUnlocker, cleanUpFn)
 	}
 
 	if objInfo.DeleteMarker {
-		nsUnlocker()
 		if opts.VersionID == "" {
-			return &GetObjectReader{
-				ObjInfo: objInfo,
-			}, toObjectErr(errFileNotFound, bucket, object)
-		}
+			err = errFileNotFound
+		} else {
 
-		// Make sure to return object info to provide extra information.
+			err = errMethodNotAllowed
+		}
+		cleanUpFn()
+		nsUnlocker()
 		return &GetObjectReader{
 			ObjInfo: objInfo,
-		}, toObjectErr(errMethodNotAllowed, bucket, object)
+		}, toObjectErr(err, bucket, object)
 	}
+
 	if objInfo.TransitionStatus == lifecycle.TransitionComplete {
 		// If transitioned, stream from transition tier unless object is restored locally or restore date is past.
 		restoreHdr, ok := caseInsensitiveMap(objInfo.UserDefined).Lookup(xhttp.AmzRestore)
 		if !ok || !strings.HasPrefix(restoreHdr, "ongoing-request=false") || (!objInfo.RestoreExpires.IsZero() && time.Now().After(objInfo.RestoreExpires)) {
-			transR, err := getTransitionedObjectReader(ctx, bucket, object, rs, h, objInfo, opts)
+			var transR *GetObjectReader
+			transR, err = getTransitionedObjectReader(ctx, bucket, object, rs, h, objInfo, opts)
+			cleanUpFn()
 			nsUnlocker()
 			return transR, err
 		}
 	}
 
-	objReaderFn, off, length, err := NewGetObjectReader(rs, objInfo, opts, nsUnlocker)
+	objReaderFn, off, length, err := NewGetObjectReader(rs, objInfo, opts, nsUnlocker, cleanUpFn)
 	if err != nil {
+		cleanUpFn()
 		nsUnlocker()
 		return nil, err
 	}
@@ -682,9 +709,9 @@ func (fs *FSObjects) GetObjectNInfo(ctx context.Context, bucket, object string, 
 		objectPath = pathJoin(object, fi.DataDir, "part.1")
 	}
 	// Read the object, doesn't exist returns an s3 compatible error.
-	ctxWithLockType := context.WithValue(ctx, lockTypeKey, lockType)
-	readCloser, err := fs.disk.ReadFileStream(ctxWithLockType, bucket, objectPath, off, length)
+	readCloser, err := fs.disk.ReadFileStream(ctx, bucket, objectPath, off, length)
 	if err != nil {
+		cleanUpFn()
 		nsUnlocker()
 		return nil, toObjectErr(err, bucket, object)
 	}
@@ -699,6 +726,7 @@ func (fs *FSObjects) GetObjectNInfo(ctx context.Context, bucket, object string, 
 		err = InvalidRange{off, length, objInfo.Size}
 		logger.LogIf(ctx, err, logger.Application)
 		closeFn()
+		cleanUpFn()
 		nsUnlocker()
 		return nil, err
 	}
@@ -707,9 +735,11 @@ func (fs *FSObjects) GetObjectNInfo(ctx context.Context, bucket, object string, 
 }
 
 // GetObjectInfo - reads object metadata and replies back ObjectInfo.
-func (fs *FSObjects) GetObjectInfo(ctx context.Context, bucket, object string, opts ObjectOptions) (oi ObjectInfo, e error) {
+func (fs *FSObjects) GetObjectInfo(ctx context.Context, bucket, object string, opts ObjectOptions) (ObjectInfo, error) {
+
+	var cleanup func(error)
 	if opts.VersionID != "" && opts.VersionID != nullVersionID {
-		return oi, VersionNotFound{
+		return ObjectInfo{}, VersionNotFound{
 			Bucket:    bucket,
 			Object:    object,
 			VersionID: opts.VersionID,
@@ -718,7 +748,7 @@ func (fs *FSObjects) GetObjectInfo(ctx context.Context, bucket, object string, o
 
 	var err error
 	if err = checkGetObjArgs(ctx, bucket, object); err != nil {
-		return oi, err
+		return ObjectInfo{}, err
 	}
 
 	atomic.AddInt64(&fs.activeIOCount, 1)
@@ -726,6 +756,7 @@ func (fs *FSObjects) GetObjectInfo(ctx context.Context, bucket, object string, o
 		atomic.AddInt64(&fs.activeIOCount, -1)
 	}()
 
+	lockType := noLock
 	if !opts.NoLock {
 		// Lock the object before reading.
 		lk := fs.NewNSLock(bucket, object)
@@ -734,11 +765,26 @@ func (fs *FSObjects) GetObjectInfo(ctx context.Context, bucket, object string, o
 			return ObjectInfo{}, err
 		}
 		defer lk.RUnlock()
+		lockType = readLock
+	}
+	oldCtx := ctx
+	ctx, cleanup, err = fs.disk.ContextWithMetaLock(oldCtx, bucket, object, lockType)
+	if err != nil {
+		return ObjectInfo{}, toObjectErr(err, bucket, object)
 	}
 
 	fi, err := fs.disk.ReadVersion(ctx, bucket, object, opts.VersionID, false)
 
 	if err == errCorruptedFormat || err == io.EOF {
+		cleanup(err)
+		lockType = writeLock
+		ctx, cleanup, err = fs.disk.ContextWithMetaLock(oldCtx, bucket, object, writeLock)
+		if err != nil {
+			return ObjectInfo{}, toObjectErr(err, bucket, object)
+		}
+		defer func() {
+			cleanup(err)
+		}()
 		fi = FileInfo{
 			Metadata: map[string]string{
 				"etag":         defaultEtag,
@@ -747,17 +793,21 @@ func (fs *FSObjects) GetObjectInfo(ctx context.Context, bucket, object string, o
 		}
 		err = fs.disk.WriteMetadata(ctx, minioMetaBucket, pathJoin(bucketMetaPrefix, bucket, object), fi)
 		if err != nil {
-			return oi, toObjectErr(err, bucket, object)
+			return ObjectInfo{}, toObjectErr(err, bucket, object)
 		}
 
 		fi, err = fs.disk.ReadVersion(ctx, bucket, object, opts.VersionID, false)
+	} else {
+		defer func() {
+			cleanup(err)
+		}()
 	}
 
 	if err != nil {
-		return oi, toObjectErr(err, bucket, object)
+		return ObjectInfo{}, toObjectErr(err, bucket, object)
 	}
 
-	oi = fi.ToObjectInfo(bucket, object)
+	oi := fi.ToObjectInfo(bucket, object)
 	if oi.TransitionStatus == lifecycle.TransitionComplete {
 		// overlay storage class for transitioned objects with transition tier SC Label
 		if sc := transitionSC(ctx, bucket); sc != "" {
@@ -766,15 +816,18 @@ func (fs *FSObjects) GetObjectInfo(ctx context.Context, bucket, object string, o
 	}
 	if !fi.VersionPurgeStatus.Empty() && opts.VersionID != "" {
 		// Make sure to return object info to provide extra information.
-		return oi, toObjectErr(errMethodNotAllowed, bucket, object)
+		err = errMethodNotAllowed
+		return oi, toObjectErr(err, bucket, object)
 	}
 
 	if fi.Deleted {
 		if opts.VersionID == "" || opts.DeleteMarker {
-			return oi, toObjectErr(errFileNotFound, bucket, object)
+			err = errFileNotFound
+			return oi, toObjectErr(err, bucket, object)
 		}
 		// Make sure to return object info to provide extra information.
-		return oi, toObjectErr(errMethodNotAllowed, bucket, object)
+		err = errMethodNotAllowed
+		return oi, toObjectErr(err, bucket, object)
 	}
 
 	return oi, nil
@@ -791,12 +844,12 @@ func (fs *FSObjects) parentDirIsObject(ctx context.Context, bucket, parent strin
 // until EOF, writes data directly to configured filesystem path.
 // Additionally writes `fs.json` which carries the necessary metadata
 // for future object operations.
-func (fs *FSObjects) PutObject(ctx context.Context, bucket string, object string, r *PutObjReader, opts ObjectOptions) (objInfo ObjectInfo, err error) {
+func (fs *FSObjects) PutObject(ctx context.Context, bucket string, object string, r *PutObjReader, opts ObjectOptions) (ObjectInfo, error) {
 	if opts.Versioned {
-		return objInfo, NotImplemented{}
+		return ObjectInfo{}, NotImplemented{}
 	}
-
-	if err := checkPutObjectArgs(ctx, bucket, object, fs); err != nil {
+	var err error
+	if err = checkPutObjectArgs(ctx, bucket, object, fs); err != nil {
 		return ObjectInfo{}, err
 	}
 
@@ -805,7 +858,7 @@ func (fs *FSObjects) PutObject(ctx context.Context, bucket string, object string
 	ctx, err = lk.GetLock(ctx, globalOperationTimeout)
 	if err != nil {
 		logger.LogIf(ctx, err)
-		return objInfo, err
+		return ObjectInfo{}, err
 	}
 	defer lk.Unlock()
 	defer ObjectPathUpdated(path.Join(bucket, object))
@@ -815,13 +868,14 @@ func (fs *FSObjects) PutObject(ctx context.Context, bucket string, object string
 		atomic.AddInt64(&fs.activeIOCount, -1)
 	}()
 
-	return fs.putObject(ctx, bucket, object, r, opts)
-}
+	ctx, cleanup, err := fs.disk.ContextWithMetaLock(ctx, bucket, object, writeLock)
+	if err != nil {
+		return ObjectInfo{}, toObjectErr(err, bucket, object)
+	}
 
-// putObject - wrapper for PutObject
-func (fs *FSObjects) putObject(ctx context.Context, bucket string, object string, r *PutObjReader, opts ObjectOptions) (ObjectInfo, error) {
-	// No metadata is set, allocate a new one.
-	var err error
+	defer func() {
+		cleanup(err)
+	}()
 
 	// Validate if bucket name is valid and exists.
 	if _, err = fs.disk.StatVol(ctx, bucket); err != nil {
@@ -1071,17 +1125,17 @@ func (fs *FSObjects) DeleteObjects(ctx context.Context, bucket string, objects [
 
 // DeleteObject - deletes an object from a bucket, this operation is destructive
 // and there are no rollbacks supported.
-func (fs *FSObjects) DeleteObject(ctx context.Context, bucket, object string, opts ObjectOptions) (objInfo ObjectInfo, err error) {
+func (fs *FSObjects) DeleteObject(ctx context.Context, bucket, object string, opts ObjectOptions) (ObjectInfo, error) {
 	if opts.VersionID != "" && opts.VersionID != nullVersionID {
-		return objInfo, VersionNotFound{
+		return ObjectInfo{}, VersionNotFound{
 			Bucket:    bucket,
 			Object:    object,
 			VersionID: opts.VersionID,
 		}
 	}
-
+	var err error
 	if err = checkDelObjArgs(ctx, bucket, object); err != nil {
-		return objInfo, err
+		return ObjectInfo{}, err
 	}
 
 	atomic.AddInt64(&fs.activeIOCount, 1)
@@ -1090,7 +1144,7 @@ func (fs *FSObjects) DeleteObject(ctx context.Context, bucket, object string, op
 	}()
 
 	versionFound := true
-	objInfo = ObjectInfo{VersionID: opts.VersionID} // version id needed in Delete API response.
+	objInfo := ObjectInfo{VersionID: opts.VersionID} // version id needed in Delete API response.
 	goi, gerr := fs.GetObjectInfo(ctx, bucket, object, opts)
 	if gerr != nil && goi.Name == "" {
 		switch gerr.(type) {
@@ -1109,7 +1163,7 @@ func (fs *FSObjects) DeleteObject(ctx context.Context, bucket, object string, op
 	lk := fs.NewNSLock(bucket, object)
 	ctx, err = lk.GetLock(ctx, globalDeleteOperationTimeout)
 	if err != nil {
-		return ObjectInfo{}, err
+		return objInfo, err
 	}
 	defer lk.Unlock()
 

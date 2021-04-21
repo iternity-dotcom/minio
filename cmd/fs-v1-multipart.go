@@ -572,6 +572,15 @@ func (fs *FSObjects) CompleteMultipartUpload(ctx context.Context, bucket string,
 	}
 	defer uploadIDLock.RUnlock()
 
+	ctx, cleanup, err := fs.disk.ContextWithMetaLock(ctx, bucket, object, writeLock)
+	if err != nil {
+		return ObjectInfo{}, err
+	}
+
+	defer func() {
+		cleanup(err)
+	}()
+
 	if _, err := fs.disk.StatVol(ctx, bucket); err != nil {
 		return ObjectInfo{}, toObjectErr(err, bucket)
 	}
@@ -589,7 +598,8 @@ func (fs *FSObjects) CompleteMultipartUpload(ctx context.Context, bucket string,
 	// Check if an object is present as one of the parent dir.
 	// -- FIXME. (needs a new kind of lock).
 	if opts.ParentIsObject != nil && opts.ParentIsObject(ctx, bucket, path.Dir(object)) {
-		return ObjectInfo{}, toObjectErr(errFileParentIsFile, bucket, object)
+		err = errFileParentIsFile
+		return ObjectInfo{}, toObjectErr(err, bucket, object)
 	}
 
 	defer ObjectPathUpdated(pathJoin(bucket, object))
@@ -614,31 +624,32 @@ func (fs *FSObjects) CompleteMultipartUpload(ctx context.Context, bucket string,
 		partIdx := objectPartIndex(currentFI.Parts, part.PartNumber)
 		// All parts should have same part number.
 		if partIdx == -1 {
-			invp := InvalidPart{
+			err = InvalidPart{
 				PartNumber: part.PartNumber,
 				GotETag:    part.ETag,
 			}
-			return ObjectInfo{}, invp
+			return ObjectInfo{}, err
 		}
 
 		// ensure that part ETag is canonicalized to strip off extraneous quotes
 		part.ETag = canonicalizeETag(part.ETag)
 		if currentFI.Parts[partIdx].ETag != part.ETag {
-			invp := InvalidPart{
+			err = InvalidPart{
 				PartNumber: part.PartNumber,
 				ExpETag:    currentFI.Parts[partIdx].ETag,
 				GotETag:    part.ETag,
 			}
-			return ObjectInfo{}, invp
+			return ObjectInfo{}, err
 		}
 
 		// All parts except the last part has to be atleast 5MB.
 		if (i < len(parts)-1) && !isMinAllowedPartSize(currentFI.Parts[partIdx].ActualSize) {
-			return ObjectInfo{}, PartTooSmall{
+			err = PartTooSmall{
 				PartNumber: part.PartNumber,
 				PartSize:   currentFI.Parts[partIdx].ActualSize,
 				PartETag:   part.ETag,
 			}
+			return ObjectInfo{}, err
 		}
 
 		// Save for total object size.
