@@ -22,7 +22,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/minio/minio/pkg/lock"
 	"io"
 	"net/http"
 	"os"
@@ -33,6 +32,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/minio/minio/pkg/lock"
 
 	"github.com/minio/minio-go/v7/pkg/set"
 	"github.com/minio/minio/pkg/bucket/replication"
@@ -66,7 +67,7 @@ type FSObjects struct {
 	activeIOCount int64
 
 	// This value shouldn't be touched, once initialized.
-	fsFormatRlk *lock.RLockedFile // Is a read lock on `format.json`.
+	fsFormatRlk     *lock.RLockedFile // Is a read lock on `format.json`.
 	appendFileMap   map[string]*fsAppendFile
 	appendFileMapMu sync.Mutex
 
@@ -113,7 +114,6 @@ func NewFSObjectLayer(fsPath string) (ObjectLayer, error) {
 		}
 		return nil, err
 	}
-
 
 	// Initialize fs objects.
 	fs := &FSObjects{
@@ -1476,6 +1476,15 @@ func (fs *FSObjects) PutObjectTags(ctx context.Context, bucket, object string, t
 		return ObjectInfo{}, err
 	}
 	defer lk.Unlock()
+
+	ctx, cleanup, err := fs.disk.ContextWithMetaLock(ctx, bucket, object, writeLock)
+	if err != nil {
+		return ObjectInfo{}, toObjectErr(err, bucket, object)
+	}
+
+	defer func() {
+		cleanup(err)
+	}()
 
 	fi, err := fs.disk.ReadVersion(ctx, bucket, object, opts.VersionID, false)
 	if err != nil {
