@@ -187,14 +187,11 @@ func (fs *FSObjects) SetDriveCounts() []int {
 	return nil
 }
 
-func (fs *FSObjects) metaTmpBucket() string {
-	return fs.disk.MetaTmpBucket()
-}
 // Shutdown - should be called when process shuts down.
 func (fs *FSObjects) Shutdown(ctx context.Context) error {
 	fs.fsFormatRlk.Close()
 	// Cleanup and delete tmp uuid.
-	fs.disk.DeleteVol(ctx, fs.metaTmpBucket(), true)
+	fs.disk.DeleteVol(ctx, fs.disk.MetaTmpBucket(), true)
 
 	return fs.disk.Close()
 }
@@ -586,15 +583,15 @@ func (fs *FSObjects) updateMetaObject(ctx context.Context, bucket, object string
 	tempObj := mustGetUUID()
 
 	defer func() {
-		fs.deleteObject(context.Background(), fs.metaTmpBucket(), tempObj)
+		fs.deleteObject(context.Background(), fs.disk.MetaTmpBucket(), tempObj)
 	}()
 
-	if err = fs.disk.WriteMetadata(ctx, fs.metaTmpBucket(), tempObj, fi); err != nil {
+	if err = fs.disk.WriteMetadata(ctx, fs.disk.MetaTmpBucket(), tempObj, fi); err != nil {
 		return ObjectInfo{}, toObjectErr(err, bucket, object)
 	}
 
 	// Atomically rename metadata from tmp location to destination for each disk.
-	if err = fs.disk.RenameData(ctx, fs.metaTmpBucket(), tempObj, "", bucket, object); err != nil {
+	if err = fs.disk.RenameData(ctx, fs.disk.MetaTmpBucket(), tempObj, "", bucket, object); err != nil {
 		return ObjectInfo{}, toObjectErr(err, bucket, object)
 	}
 
@@ -929,13 +926,13 @@ func (fs *FSObjects) PutObject(ctx context.Context, bucket string, object string
 	// failure. If PutObject succeeds, then there would be
 	// nothing to delete.
 	defer func() {
-		fs.deleteObject(context.Background(), fs.metaTmpBucket(), tempObjFolder)
+		fs.deleteObject(context.Background(), fs.disk.MetaTmpBucket(), tempObjFolder)
 	}()
 
 	// Uploaded object will first be written to the temporary location which will eventually
 	// be renamed to the actual location. It is first written to the temporary location
 	// so that cleaning it up will be easy if the server goes down.
-	err = fs.disk.CreateFile(ctx, fs.metaTmpBucket(), pathJoin(tempObjFolder, fi.DataDir, partName), data.Size(), data)
+	err = fs.disk.CreateFile(ctx, fs.disk.MetaTmpBucket(), pathJoin(tempObjFolder, fi.DataDir, partName), data.Size(), data)
 	if err != nil {
 		// Should return IncompleteBody{} error when reader has fewer
 		// bytes than specified in request header.
@@ -964,14 +961,14 @@ func (fs *FSObjects) PutObject(ctx context.Context, bucket string, object string
 	fi.Size = data.Size()
 	fi.ModTime = modTime
 
-	if err = fs.disk.WriteMetadata(ctx, fs.metaTmpBucket(), pathJoin(tempObjFolder), fi); err != nil {
+	if err = fs.disk.WriteMetadata(ctx, fs.disk.MetaTmpBucket(), pathJoin(tempObjFolder), fi); err != nil {
 		return ObjectInfo{}, toObjectErr(err, bucket, object)
 	}
 
 	// rename
-	defer ObjectPathUpdated(pathJoin(fs.metaTmpBucket(), pathJoin(tempObjFolder)))
+	defer ObjectPathUpdated(pathJoin(fs.disk.MetaTmpBucket(), pathJoin(tempObjFolder)))
 	defer ObjectPathUpdated(pathJoin(bucket, object))
-	err = fs.disk.RenameData(ctx, fs.metaTmpBucket(), pathJoin(tempObjFolder), fi.DataDir, bucket, object)
+	err = fs.disk.RenameData(ctx, fs.disk.MetaTmpBucket(), pathJoin(tempObjFolder), fi.DataDir, bucket, object)
 
 	if err != nil {
 		return ObjectInfo{}, toObjectErr(err, bucket, object)
@@ -991,16 +988,16 @@ func (fs *FSObjects) deleteObject(ctx context.Context, bucket, object string) er
 	defer ObjectPathUpdated(pathJoin(bucket, object))
 
 	tmpObj := mustGetUUID()
-	if bucket == fs.metaTmpBucket() {
+	if bucket == fs.disk.MetaTmpBucket() {
 		tmpObj = object
 	} else {
-		err = fs.disk.RenameFile(ctx, bucket, object, fs.metaTmpBucket(), tmpObj)
+		err = fs.disk.RenameFile(ctx, bucket, object, fs.disk.MetaTmpBucket(), tmpObj)
 		if err != nil {
 			return toObjectErr(err, bucket, object)
 		}
 	}
 
-	return fs.disk.Delete(ctx, fs.metaTmpBucket(), tmpObj, true)
+	return fs.disk.Delete(ctx, fs.disk.MetaTmpBucket(), tmpObj, true)
 }
 
 // DeleteObjects - deletes an object from a bucket, this operation is destructive
@@ -1504,12 +1501,12 @@ func (fs *FSObjects) PutObjectTags(ctx context.Context, bucket, object string, t
 
 	tempObj := mustGetUUID()
 
-	if err = fs.disk.WriteMetadata(ctx, fs.metaTmpBucket(), tempObj, fi); err != nil {
+	if err = fs.disk.WriteMetadata(ctx, fs.disk.MetaTmpBucket(), tempObj, fi); err != nil {
 		return ObjectInfo{}, toObjectErr(err, bucket, object)
 	}
 
 	// Atomically rename metadata from tmp location to destination for each disk.
-	if err = fs.disk.RenameData(ctx, fs.metaTmpBucket(), tempObj, "", bucket, object); err != nil {
+	if err = fs.disk.RenameData(ctx, fs.disk.MetaTmpBucket(), tempObj, "", bucket, object); err != nil {
 		return ObjectInfo{}, toObjectErr(err, bucket, object)
 	}
 
