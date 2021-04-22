@@ -22,6 +22,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/minio/minio/pkg/lock"
 	"io"
 	"net/http"
 	"os"
