@@ -43,8 +43,8 @@ Below environment variables are required to be passed to the docker container. S
 | `ENABLE_HTTPS` | (Optional) Set `1` to indicate to use HTTPS to access `SERVER_ENDPOINT`. Defaults to `0` (HTTP) | `1` |
 | `MINT_MODE` | (Optional) Set mode indicating what category of tests to be run by values `core`, `full`. Defaults to `core` | `full` |
 | `DOMAIN` | (Optional) Value of MINIO_DOMAIN environment variable used in Minio server | `myminio.com` |
-| `ENABLE_VIRTUAL_STYLE` | (Optional) Set `1` to indicate virtual style access . Defaults to `0` (Path style) | `1` |
-| `RUN_ON_FAIL` | (Optional) Set `1` to indicate execute all tests independent of failures (currently implemented for minio-go and minio-java) . Defaults to `0` (Path style) | `1` |
+| `ENABLE_VIRTUAL_STYLE` | (Optional) Set `1` to indicate virtual style access. Defaults to `0` (Path style) | `1` |
+| `RUN_ON_FAIL` | (Optional) Set `1` to indicate execute all tests independent of failures (currently implemented for minio-go and minio-java). Defaults to `0` | `1` |
 
 
 ### Test virtual style access against Minio server
