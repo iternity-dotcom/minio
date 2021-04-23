@@ -580,18 +580,7 @@ func (fs *FSObjects) updateMetaObject(ctx context.Context, bucket, object string
 	fi.Metadata = info.UserDefined
 	info.UserDefined["etag"] = info.ETag
 
-	tempObj := mustGetUUID()
-
-	defer func() {
-		fs.deleteObject(context.Background(), fs.disk.MetaTmpBucket(), tempObj)
-	}()
-
-	if err = fs.disk.WriteMetadata(ctx, fs.disk.MetaTmpBucket(), tempObj, fi); err != nil {
-		return ObjectInfo{}, toObjectErr(err, bucket, object)
-	}
-
-	// Atomically rename metadata from tmp location to destination for each disk.
-	if err = fs.disk.RenameData(ctx, fs.disk.MetaTmpBucket(), tempObj, "", bucket, object); err != nil {
+	if err = fs.disk.WriteMetadata(ctx, bucket, object, fi); err != nil {
 		return ObjectInfo{}, toObjectErr(err, bucket, object)
 	}
 
@@ -789,7 +778,7 @@ func (fs *FSObjects) GetObjectInfo(ctx context.Context, bucket, object string, o
 				"content-type": mimedb.TypeByExtension(path.Ext(object)),
 			},
 		}
-		err = fs.disk.WriteMetadata(ctx, minioMetaBucket, pathJoin(bucketMetaPrefix, bucket, object), fi)
+		err = fs.disk.WriteMetadata(ctx, bucket, object, fi)
 		if err != nil {
 			return ObjectInfo{}, toObjectErr(err, bucket, object)
 		}
@@ -961,14 +950,10 @@ func (fs *FSObjects) PutObject(ctx context.Context, bucket string, object string
 	fi.Size = data.Size()
 	fi.ModTime = modTime
 
-	if err = fs.disk.WriteMetadata(ctx, fs.disk.MetaTmpBucket(), pathJoin(tempObjFolder), fi); err != nil {
-		return ObjectInfo{}, toObjectErr(err, bucket, object)
-	}
-
 	// rename
 	defer ObjectPathUpdated(pathJoin(fs.disk.MetaTmpBucket(), pathJoin(tempObjFolder)))
 	defer ObjectPathUpdated(pathJoin(bucket, object))
-	err = fs.disk.RenameData(ctx, fs.disk.MetaTmpBucket(), pathJoin(tempObjFolder), fi.DataDir, bucket, object)
+	err = fs.disk.RenameData(ctx, fs.disk.MetaTmpBucket(), pathJoin(tempObjFolder), fi, bucket, object)
 
 	if err != nil {
 		return ObjectInfo{}, toObjectErr(err, bucket, object)
@@ -1498,31 +1483,16 @@ func (fs *FSObjects) PutObjectTags(ctx context.Context, bucket, object string, t
 		return ObjectInfo{}, toObjectErr(errMethodNotAllowed, bucket, object)
 	}
 
-	// clean fi.Meta of tag key, before updating the new tags
-	delete(fi.Metadata, xhttp.AmzObjectTagging)
-	// Don't update for empty tags
-	if tags != "" {
-		fi.Metadata[xhttp.AmzObjectTagging] = tags
-	}
+	fi.Metadata[xhttp.AmzObjectTagging] = tags
 	for k, v := range opts.UserDefined {
 		fi.Metadata[k] = v
 	}
 
-	tempObj := mustGetUUID()
-
-	if err = fs.disk.WriteMetadata(ctx, fs.disk.MetaTmpBucket(), tempObj, fi); err != nil {
+	if err = fs.disk.UpdateMetadata(ctx, bucket, object, fi); err != nil {
 		return ObjectInfo{}, toObjectErr(err, bucket, object)
 	}
 
-	// Atomically rename metadata from tmp location to destination for each disk.
-	if err = fs.disk.RenameData(ctx, fs.disk.MetaTmpBucket(), tempObj, "", bucket, object); err != nil {
-		return ObjectInfo{}, toObjectErr(err, bucket, object)
-	}
-
-	objInfo := fi.ToObjectInfo(bucket, object)
-	objInfo.UserTags = tags
-
-	return objInfo, nil
+	return fi.ToObjectInfo(bucket, object), nil
 }
 
 // DeleteObjectTags - delete object tags from an existing object

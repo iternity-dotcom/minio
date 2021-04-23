@@ -249,17 +249,8 @@ func (fs *FSObjects) NewMultipartUpload(ctx context.Context, bucket, object stri
 
 	uploadID := mustGetUUID()
 	uploadIDPath := fs.getUploadIDDir(bucket, object, uploadID)
-	tempUploadIDPath := uploadID
 
-	defer func() {
-		fs.deleteObject(context.Background(), fs.disk.MetaTmpBucket(), tempUploadIDPath)
-	}()
-
-	if err := fs.disk.WriteMetadata(ctx, fs.disk.MetaTmpBucket(), tempUploadIDPath, fi); err != nil {
-		return "", toObjectErr(err, fs.disk.MetaTmpBucket(), tempUploadIDPath)
-	}
-
-	if err := fs.disk.RenameFile(ctx, fs.disk.MetaTmpBucket(), tempUploadIDPath, minioMetaMultipartBucket, uploadIDPath); err != nil {
+	if err := fs.disk.WriteMetadata(ctx, minioMetaMultipartBucket, uploadIDPath, fi); err != nil {
 		return "", toObjectErr(err, minioMetaMultipartBucket, uploadIDPath)
 	}
 
@@ -743,12 +734,8 @@ func (fs *FSObjects) CompleteMultipartUpload(ctx context.Context, bucket string,
 	// Save the consolidated actual size.
 	fi.Metadata[ReservedMetadataPrefix+"actual-size"] = strconv.FormatInt(objectActualSize, 10)
 
-	if err = fs.disk.WriteMetadata(ctx, minioMetaMultipartBucket, uploadIDPath, fi); err != nil {
-		return ObjectInfo{}, toObjectErr(err, minioMetaMultipartBucket, uploadIDPath)
-	}
-
-	dataDir := mustGetUUID()
-	tempObjFile := pathJoin(uploadIDPath, dataDir, "part.1")
+	fi.DataDir = mustGetUUID()
+	tempObjFile := pathJoin(uploadIDPath, fi.DataDir, "part.1")
 	fs.disk.RenameFile(ctx, fs.disk.MetaTmpBucket(), appendFilePath, minioMetaMultipartBucket, tempObjFile)
 
 	lk := fs.NewNSLock(bucket, object)
@@ -759,7 +746,7 @@ func (fs *FSObjects) CompleteMultipartUpload(ctx context.Context, bucket string,
 	defer lk.Unlock()
 
 	// Rename the multipart object to final location.
-	if err = fs.disk.RenameData(ctx, minioMetaMultipartBucket, uploadIDPath, dataDir, bucket, object); err != nil {
+	if err = fs.disk.RenameData(ctx, minioMetaMultipartBucket, uploadIDPath, fi, bucket, object); err != nil {
 		return ObjectInfo{}, toObjectErr(err, bucket, object)
 	}
 
