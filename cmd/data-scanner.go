@@ -185,7 +185,7 @@ type folderScanner struct {
 	disks           []StorageAPI
 }
 
-type Disker interface {
+type disker interface {
 	GetDisksID(ids ...string) []StorageAPI
 }
 
@@ -226,7 +226,7 @@ func scanDataFolder(ctx context.Context, basePath string, cache dataUsageCache, 
 
 	// Add disks for set healing.
 	if len(cache.Disks) > 0 {
-		disker, ok := newObjectLayerFn().(Disker)
+		disker, ok := newObjectLayerFn().(disker)
 		if ok {
 			s.disks = disker.GetDisksID(cache.Disks...)
 			if len(s.disks) != len(cache.Disks) {

@@ -162,7 +162,6 @@ func newFSV1Storage(ep Endpoint) (*fsv1Storage, error) {
 	w.Close()
 	defer Remove(filePath)
 
-
 	// Success.
 	return p, nil
 }
@@ -493,7 +492,6 @@ func (s *fsv1Storage) getLockPath(volume string, path string) (string, string, e
 	}
 	return volDir, s.getMetaPathFile(volume, path), nil
 }
-
 
 func (s *fsv1Storage) CacheEntriesToObjInfos(cacheEntries metaCacheEntriesSorted, opts listPathOptions) []ObjectInfo {
 	return cacheEntries.objectInfos(opts.Bucket, opts.Prefix, opts.Separator, func(objectInfoBuf []byte) (ObjectInfo, error) {
@@ -856,9 +854,9 @@ func (s *fsv1Storage) WriteMetadata(ctx context.Context, volume, path string, fi
 
 	if strings.HasPrefix(volume, minioMetaBucket) {
 		return s.WriteAll(ctx, volume, pathJoin(path, fsMetaJSONFile), buf)
-	} else {
-		return s.WriteAll(ctx, minioMetaBucket, s.getMetaPathFile(volume, path), buf)
 	}
+
+	return s.WriteAll(ctx, minioMetaBucket, s.getMetaPathFile(volume, path), buf)
 }
 
 func (s *fsv1Storage) UpdateMetadata(ctx context.Context, volume, path string, fi FileInfo) error {

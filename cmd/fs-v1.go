@@ -560,7 +560,6 @@ func (fs *FSObjects) updateMetaObject(ctx context.Context, bucket, object string
 		return fi.ToObjectInfo(bucket, object), toObjectErr(err, bucket, object)
 	}
 
-	modTime := fi.ModTime
 	versionID := info.VersionID
 	if info.versionOnly {
 		versionID = dstOpts.VersionID
@@ -568,13 +567,11 @@ func (fs *FSObjects) updateMetaObject(ctx context.Context, bucket, object string
 		if versionID == "" {
 			versionID = mustGetUUID()
 		}
-		modTime = UTCNow()
+		fi.ModTime = UTCNow()
 	}
 
 	fi.VersionID = versionID // set any new versionID we might have created
-	fi.ModTime = modTime     // set modTime for the new versionID
 	if !dstOpts.MTime.IsZero() {
-		modTime = dstOpts.MTime
 		fi.ModTime = dstOpts.MTime
 	}
 	fi.Metadata = info.UserDefined
@@ -764,7 +761,6 @@ func (fs *FSObjects) GetObjectInfo(ctx context.Context, bucket, object string, o
 
 	if err == errCorruptedFormat || err == io.EOF {
 		cleanup(err)
-		lockType = writeLock
 		ctx, cleanup, err = fs.disk.ContextWithMetaLock(oldCtx, bucket, object, writeLock)
 		if err != nil {
 			return ObjectInfo{}, toObjectErr(err, bucket, object)
