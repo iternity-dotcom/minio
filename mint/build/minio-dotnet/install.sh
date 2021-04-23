@@ -34,9 +34,6 @@ temp_dir="$MINIO_DOTNET_SDK_PATH/temp"
 git clone --quiet https://github.com/iternity-dotcom/minio-dotnet.git "${temp_dir}/minio-dotnet.git/"
 (cd "${temp_dir}/minio-dotnet.git"; git checkout --quiet "all-commits")
 
-cp -a "${temp_dir}/minio-dotnet.git/Minio.Functional.Tests/"* "${MINIO_DOTNET_SDK_PATH}/"
-rm -fr "${temp_dir}"
-
-cd "$MINIO_DOTNET_SDK_PATH"
-dotnet restore /p:Configuration=Mint
-dotnet publish --runtime ubuntu.18.04-x64 --output out /p:Configuration=Mint
+cd "${temp_dir}/minio-dotnet.git/Minio.Functional.Tests"
+dotnet restore
+dotnet publish --runtime ubuntu.18.04-x64 --output "$out_dir"
