@@ -90,15 +90,16 @@ func testLockingRetentionGovernance() {
 		uploads[i].versionId = *output.VersionId
 	}
 
-	// Change RetainUntilDate
-	retentionUntil := time.Now().UTC().Add(time.Hour).Truncate(time.Second)
+	// Put retention on first object
+	uploads[0].retention = "GOVERNANCE"
+	uploads[0].retentionUntil = time.Now().UTC().Add(time.Hour).Truncate(time.Second)
 	putRetentionInput := &s3.PutObjectRetentionInput{
 		Bucket:    aws.String(bucket),
 		Key:       aws.String(object),
-		VersionId: &uploads[1].versionId,
+		VersionId: aws.String(uploads[0].versionId),
 		Retention: &s3.ObjectLockRetention{
-			Mode:            aws.String(uploads[1].retention),
-			RetainUntilDate: aws.Time(retentionUntil),
+			Mode:            aws.String(uploads[0].retention),
+			RetainUntilDate: aws.Time(uploads[0].retentionUntil),
 		},
 	}
 	_, err = s3Client.PutObjectRetention(putRetentionInput)
@@ -110,10 +111,10 @@ func testLockingRetentionGovernance() {
 	getRetentionInput := &s3.GetObjectRetentionInput{
 		Bucket:    aws.String(bucket),
 		Key:       aws.String(object),
-		VersionId: aws.String(uploads[1].versionId),
+		VersionId: aws.String(uploads[0].versionId),
 	}
 	retentionOutput, err := s3Client.GetObjectRetention(getRetentionInput)
-	if err != nil || retentionOutput.Retention.RetainUntilDate.String() != retentionUntil.String() {
+	if err != nil || retentionOutput.Retention.RetainUntilDate.String() != uploads[0].retentionUntil.String() {
 		failureLog(function, args, startTime, "", fmt.Sprintf("GetObjectRetention expected to succeed but got %v", err), err).Fatal()
 		return
 	}
