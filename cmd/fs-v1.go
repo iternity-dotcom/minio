@@ -88,7 +88,7 @@ type fsStorageAPI interface {
 	StorageAPI
 	MetaTmpBucket() string
 	CacheEntriesToObjInfos(cacheEntries metaCacheEntriesSorted, opts listPathOptions) []ObjectInfo
-	ContextWithMetaLock(ctx context.Context, lockType LockType, volume string, path string) (context.Context, func(err error), error)
+	ContextWithMetaLock(ctx context.Context, lockType LockType, volume string, path ...string) (context.Context, func(err ...error), error)
 }
 
 // NewFSObjectLayer - initialize new fs object layer.
@@ -587,7 +587,7 @@ func (fs *FSObjects) updateMetaObject(ctx context.Context, bucket, object string
 // GetObjectNInfo - returns object info and a reader for object
 // content.
 func (fs *FSObjects) GetObjectNInfo(ctx context.Context, bucket, object string, rs *HTTPRangeSpec, h http.Header, lockType LockType, opts ObjectOptions) (*GetObjectReader, error) {
-	var cleanup func(error)
+	var cleanup func(...error)
 	var err error
 	if opts.VersionID != "" && opts.VersionID != nullVersionID {
 		return nil, VersionNotFound{
@@ -721,7 +721,7 @@ func (fs *FSObjects) GetObjectNInfo(ctx context.Context, bucket, object string, 
 // GetObjectInfo - reads object metadata and replies back ObjectInfo.
 func (fs *FSObjects) GetObjectInfo(ctx context.Context, bucket, object string, opts ObjectOptions) (ObjectInfo, error) {
 
-	var cleanup func(error)
+	var cleanup func(...error)
 	if opts.VersionID != "" && opts.VersionID != nullVersionID {
 		return ObjectInfo{}, VersionNotFound{
 			Bucket:    bucket,
@@ -1007,12 +1007,23 @@ func (fs *FSObjects) DeleteObjects(ctx context.Context, bucket string, objects [
 	ctx, err := multiDeleteLock.GetLock(ctx, globalOperationTimeout)
 	if err != nil {
 		for i := range errs {
-			errs[i] = err
+			errs[i] = toObjectErr(err, bucket, objects[i].ObjectName)
 		}
 		return dobjects, errs
 	}
 	defer multiDeleteLock.Unlock()
 
+	ctx, cleanup, err := fs.disk.ContextWithMetaLock(ctx, writeLock, bucket, objSets.ToSlice()...)
+	if err != nil {
+		for i := range errs {
+			errs[i] = err
+		}
+		return dobjects, errs
+	}
+
+	defer func() {
+		cleanup(errs...)
+	}()
 	versions := make([]FileInfo, 0)
 	objIdxToVerIdx := make(map[int]int, len(objects))
 	for i := range objects {
