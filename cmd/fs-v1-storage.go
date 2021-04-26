@@ -359,7 +359,7 @@ func (s *fsv1Storage) rwMetaLocker(ctx context.Context, volume string, path stri
 	return nil, errFileNotFound
 }
 
-func (s *fsv1Storage) ContextWithMetaLock(ctx context.Context, volume string, path string, lockType LockType) (context.Context, func(err error), error) {
+func (s *fsv1Storage) ContextWithMetaLock(ctx context.Context, lockType LockType, volume string, path string) (context.Context, func(err error), error) {
 	switch lockType {
 	case writeLock:
 		return s.contextWithRWMetaLock(ctx, volume, path)
@@ -892,7 +892,7 @@ func (s *fsv1Storage) DeleteVersion(ctx context.Context, volume, path string, fi
 	return nil
 }
 
-func (s *fsv1Storage) WriteAll(ctx context.Context, volume string, path string, b []byte) error {
+func (s *fsv1Storage) WriteAll(ctx context.Context, volume, path string, b []byte) error {
 	volumeDir, err := s.getVolDir(volume)
 	if err != nil {
 		return err
@@ -922,7 +922,7 @@ func (s *fsv1Storage) WriteAll(ctx context.Context, volume string, path string, 
 	return nil
 }
 
-func (s *fsv1Storage) CheckFile(ctx context.Context, volume string, path string) error {
+func (s *fsv1Storage) CheckFile(ctx context.Context, volume, path string) error {
 	var isParentDirObject func(string) error
 	isParentDirObject = func(p string) error {
 		if p == "." || p == SlashSeparator {
@@ -939,7 +939,7 @@ func (s *fsv1Storage) CheckFile(ctx context.Context, volume string, path string)
 	return isParentDirObject(path)
 }
 
-func (s *fsv1Storage) CheckParts(ctx context.Context, volume string, path string, fi FileInfo) error {
+func (s *fsv1Storage) CheckParts(ctx context.Context, volume, path string, fi FileInfo) error {
 	return NotImplemented{}
 }
 

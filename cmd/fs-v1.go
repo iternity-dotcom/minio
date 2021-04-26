@@ -88,7 +88,7 @@ type fsStorageAPI interface {
 	StorageAPI
 	MetaTmpBucket() string
 	CacheEntriesToObjInfos(cacheEntries metaCacheEntriesSorted, opts listPathOptions) []ObjectInfo
-	ContextWithMetaLock(ctx context.Context, volume string, path string, lockType LockType) (context.Context, func(err error), error)
+	ContextWithMetaLock(ctx context.Context, lockType LockType, volume string, path string) (context.Context, func(err error), error)
 }
 
 // NewFSObjectLayer - initialize new fs object layer.
@@ -537,7 +537,7 @@ func (fs *FSObjects) updateMetaObject(ctx context.Context, bucket, object string
 	}
 	defer lk.Unlock()
 
-	ctx, cleanup, err := fs.disk.ContextWithMetaLock(ctx, bucket, object, writeLock)
+	ctx, cleanup, err := fs.disk.ContextWithMetaLock(ctx, writeLock, bucket, object)
 	if err != nil {
 		return ObjectInfo{}, toObjectErr(err, bucket, object)
 	}
@@ -630,7 +630,7 @@ func (fs *FSObjects) GetObjectNInfo(ctx context.Context, bucket, object string, 
 		nsUnlocker = lock.RUnlock
 	}
 
-	ctx, cleanup, err = fs.disk.ContextWithMetaLock(ctx, bucket, object, lockType)
+	ctx, cleanup, err = fs.disk.ContextWithMetaLock(ctx, lockType, bucket, object)
 	if err != nil {
 		return nil, toObjectErr(err, bucket, object)
 	}
@@ -752,7 +752,7 @@ func (fs *FSObjects) GetObjectInfo(ctx context.Context, bucket, object string, o
 		lockType = readLock
 	}
 	oldCtx := ctx
-	ctx, cleanup, err = fs.disk.ContextWithMetaLock(oldCtx, bucket, object, lockType)
+	ctx, cleanup, err = fs.disk.ContextWithMetaLock(oldCtx, lockType, bucket, object)
 	if err != nil {
 		return ObjectInfo{}, toObjectErr(err, bucket, object)
 	}
@@ -761,7 +761,7 @@ func (fs *FSObjects) GetObjectInfo(ctx context.Context, bucket, object string, o
 
 	if err == errCorruptedFormat || err == io.EOF {
 		cleanup(err)
-		ctx, cleanup, err = fs.disk.ContextWithMetaLock(oldCtx, bucket, object, writeLock)
+		ctx, cleanup, err = fs.disk.ContextWithMetaLock(oldCtx, writeLock, bucket, object)
 		if err != nil {
 			return ObjectInfo{}, toObjectErr(err, bucket, object)
 		}
@@ -851,7 +851,7 @@ func (fs *FSObjects) PutObject(ctx context.Context, bucket string, object string
 		atomic.AddInt64(&fs.activeIOCount, -1)
 	}()
 
-	ctx, cleanup, err := fs.disk.ContextWithMetaLock(ctx, bucket, object, writeLock)
+	ctx, cleanup, err := fs.disk.ContextWithMetaLock(ctx, writeLock, bucket, object)
 	if err != nil {
 		return ObjectInfo{}, toObjectErr(err, bucket, object)
 	}
@@ -1124,9 +1124,9 @@ func (fs *FSObjects) DeleteObject(ctx context.Context, bucket, object string, op
 
 	versionFound := true
 	objInfo := ObjectInfo{VersionID: opts.VersionID} // version id needed in Delete API response.
-	goi, gerr := fs.GetObjectInfo(ctx, bucket, object, opts)
-	if gerr != nil && goi.Name == "" {
-		switch gerr.(type) {
+	oi, err := fs.GetObjectInfo(ctx, bucket, object, opts)
+	if err != nil && oi.Name == "" {
+		switch err.(type) {
 		case InsufficientReadQuorum:
 			return objInfo, InsufficientWriteQuorum{}
 		}
@@ -1134,7 +1134,7 @@ func (fs *FSObjects) DeleteObject(ctx context.Context, bucket, object string, op
 		if opts.DeleteMarker {
 			versionFound = false
 		} else {
-			return objInfo, gerr
+			return objInfo, err
 		}
 	}
 
@@ -1145,12 +1145,19 @@ func (fs *FSObjects) DeleteObject(ctx context.Context, bucket, object string, op
 		return objInfo, err
 	}
 	defer lk.Unlock()
+	ctx, cleanup, err := fs.disk.ContextWithMetaLock(ctx, writeLock, bucket, object)
+	if err != nil {
+		return ObjectInfo{}, toObjectErr(err, bucket, object)
+	}
 
+	defer func() {
+		cleanup(err)
+	}()
 	defer ObjectPathUpdated(path.Join(bucket, object))
 
 	var markDelete bool
 	// Determine whether to mark object deleted for replication
-	if goi.VersionID != "" {
+	if oi.VersionID != "" {
 		markDelete = true
 	}
 
@@ -1170,7 +1177,7 @@ func (fs *FSObjects) DeleteObject(ctx context.Context, bucket, object string, op
 		}
 		// determine if the version represents an object delete
 		// deleteMarker = true
-		if versionFound && !goi.DeleteMarker { // implies a versioned delete of object
+		if versionFound && !oi.DeleteMarker { // implies a versioned delete of object
 			deleteMarker = false
 		}
 	}
@@ -1458,7 +1465,7 @@ func (fs *FSObjects) PutObjectTags(ctx context.Context, bucket, object string, t
 	}
 	defer lk.Unlock()
 
-	ctx, cleanup, err := fs.disk.ContextWithMetaLock(ctx, bucket, object, writeLock)
+	ctx, cleanup, err := fs.disk.ContextWithMetaLock(ctx, writeLock, bucket, object)
 	if err != nil {
 		return ObjectInfo{}, toObjectErr(err, bucket, object)
 	}

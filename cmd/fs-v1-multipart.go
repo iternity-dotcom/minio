@@ -563,7 +563,7 @@ func (fs *FSObjects) CompleteMultipartUpload(ctx context.Context, bucket string,
 	}
 	defer uploadIDLock.RUnlock()
 
-	ctx, cleanup, err := fs.disk.ContextWithMetaLock(ctx, bucket, object, writeLock)
+	ctx, cleanup, err := fs.disk.ContextWithMetaLock(ctx, writeLock, bucket, object)
 	if err != nil {
 		return ObjectInfo{}, err
 	}
