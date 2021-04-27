@@ -201,26 +201,11 @@ type rwLock struct {
 	*lockPaths
 	getVolDir func(string) (string, error)
 	openFile  func(filePath string, mode int) (*os.File, error)
-	wlk       *lock.LockedFile
+	*lock.LockedFile
 }
 
-func (l *rwLock) Stat() (fs.FileInfo, error) {
-	return l.wlk.Stat()
-}
-func (l *rwLock) Read(p []byte) (int, error) {
-	return l.wlk.Read(p)
-}
-func (l *rwLock) Write(p []byte) (int, error) {
-	return l.wlk.Write(p)
-}
-func (l *rwLock) Seek(offset int64, whence int) (int64, error) {
-	return l.wlk.Seek(offset, whence)
-}
 func (l *rwLock) Close() error {
 	return nil
-}
-func (l *rwLock) Truncate(size int64) error {
-	return l.wlk.Truncate(size)
 }
 func (l *rwLock) LockType() LockType {
 	return writeLock
@@ -229,18 +214,9 @@ func (l *rwLock) LockType() LockType {
 type rLock struct {
 	*lockPaths
 	getVolDir func(string) (string, error)
-	rlk       *lock.RLockedFile
+	*lock.RLockedFile
 }
 
-func (l *rLock) Stat() (fs.FileInfo, error) {
-	return l.rlk.Stat()
-}
-func (l *rLock) Read(p []byte) (int, error) {
-	return l.rlk.Read(p)
-}
-func (l *rLock) Seek(offset int64, whence int) (int64, error) {
-	return l.rlk.Seek(offset, whence)
-}
 func (l *rLock) Close() error {
 	return nil
 }
@@ -482,7 +458,7 @@ func (s *fsv1Storage) contextWithRMetaLock(ctx context.Context, volume string, p
 					path:     path,
 					lockPath: lockPath,
 				},
-				rlk: rlk,
+				RLockedFile: rlk,
 			}
 			cleanups[i] = func(err error) {
 				s.rwPool.Close(lockPath)
@@ -541,9 +517,9 @@ func (s *fsv1Storage) contextWithRWMetaLock(ctx context.Context, volume string, 
 				path:     path,
 				lockPath: lockPath,
 			},
-			wlk:       wlk,
-			openFile:  s.openFile,
-			getVolDir: s.getVolDir,
+			LockedFile: wlk,
+			openFile:   s.openFile,
+			getVolDir:  s.getVolDir,
 		}
 		cleanups[i] = func(err error) {
 			wlk.Close()
