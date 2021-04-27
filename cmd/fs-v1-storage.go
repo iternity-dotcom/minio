@@ -804,12 +804,12 @@ func (s *fsv1Storage) AppendFile(ctx context.Context, volume string, path string
 	if err != nil {
 		return err
 	}
+	defer file.Close()
 
 	_, err = file.Seek(0, io.SeekEnd)
 	if err != nil {
 		return err
 	}
-	defer file.Close()
 
 	n, err := io.Copy(file, bytes.NewBuffer(buf))
 	if err != nil {
@@ -832,6 +832,7 @@ func (s *fsv1Storage) CreateFile(ctx context.Context, volume, path string, fileS
 	if err != nil {
 		return err
 	}
+	defer file.Close()
 
 	written, err := io.Copy(file, r)
 	if err != nil {
