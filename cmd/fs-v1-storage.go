@@ -330,7 +330,7 @@ func (s *fsv1Storage) rMetaLocker(ctx context.Context, volume string, path strin
 	return nil, errFileNotFound
 }
 
-func (s *fsv1Storage) rwMetaLocker(ctx context.Context, volume string, path string) (writeLocker, error) {
+func (s *fsv1Storage) rwMetaLocker(ctx context.Context, volume string, path string, truncate bool) (writeLocker, error) {
 
 	metaVolDir, err := s.getVolDir(minioMetaBucket)
 	if err != nil {
@@ -344,7 +344,12 @@ func (s *fsv1Storage) rwMetaLocker(ctx context.Context, volume string, path stri
 	fsPath := pathJoin(volDir, path)
 
 	locks := getLocks(ctx)
-
+	var flags int
+	if truncate {
+		flags = os.O_CREATE|os.O_WRONLY|os.O_TRUNC
+	} else {
+		flags = os.O_CREATE|os.O_WRONLY
+	}
 	for _, l := range locks {
 		if l.LockType() != writeLock {
 			continue
@@ -356,17 +361,20 @@ func (s *fsv1Storage) rwMetaLocker(ctx context.Context, volume string, path stri
 				return nil, errInvalidArgument
 			}
 			wl.Seek(0, io.SeekStart)
-			wl.Truncate(0)
+			if truncate {
+				wl.Truncate(0)
+			}
+
 			return wl, nil
 		}
 		if l.Volume() == volume && l.Path() == path {
-			return s.openFile(pathJoin(volDir, path), os.O_CREATE|os.O_WRONLY|os.O_TRUNC)
+			return s.openFile(pathJoin(volDir, path), flags)
 		}
 
 	}
 	// it is in the meta bucket, but it is not in the meta path
 	if HasPrefix(fsPath, metaVolDir) && !HasPrefix(fsPath, pathJoin(metaVolDir, bucketMetaPrefix)) {
-		return s.openFile(pathJoin(volDir, path), os.O_CREATE|os.O_WRONLY|os.O_TRUNC)
+		return s.openFile(pathJoin(volDir, path), flags)
 	}
 
 	return nil, errFileNotFound
@@ -820,13 +828,18 @@ func (s *fsv1Storage) AppendFile(ctx context.Context, volume string, path string
 		return err
 	}
 
-	w, err := s.openFile(filePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND)
+	file, err := s.rwMetaLocker(ctx, volume, path, false)
 	if err != nil {
 		return err
 	}
-	defer w.Close()
 
-	n, err := io.Copy(w, bytes.NewBuffer(buf))
+	_, err = file.Seek(0, io.SeekEnd)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	n, err := io.Copy(file, bytes.NewBuffer(buf))
 	if err != nil {
 		return err
 	}
@@ -843,7 +856,7 @@ func (s *fsv1Storage) CreateFile(ctx context.Context, volume, path string, fileS
 		return errInvalidArgument
 	}
 
-	file, err := s.rwMetaLocker(ctx, volume, path)
+	file, err := s.rwMetaLocker(ctx, volume, path, true)
 	if err != nil {
 		return err
 	}
@@ -976,7 +989,7 @@ func (s *fsv1Storage) WriteAll(ctx context.Context, volume, path string, b []byt
 	if err = checkPathLength(filePath); err != nil {
 		return err
 	}
-	file, err := s.rwMetaLocker(ctx, volume, path)
+	file, err := s.rwMetaLocker(ctx, volume, path, true)
 	if err != nil {
 		return err
 	}
