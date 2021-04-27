@@ -236,11 +236,9 @@ func (fs *FSObjects) NewMultipartUpload(ctx context.Context, bucket, object stri
 	fi := FileInfo{}
 
 	// Calculate the version to be saved.
-	if opts.Versioned {
-		fi.VersionID = opts.VersionID
-		if fi.VersionID == "" {
-			fi.VersionID = mustGetUUID()
-		}
+	fi.VersionID = opts.VersionID
+	if opts.Versioned && fi.VersionID == "" {
+		fi.VersionID = mustGetUUID()
 	}
 
 	fi.DataDir = mustGetUUID()

@@ -671,8 +671,7 @@ func (fs *FSObjects) GetObjectNInfo(ctx context.Context, bucket, object string, 
 
 	if objInfo.TransitionStatus == lifecycle.TransitionComplete {
 		// If transitioned, stream from transition tier unless object is restored locally or restore date is past.
-		restoreHdr, ok := caseInsensitiveMap(objInfo.UserDefined).Lookup(xhttp.AmzRestore)
-		if !ok || !strings.HasPrefix(restoreHdr, "ongoing-request=false") || (!objInfo.RestoreExpires.IsZero() && time.Now().After(objInfo.RestoreExpires)) {
+		if onDisk := isRestoredObjectOnDisk(objInfo.UserDefined); !onDisk {
 			var transR *GetObjectReader
 			transR, err = getTransitionedObjectReader(ctx, bucket, object, rs, h, objInfo, opts)
 			cleanUpFn()
@@ -791,13 +790,7 @@ func (fs *FSObjects) GetObjectInfo(ctx context.Context, bucket, object string, o
 	}
 
 	oi := fi.ToObjectInfo(bucket, object)
-	if oi.TransitionStatus == lifecycle.TransitionComplete {
-		// overlay storage class for transitioned objects with transition tier SC Label
-		if sc := transitionSC(ctx, bucket); sc != "" {
-			oi.StorageClass = sc
-		}
-	}
-	if !fi.VersionPurgeStatus.Empty() && opts.VersionID != "" {
+	if !fi.VersionPurgeStatus.Empty() {
 		// Make sure to return object info to provide extra information.
 		err = errMethodNotAllowed
 		return oi, toObjectErr(err, bucket, object)
@@ -908,6 +901,11 @@ func (fs *FSObjects) PutObject(ctx context.Context, bucket string, object string
 		return fi.ToObjectInfo(bucket, object), nil
 	}
 
+	fi.VersionID = opts.VersionID
+	if opts.Versioned && fi.VersionID == "" {
+		fi.VersionID = mustGetUUID()
+	}
+
 	fi.DataDir = mustGetUUID()
 	partName := "part.1"
 
@@ -959,11 +957,6 @@ func (fs *FSObjects) PutObject(ctx context.Context, bucket string, object string
 		return ObjectInfo{}, toObjectErr(err, bucket, object)
 	}
 
-	// Stat the file to fetch timestamp, size.
-	//fi, err = fs.disk.ReadVersion(ctx, bucket, object, "", false)
-	//if err != nil {
-	//	return ObjectInfo{}, toObjectErr(err, bucket, object)
-	//}
 	// Success.
 	return fi.ToObjectInfo(bucket, object), nil
 }
@@ -1101,7 +1094,6 @@ func (fs *FSObjects) DeleteObjects(ctx context.Context, bucket string, objects [
 				DeleteMarkerReplicationStatus: versions[verIdx].DeleteMarkerReplicationStatus,
 				ObjectName:                    versions[verIdx].Name,
 				VersionPurgeStatus:            versions[verIdx].VersionPurgeStatus,
-				PurgeTransitioned:             objects[objIndex].PurgeTransitioned,
 			}
 		} else {
 			dobjects[objIndex] = DeletedObject{
@@ -1109,7 +1101,6 @@ func (fs *FSObjects) DeleteObjects(ctx context.Context, bucket string, objects [
 				VersionID:                     versions[verIdx].VersionID,
 				VersionPurgeStatus:            versions[verIdx].VersionPurgeStatus,
 				DeleteMarkerReplicationStatus: versions[verIdx].DeleteMarkerReplicationStatus,
-				PurgeTransitioned:             objects[objIndex].PurgeTransitioned,
 			}
 		}
 	}
@@ -1210,6 +1201,8 @@ func (fs *FSObjects) DeleteObject(ctx context.Context, bucket, object string, op
 				ModTime:                       modTime,
 				DeleteMarkerReplicationStatus: opts.DeleteMarkerReplicationStatus,
 				VersionPurgeStatus:            opts.VersionPurgeStatus,
+				TransitionStatus:              opts.Transition.Status,
+				ExpireRestored:                opts.Transition.ExpireRestored,
 			}
 			if opts.Versioned {
 				fi.VersionID = mustGetUUID()
@@ -1217,7 +1210,6 @@ func (fs *FSObjects) DeleteObject(ctx context.Context, bucket, object string, op
 					fi.VersionID = opts.VersionID
 				}
 			}
-			fi.TransitionStatus = opts.TransitionStatus
 
 			// versioning suspended means we add `null`
 			// version as delete marker
@@ -1239,7 +1231,8 @@ func (fs *FSObjects) DeleteObject(ctx context.Context, bucket, object string, op
 		ModTime:                       modTime,
 		DeleteMarkerReplicationStatus: opts.DeleteMarkerReplicationStatus,
 		VersionPurgeStatus:            opts.VersionPurgeStatus,
-		TransitionStatus:              opts.TransitionStatus,
+		TransitionStatus:              opts.Transition.Status,
+		ExpireRestored:                opts.Transition.ExpireRestored,
 	}, opts.DeleteMarker); err != nil {
 		return objInfo, toObjectErr(err, bucket, object)
 	}
