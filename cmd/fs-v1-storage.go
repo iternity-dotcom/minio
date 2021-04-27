@@ -170,7 +170,6 @@ type writeLocker interface {
 	io.ReadWriteSeeker
 	io.Closer
 	Truncate(int64) error
-	Fd() uintptr
 	Stat() (fs.FileInfo, error)
 }
 
@@ -219,9 +218,6 @@ func (l *rwLock) Seek(offset int64, whence int) (int64, error) {
 }
 func (l *rwLock) Close() error {
 	return nil
-}
-func (l *rwLock) Fd() uintptr {
-	return l.wlk.Fd()
 }
 func (l *rwLock) Truncate(size int64) error {
 	return l.wlk.Truncate(size)
@@ -346,9 +342,9 @@ func (s *fsv1Storage) rwMetaLocker(ctx context.Context, volume string, path stri
 	locks := getLocks(ctx)
 	var flags int
 	if truncate {
-		flags = os.O_CREATE|os.O_WRONLY|os.O_TRUNC
+		flags = os.O_CREATE | os.O_WRONLY | os.O_TRUNC
 	} else {
-		flags = os.O_CREATE|os.O_WRONLY
+		flags = os.O_CREATE | os.O_WRONLY
 	}
 	for _, l := range locks {
 		if l.LockType() != writeLock {
@@ -859,13 +855,6 @@ func (s *fsv1Storage) CreateFile(ctx context.Context, volume, path string, fileS
 	file, err := s.rwMetaLocker(ctx, volume, path, true)
 	if err != nil {
 		return err
-	}
-	// Fallocate only if the size is final object is known.
-	if fileSize > 0 {
-		if err = fsFAllocate(int(file.Fd()), 0, fileSize); err != nil {
-			logger.LogIf(ctx, err)
-			return err
-		}
 	}
 
 	written, err := io.Copy(file, r)
