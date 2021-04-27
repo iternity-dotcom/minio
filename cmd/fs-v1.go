@@ -851,7 +851,11 @@ func (fs *FSObjects) PutObject(ctx context.Context, bucket string, object string
 		atomic.AddInt64(&fs.activeIOCount, -1)
 	}()
 
-	ctx, cleanup, err := fs.disk.ContextWithMetaLock(ctx, writeLock, bucket, object)
+	cleanup := func(err ...error) {}
+	if bucket != minioMetaBucket {
+		ctx, cleanup, err = fs.disk.ContextWithMetaLock(ctx, writeLock, bucket, object)
+	}
+
 	if err != nil {
 		return ObjectInfo{}, toObjectErr(err, bucket, object)
 	}
