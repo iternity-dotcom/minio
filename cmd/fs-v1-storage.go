@@ -170,6 +170,7 @@ type writeLocker interface {
 	io.ReadWriteSeeker
 	io.Closer
 	Truncate(int64) error
+	Fd() uintptr
 	Stat() (fs.FileInfo, error)
 }
 
@@ -218,6 +219,9 @@ func (l *rwLock) Seek(offset int64, whence int) (int64, error) {
 }
 func (l *rwLock) Close() error {
 	return nil
+}
+func (l *rwLock) Fd() uintptr {
+	return l.wlk.Fd()
 }
 func (l *rwLock) Truncate(size int64) error {
 	return l.wlk.Truncate(size)
@@ -818,7 +822,6 @@ func (s *fsv1Storage) AppendFile(ctx context.Context, volume string, path string
 
 	w, err := s.openFile(filePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND)
 	if err != nil {
-		logger.LogIf(ctx, err)
 		return err
 	}
 	defer w.Close()
@@ -836,27 +839,25 @@ func (s *fsv1Storage) AppendFile(ctx context.Context, volume string, path string
 }
 
 func (s *fsv1Storage) CreateFile(ctx context.Context, volume, path string, fileSize int64, r io.Reader) error {
-	volumeDir, err := s.getVolDir(volume)
-	if err != nil {
-		return err
-	}
-	filePath := pathJoin(volumeDir, path)
-
 	if fileSize < -1 {
 		return errInvalidArgument
 	}
 
-	// TODO: handle locking with rwPool
-	parentFilePath := pathutil.Dir(filePath)
-	defer func() {
-		if err != nil {
-			if volume == s.metaTmpBucket {
-				_ = removeAll(parentFilePath)
-			}
-		}
-	}()
-	written, err := fsCreateFile(ctx, filePath, r, fileSize)
+	file, err := s.rwMetaLocker(ctx, volume, path)
 	if err != nil {
+		return err
+	}
+	// Fallocate only if the size is final object is known.
+	if fileSize > 0 {
+		if err = fsFAllocate(int(file.Fd()), 0, fileSize); err != nil {
+			logger.LogIf(ctx, err)
+			return err
+		}
+	}
+
+	written, err := io.Copy(file, r)
+	if err != nil {
+		logger.LogIf(ctx, err)
 		return err
 	}
 
