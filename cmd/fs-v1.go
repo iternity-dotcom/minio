@@ -96,9 +96,9 @@ type fsXlStorage struct {
 	metaTmpBucket string
 }
 
-func (x *fsXlStorage) ContextWithMetaLock(ctx context.Context, volume string, path string, lockType LockType) (context.Context, func(err error), error) {
+func (x *fsXlStorage) ContextWithMetaLock(ctx context.Context, l LockType, volume string, paths...string) (context.Context, func(err ...error), error) {
 	// noop
-	return ctx, func(err error){}, nil
+	return ctx, func(err ...error){}, nil
 }
 
 func (x *fsXlStorage) MetaTmpBucket() string {
