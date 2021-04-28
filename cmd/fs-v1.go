@@ -91,32 +91,6 @@ type fsStorageAPI interface {
 	ContextWithMetaLock(ctx context.Context, lockType LockType, volume string, path ...string) (context.Context, func(err ...error), error)
 }
 
-type fsXlStorage struct {
-	*xlStorage
-	metaTmpBucket string
-}
-
-func (x *fsXlStorage) ContextWithMetaLock(ctx context.Context, l LockType, volume string, paths...string) (context.Context, func(err ...error), error) {
-	// noop
-	return ctx, func(err ...error){}, nil
-}
-
-func (x *fsXlStorage) MetaTmpBucket() string {
-	return x.metaTmpBucket
-}
-
-func (x *fsXlStorage) CacheEntriesToObjInfos(cacheEntries metaCacheEntriesSorted, opts listPathOptions) []ObjectInfo {
-	return cacheEntries.fileInfos(opts.Bucket, opts.Prefix, opts.Separator)
-}
-
-func newLocalFSXLStorage(fsPath string) (*fsXlStorage, error) {
-	storage, err := newLocalXLStorage(fsPath)
-	return &fsXlStorage{
-		xlStorage: storage,
-		metaTmpBucket: minioMetaTmpBucket,
-	}, err
-}
-
 // NewFSObjectLayer - initialize new fs object layer.
 func NewFSObjectLayer(fsPath string) (ObjectLayer, error) {
 	ctx := GlobalContext
@@ -144,7 +118,6 @@ func NewFSObjectLayer(fsPath string) (ObjectLayer, error) {
 	// Initialize fs objects.
 	fs := &FSObjects{
 		disk:                  disk,
-
 		nsMutex:               newNSLock(false),
 		appendFileMap:         make(map[string]*fsAppendFile),
 		deletedCleanupSleeper: newDynamicSleeper(10, 2*time.Second),
