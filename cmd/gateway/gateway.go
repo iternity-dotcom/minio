@@ -23,6 +23,9 @@ import (
 	// NAS
 	_ "github.com/minio/minio/cmd/gateway/nas"
 
+	// NASXL
+	_ "github.com/minio/minio/cmd/gateway/nasxl"
+
 	// Azure
 	_ "github.com/minio/minio/cmd/gateway/azure"
 
