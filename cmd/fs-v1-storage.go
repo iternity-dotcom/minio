@@ -382,6 +382,9 @@ func (s *fsv1Storage) contextWithNMetaLock(ctx context.Context, volume string, p
 		}
 	}
 	for i, path := range paths {
+		if HasSuffix(path, slashSeparator) {
+			continue
+		}
 		lockVolDir, lockFile, err := s.getLockPath(volume, path)
 		if err != nil {
 			errs[i] = err
@@ -423,6 +426,9 @@ func (s *fsv1Storage) contextWithRMetaLock(ctx context.Context, volume string, p
 		}
 	}
 	for i, path := range paths {
+		if HasSuffix(path, slashSeparator) {
+			continue
+		}
 		lockVolDir, lockFile, err := s.getLockPath(volume, path)
 		if err != nil {
 			errs[i] = err
@@ -488,6 +494,9 @@ func (s *fsv1Storage) contextWithRWMetaLock(ctx context.Context, volume string, 
 		}
 	}
 	for i, path := range paths {
+		if HasSuffix(path, slashSeparator) {
+			continue
+		}
 		lockVolDir, lockFile, err := s.getLockPath(volume, path)
 		if err != nil {
 			errs[i] = err
@@ -1031,8 +1040,17 @@ func (s *fsv1Storage) RenameData(ctx context.Context, srcVolume, srcPath string,
 		return err
 	}
 
+	if HasSuffix(dstPath, slashSeparator) {
+		err = s.MakeVol(ctx, pathJoin(dstVolume, dstPath))
+		if err != nil && err != errVolumeExists {
+			return err
+		}
+
+		return nil
+	}
+
 	objectSrcPath := pathutil.Join(srcVolumeDir, pathJoin(srcPath, fi.DataDir, "part.1"))
-	objectDstPath := pathutil.Join(dstVolumeDir, pathJoin(dstPath))
+	objectDstPath := pathutil.Join(dstVolumeDir, dstPath)
 
 	err = renameAll(objectSrcPath, objectDstPath)
 	if err != nil {
@@ -1042,6 +1060,7 @@ func (s *fsv1Storage) RenameData(ctx context.Context, srcVolume, srcPath string,
 	if !HasPrefix(dstVolume, minioMetaBucket) {
 		return s.WriteMetadata(ctx, dstVolume, dstPath, fi)
 	}
+
 	return nil
 }
 

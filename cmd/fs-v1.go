@@ -913,20 +913,6 @@ func (fs *FSObjects) PutObject(ctx context.Context, bucket string, object string
 	if fs.parentDirIsObject(ctx, bucket, path.Dir(object)) {
 		return ObjectInfo{}, toObjectErr(errFileParentIsFile, bucket, object)
 	}
-	// This is a special case with size as '0' and object ends
-	// with a slash separator, we treat it like a valid operation
-	// and return success.
-	if isObjectDir(object, data.Size()) {
-		err = fs.disk.MakeVol(ctx, pathJoin(bucket, object))
-		if err != nil && err != errVolumeExists {
-			logger.LogIf(ctx, err)
-			return ObjectInfo{}, toObjectErr(err, bucket, object)
-		}
-		if fi, err = fs.disk.ReadVersion(ctx, bucket, object, "", false); err != nil {
-			return ObjectInfo{}, toObjectErr(err, bucket, object)
-		}
-		return fi.ToObjectInfo(bucket, object), nil
-	}
 
 	fi.VersionID = opts.VersionID
 	if opts.Versioned && fi.VersionID == "" {
@@ -943,17 +929,19 @@ func (fs *FSObjects) PutObject(ctx context.Context, bucket string, object string
 		fs.deleteObject(context.Background(), fs.disk.MetaTmpBucket(), tempObjFolder)
 	}()
 
-	// Uploaded object will first be written to the temporary location which will eventually
-	// be renamed to the actual location. It is first written to the temporary location
-	// so that cleaning it up will be easy if the server goes down.
-	err = fs.disk.CreateFile(ctx, fs.disk.MetaTmpBucket(), pathJoin(tempObjFolder, fi.DataDir, partName), data.Size(), data)
-	if err != nil {
-		// Should return IncompleteBody{} error when reader has fewer
-		// bytes than specified in request header.
-		if err == errLessData || err == errMoreData {
-			return ObjectInfo{}, IncompleteBody{Bucket: bucket, Object: object}
+	if !isObjectDir(object, data.Size()) {
+		// Uploaded object will first be written to the temporary location which will eventually
+		// be renamed to the actual location. It is first written to the temporary location
+		// so that cleaning it up will be easy if the server goes down.
+		err = fs.disk.CreateFile(ctx, fs.disk.MetaTmpBucket(), pathJoin(tempObjFolder, fi.DataDir, partName), data.Size(), data)
+		if err != nil {
+			// Should return IncompleteBody{} error when reader has fewer
+			// bytes than specified in request header.
+			if err == errLessData || err == errMoreData {
+				return ObjectInfo{}, IncompleteBody{Bucket: bucket, Object: object}
+			}
+			return ObjectInfo{}, toObjectErr(err, bucket, object)
 		}
-		return ObjectInfo{}, toObjectErr(err, bucket, object)
 	}
 
 	fi.AddObjectPart(1, "", data.Size(), data.ActualSize())
