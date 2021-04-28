@@ -89,7 +89,7 @@ func (g *NASXL) Name() string {
 // NewGatewayLayer returns nas gatewaylayer.
 func (g *NASXL) NewGatewayLayer(creds auth.Credentials) (minio.ObjectLayer, error) {
 	var err error
-	newObject, err := minio.NewFSObjectLayer(g.path)
+	newObject, err := minio.NewFSXLObjectLayer(g.path)
 	if err != nil {
 		return nil, err
 	}

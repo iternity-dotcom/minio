@@ -20,7 +20,7 @@ func (x *fsXlStorage) CacheEntriesToObjInfos(cacheEntries metaCacheEntriesSorted
 	return cacheEntries.fileInfos(opts.Bucket, opts.Prefix, opts.Separator)
 }
 
-func newLocalFSXLStorage(fsPath string) (*fsXlStorage, error) {
+func newLocalFSXLStorage(fsPath string) (fsStorageAPI, error) {
 	storage, err := newLocalXLStorage(fsPath)
 	return &fsXlStorage{
 		xlStorage:     storage,

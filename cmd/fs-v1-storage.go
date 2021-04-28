@@ -70,7 +70,7 @@ type fsv1Storage struct {
 	poolIndex, setIndex, diskIndex int
 }
 
-func newLocalFSV1Storage(path string) (*fsv1Storage, error) {
+func newLocalFSV1Storage(path string) (fsStorageAPI, error) {
 	u := url.URL{Path: path}
 	return newFSV1Storage(Endpoint{
 		URL:     &u,
@@ -80,7 +80,7 @@ func newLocalFSV1Storage(path string) (*fsv1Storage, error) {
 }
 
 // Initialize a new storage disk.
-func newFSV1Storage(ep Endpoint) (*fsv1Storage, error) {
+func newFSV1Storage(ep Endpoint) (fsStorageAPI, error) {
 	path := ep.Path
 	var err error
 	if path, err = getValidPath(path); err != nil {
