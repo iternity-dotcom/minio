@@ -196,6 +196,20 @@ func prepareFS() (ObjectLayer, string, error) {
 	return obj, fsDirs[0], nil
 }
 
+func prepareFSXL() (ObjectLayer, string, error) {
+
+	nDisks := 1
+	fsDirs, err := getRandomDisks(nDisks)
+	if err != nil {
+		return nil, "", err
+	}
+	obj, err := NewFSXLObjectLayer(fsDirs[0])
+	if err != nil {
+		return nil, "", err
+	}
+	return obj, fsDirs[0], nil
+}
+
 func prepareErasureSets32(ctx context.Context) (ObjectLayer, []string, error) {
 	return prepareErasure(ctx, 32)
 }
@@ -228,6 +242,17 @@ func initFSObjects(disk string, t *testing.T) (obj ObjectLayer) {
 	return obj
 }
 
+// Initialize FSXL objects.
+func initFSXLObjects(disk string, t *testing.T) (obj ObjectLayer) {
+	var err error
+	obj, err = NewFSXLObjectLayer(disk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newTestConfig(globalMinioDefaultRegion, obj)
+	return obj
+}
+
 // TestErrHandler - Go testing.T satisfy this interface.
 // This makes it easy to run the TestServer from any of the tests.
 // Using this interface, functionalities to be used in tests can be
@@ -239,6 +264,9 @@ type TestErrHandler interface {
 const (
 	// FSTestStr is the string which is used as notation for Single node ObjectLayer in the unit tests.
 	FSTestStr string = "FS"
+
+	// FSTestStr is the string which is used as notation for Single node ObjectLayer in the unit tests.
+	FSXLTestStr string = "FSXL"
 
 	// ErasureTestStr is the string which is used as notation for Erasure ObjectLayer in the unit tests.
 	ErasureTestStr string = "Erasure"
@@ -1646,13 +1674,22 @@ func prepareTestBackend(ctx context.Context, instanceType string) (ObjectLayer, 
 	// Total number of disks for Erasure backend is set to 16.
 	case ErasureTestStr:
 		return prepareErasure16(ctx)
-	default:
+	case FSXLTestStr:
+		// return FS backend by default.
+		obj, disk, err := prepareFSXL()
+		if err != nil {
+			return nil, nil, err
+		}
+		return obj, []string{disk}, nil
+	case FSTestStr:
 		// return FS backend by default.
 		obj, disk, err := prepareFS()
 		if err != nil {
 			return nil, nil, err
 		}
 		return obj, []string{disk}, nil
+	default:
+		return nil, nil, fmt.Errorf("unknown instance type: %s", instanceType)
 	}
 }
 
@@ -1843,6 +1880,19 @@ func ExecObjectLayerAPITest(t *testing.T, objAPITest objAPITestType, endpoints [
 	// Executing the object layer tests for single node setup.
 	objAPITest(objLayer, FSTestStr, bucketFS, fsAPIRouter, credentials, t)
 
+	objLayer, fsXLDir, err := prepareFSXL()
+	if err != nil {
+		t.Fatalf("Initialization of object layer failed for single node setup: %s", err)
+	}
+
+	bucketFSXL, fsXLAPIRouter, err := initAPIHandlerTest(objLayer, endpoints)
+	if err != nil {
+		t.Fatalf("Initialization of API handler tests failed: <ERROR> %s", err)
+	}
+
+	// Executing the object layer tests for single node setup.
+	objAPITest(objLayer, FSXLTestStr, bucketFSXL, fsXLAPIRouter, credentials, t)
+
 	objLayer, erasureDisks, err := prepareErasure16(ctx)
 	if err != nil {
 		t.Fatalf("Initialization of object layer failed for Erasure setup: %s", err)
@@ -1857,7 +1907,7 @@ func ExecObjectLayerAPITest(t *testing.T, objAPITest objAPITestType, endpoints [
 	objAPITest(objLayer, ErasureTestStr, bucketErasure, erAPIRouter, credentials, t)
 
 	// clean up the temporary test backend.
-	removeRoots(append(erasureDisks, fsDir))
+	removeRoots(append(erasureDisks, fsDir, fsXLDir))
 }
 
 // ExecExtendedObjectLayerTest will execute the tests with combinations of encrypted & compressed.
@@ -1916,6 +1966,30 @@ func ExecObjectLayerTest(t TestErrHandler, objTest objTestType) {
 	}
 	defer setObjectLayer(newObjectLayerFn())
 
+	objLayer, fsXLDir, err := prepareFSXL()
+	if err != nil {
+		t.Fatalf("Initialization of object layer failed for single node setup (XLStorage): %s", err)
+	}
+	setObjectLayer(objLayer)
+
+	newAllSubsystems()
+
+	// initialize the server and obtain the credentials and root.
+	// credentials are necessary to sign the HTTP request.
+	if err = newTestConfig(globalMinioDefaultRegion, objLayer); err != nil {
+		t.Fatal("Unexpected error", err)
+	}
+
+	initAllSubsystems(ctx, objLayer)
+
+	// Executing the object layer tests for single node setup.
+	objTest(objLayer, FSXLTestStr, t)
+
+	if localMetacacheMgr != nil {
+		localMetacacheMgr.deleteAll()
+	}
+	defer setObjectLayer(newObjectLayerFn())
+
 	newAllSubsystems()
 	objLayer, fsDirs, err := prepareErasureSets32(ctx)
 	if err != nil {
@@ -1927,7 +2001,7 @@ func ExecObjectLayerTest(t TestErrHandler, objTest objTestType) {
 
 	initAllSubsystems(ctx, objLayer)
 
-	defer removeRoots(append(fsDirs, fsDir))
+	defer removeRoots(append(fsDirs, fsDir, fsXLDir))
 	// Executing the object layer tests for Erasure.
 	objTest(objLayer, ErasureTestStr, t)
 
