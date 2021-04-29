@@ -666,7 +666,7 @@ func (fs *FSObjects) GetObjectNInfo(ctx context.Context, bucket, object string, 
 	objInfo := fi.ToObjectInfo(bucket, object)
 
 	// For a directory, we need to return a reader that returns no bytes.
-	if fs.disk.IsDirObject(object) {
+	if fs.disk.IsDirObject(object) || fi.Size == 0 {
 		// The lock taken above is released when
 		// objReader.Close() is called by the caller.
 		return NewGetObjectReaderFromReader(bytes.NewBuffer(nil), objInfo, opts, nsUnlocker, cleanUpFn)
