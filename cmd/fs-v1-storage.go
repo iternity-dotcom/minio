@@ -567,9 +567,23 @@ func (s *fsv1Storage) CacheEntriesToObjInfos(cacheEntries metaCacheEntriesSorted
 		return oi, err
 	})
 }
+
 func (s *fsv1Storage) MetaTmpBucket() string {
 	return s.metaTmpBucket
 }
+
+func (s *fsv1Storage) EncodeDirObject(object string) string {
+	return object
+}
+
+func (s *fsv1Storage) DecodeDirObject(object string) string {
+	return object
+}
+
+func (s *fsv1Storage) IsDirObject(object string) bool {
+	return HasSuffix(object, slashSeparator)
+}
+
 func (s *fsv1Storage) String() string {
 	return s.diskPath
 }
@@ -1040,7 +1054,7 @@ func (s *fsv1Storage) RenameData(ctx context.Context, srcVolume, srcPath string,
 		return err
 	}
 
-	if HasSuffix(dstPath, slashSeparator) {
+	if s.IsDirObject(dstPath) {
 		err = s.MakeVol(ctx, pathJoin(dstVolume, dstPath))
 		if err != nil && err != errVolumeExists {
 			return err

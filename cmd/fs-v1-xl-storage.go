@@ -20,6 +20,18 @@ func (x *fsXlStorage) CacheEntriesToObjInfos(cacheEntries metaCacheEntriesSorted
 	return cacheEntries.fileInfos(opts.Bucket, opts.Prefix, opts.Separator)
 }
 
+func (x *fsXlStorage) EncodeDirObject(object string) string {
+	return encodeDirObject(object)
+}
+
+func (x *fsXlStorage) DecodeDirObject(object string) string {
+	return decodeDirObject(object)
+}
+
+func (x *fsXlStorage) IsDirObject(object string) bool {
+	return HasSuffix(object, globalDirSuffix)
+}
+
 func newLocalFSXLStorage(fsPath string) (fsStorageAPI, error) {
 	storage, err := newLocalXLStorage(fsPath)
 	return &fsXlStorage{

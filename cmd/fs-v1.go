@@ -89,6 +89,9 @@ type fsStorageAPI interface {
 	MetaTmpBucket() string
 	CacheEntriesToObjInfos(cacheEntries metaCacheEntriesSorted, opts listPathOptions) []ObjectInfo
 	ContextWithMetaLock(ctx context.Context, lockType LockType, volume string, path ...string) (context.Context, func(err ...error), error)
+	EncodeDirObject(object string) string
+	DecodeDirObject(object string) string
+	IsDirObject(object string) bool
 }
 
 // NewFSXLObjectLayer - initialize new fs object layer using the new xl storage meta format.
@@ -488,6 +491,9 @@ func (fs *FSObjects) CopyObject(ctx context.Context, srcBucket, srcObject, dstBu
 		}
 	}
 
+	srcObject = fs.disk.EncodeDirObject(srcObject)
+	dstObject = fs.disk.EncodeDirObject(dstObject)
+
 	cpSrcDstSame := isStringEqual(pathJoin(srcBucket, srcObject), pathJoin(dstBucket, dstObject))
 
 	atomic.AddInt64(&fs.activeIOCount, 1)
@@ -609,6 +615,8 @@ func (fs *FSObjects) GetObjectNInfo(ctx context.Context, bucket, object string, 
 		return nil, err
 	}
 
+	object = fs.disk.EncodeDirObject(object)
+
 	atomic.AddInt64(&fs.activeIOCount, 1)
 	defer func() {
 		atomic.AddInt64(&fs.activeIOCount, -1)
@@ -658,7 +666,7 @@ func (fs *FSObjects) GetObjectNInfo(ctx context.Context, bucket, object string, 
 	objInfo := fi.ToObjectInfo(bucket, object)
 
 	// For a directory, we need to return a reader that returns no bytes.
-	if HasSuffix(object, SlashSeparator) {
+	if fs.disk.IsDirObject(object) {
 		// The lock taken above is released when
 		// objReader.Close() is called by the caller.
 		return NewGetObjectReaderFromReader(bytes.NewBuffer(nil), objInfo, opts, nsUnlocker, cleanUpFn)
@@ -742,6 +750,8 @@ func (fs *FSObjects) GetObjectInfo(ctx context.Context, bucket, object string, o
 	if err = checkGetObjArgs(ctx, bucket, object); err != nil {
 		return ObjectInfo{}, err
 	}
+
+	object = fs.disk.EncodeDirObject(object)
 
 	atomic.AddInt64(&fs.activeIOCount, 1)
 	defer func() {
@@ -833,10 +843,13 @@ func (fs *FSObjects) PutObject(ctx context.Context, bucket string, object string
 	if opts.Versioned {
 		return ObjectInfo{}, NotImplemented{}
 	}
+
 	var err error
 	if err = checkPutObjectArgs(ctx, bucket, object, fs); err != nil {
 		return ObjectInfo{}, err
 	}
+
+	object = fs.disk.EncodeDirObject(object)
 
 	// Lock the object.
 	lk := fs.NewNSLock(bucket, object)
@@ -911,7 +924,7 @@ func (fs *FSObjects) PutObject(ctx context.Context, bucket string, object string
 		fs.deleteObject(context.Background(), fs.disk.MetaTmpBucket(), tempObjFolder)
 	}()
 
-	if !isObjectDir(object, data.Size()) {
+	if !(fs.disk.IsDirObject(object) && data.Size() == 0) {
 		// Uploaded object will first be written to the temporary location which will eventually
 		// be renamed to the actual location. It is first written to the temporary location
 		// so that cleaning it up will be easy if the server goes down.
@@ -959,6 +972,7 @@ func (fs *FSObjects) PutObject(ctx context.Context, bucket string, object string
 }
 
 func (fs *FSObjects) deleteObject(ctx context.Context, bucket, object string) error {
+	object = fs.disk.EncodeDirObject(object)
 	var err error
 	defer ObjectPathUpdated(pathJoin(bucket, object))
 
@@ -990,6 +1004,8 @@ func (fs *FSObjects) DeleteObjects(ctx context.Context, bucket string, objects [
 			}
 			continue
 		}
+
+		objects[i].ObjectName = fs.disk.EncodeDirObject(objects[i].ObjectName)
 		errs[i] = checkDelObjArgs(ctx, bucket, objects[i].ObjectName)
 		if errs[i] == nil {
 			objSets.Add(objects[i].ObjectName)
@@ -1443,6 +1459,8 @@ func (fs *FSObjects) GetObjectTags(ctx context.Context, bucket, object string, o
 			VersionID: opts.VersionID,
 		}
 	}
+
+	object = fs.disk.EncodeDirObject(object)
 	oi, err := fs.GetObjectInfo(ctx, bucket, object, ObjectOptions{})
 	if err != nil {
 		return nil, err
@@ -1453,6 +1471,8 @@ func (fs *FSObjects) GetObjectTags(ctx context.Context, bucket, object string, o
 
 // PutObjectTags - replace or add tags to an existing object
 func (fs *FSObjects) PutObjectTags(ctx context.Context, bucket, object string, tags string, opts ObjectOptions) (ObjectInfo, error) {
+	object = fs.disk.EncodeDirObject(object)
+
 	if opts.VersionID != "" && opts.VersionID != nullVersionID {
 		return ObjectInfo{}, VersionNotFound{
 			Bucket:    bucket,

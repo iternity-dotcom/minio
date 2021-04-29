@@ -55,13 +55,6 @@ var globalObjectAPI ObjectLayer
 //Global cacheObjects, only accessed by newCacheObjectsFn().
 var globalCacheObjectAPI CacheObjectLayer
 
-// Checks if the object is a directory, this logic uses
-// if size == 0 and object ends with SlashSeparator then
-// returns true.
-func isObjectDir(object string, size int64) bool {
-	return HasSuffix(object, SlashSeparator) && size == 0
-}
-
 func newStorageAPIWithoutHealthCheck(endpoint Endpoint) (storage StorageAPI, err error) {
 	if endpoint.IsLocal {
 		storage, err := newXLStorage(endpoint)
