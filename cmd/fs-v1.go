@@ -1334,13 +1334,15 @@ func (fs *FSObjects) fsListObjects(ctx context.Context, opts listPathOptions) (L
 	// Make sure we close the pipe so blocked writes doesn't stay around.
 	defer r.CloseWithError(context.Canceled)
 
+	opts.BaseDir = baseDirFromPrefix(opts.Prefix)
+	opts.SetFilter()
 	go func() {
 		werr := fs.disk.WalkDir(ctx, WalkDirOptions{
 			Bucket:         opts.Bucket,
-			BaseDir:        baseDirFromPrefix(opts.Prefix),
+			BaseDir:        opts.BaseDir,
 			Recursive:      opts.Recursive,
 			ReportNotFound: false,
-			FilterPrefix:   opts.Prefix,
+			FilterPrefix:   opts.FilterPrefix,
 		}, w)
 		w.CloseWithError(werr)
 		if werr != io.EOF && werr != nil &&
