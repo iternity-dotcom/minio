@@ -446,6 +446,13 @@ func (fs *FSObjects) ListBuckets(ctx context.Context) ([]BucketInfo, error) {
 		return bucketInfos[i].Name < bucketInfos[j].Name
 	})
 
+	for idx, bInfo := range bucketInfos {
+		meta, err := globalBucketMetadataSys.Get(bInfo.Name)
+		if err == nil {
+			bucketInfos[idx].Created = meta.Created
+		}
+	}
+
 	// Succes.
 	return bucketInfos, nil
 }
