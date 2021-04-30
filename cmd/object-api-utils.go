@@ -885,6 +885,24 @@ func NewPutObjReader(rawReader *hash.Reader) *PutObjReader {
 	return &PutObjReader{Reader: rawReader, rawReader: rawReader}
 }
 
+type countingReader struct {
+	bytesRead    int64
+	*PutObjReader
+}
+
+func (c *countingReader) Read(p []byte) (n int, err error) {
+	n, err = c.Reader.Read(p)
+	if err == nil || err == io.EOF {
+		c.bytesRead += int64(n)
+	}
+	return n, err
+}
+
+func NewCountingReader(reader *PutObjReader) *countingReader {
+	return &countingReader{
+		PutObjReader: reader,
+	}
+}
 func sealETag(encKey crypto.ObjectKey, md5CurrSum []byte) []byte {
 	var emptyKey [32]byte
 	if bytes.Equal(encKey[:], emptyKey[:]) {

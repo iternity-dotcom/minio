@@ -20,7 +20,6 @@ package cmd
 import (
 	"context"
 	"fmt"
-	"io"
 	"path"
 	pathutil "path"
 	"sort"
@@ -281,19 +280,6 @@ func (fs *FSObjects) CopyObjectPart(ctx context.Context, srcBucket, srcObject, d
 	return partInfo, nil
 }
 
-type countingReader struct {
-	bytesRead    int64
-	targetReader *PutObjReader
-}
-
-func (c *countingReader) Read(p []byte) (n int, err error) {
-	n, err = c.targetReader.Read(p)
-	if err == nil || err == io.EOF {
-		c.bytesRead += int64(n)
-	}
-	return n, err
-}
-
 // PutObjectPart - reads incoming data until EOF for the part file on
 // an ongoing multipart transaction. Internally incoming data is
 // written to '.minio.sys/tmp' location and safely renamed to
@@ -323,16 +309,14 @@ func (fs *FSObjects) PutObjectPart(ctx context.Context, bucket, object, uploadID
 		}
 	}()
 
-	cReader := &countingReader{
-		targetReader: r,
-	}
+	cReader := NewCountingReader(r)
 
 	if _, err := fs.disk.StatVol(ctx, bucket); err != nil {
 		return pi, toObjectErr(err, bucket)
 	}
 
 	// Validate input data size and it can never be less than -1.
-	if r.Size() < -1 {
+	if cReader.Size() < -1 {
 		logger.LogIf(ctx, errInvalidArgument, logger.Application)
 		return pi, toObjectErr(errInvalidArgument)
 	}
@@ -354,7 +338,7 @@ func (fs *FSObjects) PutObjectPart(ctx context.Context, bucket, object, uploadID
 		fs.deleteObject(context.Background(), fs.disk.MetaTmpBucket(), tmpPartPath)
 	}()
 
-	err = fs.disk.CreateFile(ctx, fs.disk.MetaTmpBucket(), tmpPartPath, r.Size(), cReader)
+	err = fs.disk.CreateFile(ctx, fs.disk.MetaTmpBucket(), tmpPartPath, cReader.Size(), cReader)
 	if err != nil {
 		// Should return IncompleteBody{} error when reader has fewer
 		// bytes than specified in request header.
@@ -380,13 +364,13 @@ func (fs *FSObjects) PutObjectPart(ctx context.Context, bucket, object, uploadID
 		return pi, toObjectErr(err, bucket, object)
 	}
 
-	etag := r.MD5CurrentHexString()
+	etag := cReader.MD5CurrentHexString()
 	if etag == "" {
 		etag = GenETag()
 	}
 
 	// Rename temporary part file to its final location.
-	partPath := pathJoin(uploadIDPath, fs.encodePartFile(partID, etag, r.ActualSize()))
+	partPath := pathJoin(uploadIDPath, fs.encodePartFile(partID, etag, cReader.ActualSize()))
 	err = fs.disk.RenameFile(ctx, fs.disk.MetaTmpBucket(), tmpPartPath, minioMetaMultipartBucket, partPath)
 	if err != nil {
 		if err == errFileNotFound || err == errFileAccessDenied {
@@ -396,7 +380,7 @@ func (fs *FSObjects) PutObjectPart(ctx context.Context, bucket, object, uploadID
 	}
 
 	fi.ModTime = UTCNow()
-	fi.AddObjectPart(partID, etag, cReader.bytesRead, r.ActualSize())
+	fi.AddObjectPart(partID, etag, cReader.bytesRead, cReader.ActualSize())
 
 	if err = fs.disk.WriteMetadata(ctx, minioMetaMultipartBucket, uploadIDPath, fi); err != nil {
 		return pi, toObjectErr(err, minioMetaMultipartBucket, uploadIDPath)
@@ -409,7 +393,7 @@ func (fs *FSObjects) PutObjectPart(ctx context.Context, bucket, object, uploadID
 		LastModified: fi.ModTime,
 		ETag:         etag,
 		Size:         cReader.bytesRead,
-		ActualSize:   r.ActualSize(),
+		ActualSize:   cReader.ActualSize(),
 	}, nil
 }
 

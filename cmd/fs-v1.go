@@ -884,7 +884,7 @@ func (fs *FSObjects) PutObject(ctx context.Context, bucket string, object string
 		return ObjectInfo{}, toObjectErr(err, bucket)
 	}
 
-	data := r.Reader
+	cReader := NewCountingReader(r)
 
 	uniqueID := mustGetUUID()
 	tempObjFolder := uniqueID
@@ -895,7 +895,7 @@ func (fs *FSObjects) PutObject(ctx context.Context, bucket string, object string
 	}
 
 	// Validate input data size and it can never be less than zero.
-	if data.Size() < -1 {
+	if cReader.Size() < -1 {
 		logger.LogIf(ctx, errInvalidArgument, logger.Application)
 		return ObjectInfo{}, toObjectErr(errInvalidArgument)
 	}
@@ -924,11 +924,11 @@ func (fs *FSObjects) PutObject(ctx context.Context, bucket string, object string
 		fs.deleteObject(context.Background(), fs.disk.MetaTmpBucket(), tempObjFolder)
 	}()
 
-	if !(fs.disk.IsDirObject(object) && data.Size() == 0) {
+	if !(fs.disk.IsDirObject(object) && cReader.Size() == 0) {
 		// Uploaded object will first be written to the temporary location which will eventually
 		// be renamed to the actual location. It is first written to the temporary location
 		// so that cleaning it up will be easy if the server goes down.
-		err = fs.disk.CreateFile(ctx, fs.disk.MetaTmpBucket(), pathJoin(tempObjFolder, fi.DataDir, partName), data.Size(), data)
+		err = fs.disk.CreateFile(ctx, fs.disk.MetaTmpBucket(), pathJoin(tempObjFolder, fi.DataDir, partName), cReader.Size(), cReader)
 		if err != nil {
 			// Should return IncompleteBody{} error when reader has fewer
 			// bytes than specified in request header.
@@ -939,10 +939,10 @@ func (fs *FSObjects) PutObject(ctx context.Context, bucket string, object string
 		}
 	}
 
-	fi.AddObjectPart(1, "", data.Size(), data.ActualSize())
+	fi.AddObjectPart(1, "", cReader.bytesRead, cReader.ActualSize())
 
 	if opts.UserDefined["etag"] == "" {
-		fi.Metadata["etag"] = r.MD5CurrentHexString()
+		fi.Metadata["etag"] = cReader.MD5CurrentHexString()
 	}
 
 	// Guess content-type from the extension if possible.
@@ -955,7 +955,7 @@ func (fs *FSObjects) PutObject(ctx context.Context, bucket string, object string
 		modTime = UTCNow()
 	}
 
-	fi.Size = data.Size()
+	fi.Size = cReader.bytesRead
 	fi.ModTime = modTime
 
 	// rename

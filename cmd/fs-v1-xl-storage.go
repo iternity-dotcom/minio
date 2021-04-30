@@ -19,13 +19,15 @@ func (x *fsXlStorage) CreateFile(ctx context.Context, volume, path string, fileS
 		return err
 	}
 
-	if hashR, ok := r.(*hash.Reader); ok {
-		if len(hashR.MD5()) != 0 && !bytes.Equal(hashR.MD5(), hashR.MD5Current()) {
+	if countR, ok := r.(*countingReader); ok {
+		hashR := countR.PutObjReader.Reader
+		expectedMD5 := hashR.MD5()
+		calculatedMD5 := hashR.MD5Current()
+		if len(expectedMD5) != 0 && !bytes.Equal(expectedMD5, calculatedMD5) {
 			return hash.BadDigest{
-				ExpectedMD5:   etag.ETag(hashR.MD5()).String(),
-				CalculatedMD5: etag.ETag(hashR.MD5Current()).String(),
+				ExpectedMD5:   etag.ETag(expectedMD5).String(),
+				CalculatedMD5: etag.ETag(calculatedMD5).String(),
 			}
-
 		}
 	}
 
