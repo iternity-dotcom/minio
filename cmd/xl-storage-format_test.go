@@ -61,6 +61,7 @@ func TestIsXLMetaErasureInfoValid(t *testing.T) {
 		{4, 5, 0, false},
 		{5, 5, 0, false},
 		{6, 5, 4, true},
+		{7, 0, 0, true},
 	}
 	for _, tt := range tests {
 		if got := isXLMetaErasureInfoValid(tt.data, tt.parity); got != tt.want {

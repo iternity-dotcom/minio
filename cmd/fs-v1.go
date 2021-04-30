@@ -672,7 +672,7 @@ func (fs *FSObjects) GetObjectNInfo(ctx context.Context, bucket, object string, 
 	}
 	objInfo := fi.ToObjectInfo(bucket, object)
 
-	// For a directory, we need to return a reader that returns no bytes.
+	// For a directory or an empty file, we need to return a reader that returns no bytes.
 	if fs.disk.IsDirObject(object) || fi.Size == 0 {
 		// The lock taken above is released when
 		// objReader.Close() is called by the caller.
@@ -931,7 +931,7 @@ func (fs *FSObjects) PutObject(ctx context.Context, bucket string, object string
 		fs.deleteObject(context.Background(), fs.disk.MetaTmpBucket(), tempObjFolder)
 	}()
 
-	if !(fs.disk.IsDirObject(object) && cReader.Size() == 0) {
+	if !fs.disk.IsDirObject(object) {
 		// Uploaded object will first be written to the temporary location which will eventually
 		// be renamed to the actual location. It is first written to the temporary location
 		// so that cleaning it up will be easy if the server goes down.
