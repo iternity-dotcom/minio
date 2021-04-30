@@ -1132,9 +1132,11 @@ func (fs *FSObjects) DeleteObject(ctx context.Context, bucket, object string, op
 		}
 	}
 	var err error
+	object = fs.disk.EncodeDirObject(object)
 	if err = checkDelObjArgs(ctx, bucket, object); err != nil {
 		return ObjectInfo{}, err
 	}
+
 
 	atomic.AddInt64(&fs.activeIOCount, 1)
 	defer func() {
