@@ -3,9 +3,10 @@ package cmd
 import (
 	"bytes"
 	"context"
+	"io"
+
 	"github.com/minio/minio/pkg/etag"
 	"github.com/minio/minio/pkg/hash"
-	"io"
 )
 
 type fsXlStorage struct {
@@ -13,7 +14,7 @@ type fsXlStorage struct {
 	metaTmpBucket string
 }
 
-func (x *fsXlStorage) CreateFile(ctx context.Context, volume, path string, fileSize int64, r io.Reader) (error) {
+func (x *fsXlStorage) CreateFile(ctx context.Context, volume, path string, fileSize int64, r io.Reader) error {
 	err := x.xlStorage.CreateFile(ctx, volume, path, fileSize, r)
 	if err != nil {
 		return err

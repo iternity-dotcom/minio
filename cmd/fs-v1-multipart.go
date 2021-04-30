@@ -309,7 +309,7 @@ func (fs *FSObjects) PutObjectPart(ctx context.Context, bucket, object, uploadID
 		}
 	}()
 
-	cReader := NewCountingReader(r)
+	cReader := newCountingReader(r)
 
 	if _, err := fs.disk.StatVol(ctx, bucket); err != nil {
 		return pi, toObjectErr(err, bucket)

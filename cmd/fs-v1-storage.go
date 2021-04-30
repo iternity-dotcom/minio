@@ -213,7 +213,6 @@ func (l *rwLock) LockType() LockType {
 
 type rLock struct {
 	*lockPaths
-	getVolDir func(string) (string, error)
 	*lock.RLockedFile
 }
 
@@ -226,20 +225,19 @@ func (l *rLock) LockType() LockType {
 
 type nLock struct {
 	*lockPaths
-	getVolDir func(string) (string, error)
 }
 
 func (l *nLock) LockType() LockType {
 	return noLock
 }
 
-type MetaLock interface {
+type metaLock interface {
 	Volume() string
 	Path() string
 	LockPath() string
 	LockType() LockType
 }
-type locks map[string]MetaLock
+type locks map[string]metaLock
 
 func getLocks(ctx context.Context) locks {
 	var l interface{}

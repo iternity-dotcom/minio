@@ -886,7 +886,7 @@ func NewPutObjReader(rawReader *hash.Reader) *PutObjReader {
 }
 
 type countingReader struct {
-	bytesRead    int64
+	bytesRead int64
 	*PutObjReader
 }
 
@@ -898,7 +898,7 @@ func (c *countingReader) Read(p []byte) (n int, err error) {
 	return n, err
 }
 
-func NewCountingReader(reader *PutObjReader) *countingReader {
+func newCountingReader(reader *PutObjReader) *countingReader {
 	return &countingReader{
 		PutObjReader: reader,
 	}

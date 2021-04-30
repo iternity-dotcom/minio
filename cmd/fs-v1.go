@@ -891,7 +891,7 @@ func (fs *FSObjects) PutObject(ctx context.Context, bucket string, object string
 		return ObjectInfo{}, toObjectErr(err, bucket)
 	}
 
-	cReader := NewCountingReader(r)
+	cReader := newCountingReader(r)
 
 	uniqueID := mustGetUUID()
 	tempObjFolder := uniqueID
@@ -1143,7 +1143,6 @@ func (fs *FSObjects) DeleteObject(ctx context.Context, bucket, object string, op
 	if err = checkDelObjArgs(ctx, bucket, object); err != nil {
 		return ObjectInfo{}, err
 	}
-
 
 	atomic.AddInt64(&fs.activeIOCount, 1)
 	defer func() {
