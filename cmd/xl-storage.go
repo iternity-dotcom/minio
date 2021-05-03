@@ -108,6 +108,8 @@ type xlStorage struct {
 
 	diskID string
 
+	openFileDirectIO func(ctx context.Context, volume string, path string, flag int, perm os.FileMode) (FileWriter, error)
+	openFileNormal   func(ctx context.Context, volume string, path string, flag int, perm os.FileMode) (FileWriter, error)
 	// Indexes, will be -1 until assigned a set.
 	poolIndex, setIndex, diskIndex int
 
@@ -278,6 +280,8 @@ func newXLStorage(ep Endpoint) (*xlStorage, error) {
 		diskIndex:  -1,
 	}
 
+	p.openFileDirectIO = p._openFileDirectIO
+	p.openFileNormal = p._openFile
 	// Create all necessary bucket folders if possible.
 	if err = p.MakeVolBulk(context.TODO(), minioMetaBucket, minioMetaTmpBucket, minioMetaMultipartBucket, dataUsageBucket); err != nil {
 		return nil, err
@@ -288,7 +292,7 @@ func newXLStorage(ep Endpoint) (*xlStorage, error) {
 	_, _ = rand.Read(rnd[:])
 	tmpFile := ".writable-check-" + hex.EncodeToString(rnd[:]) + ".tmp"
 	filePath := pathJoin(p.diskPath, minioMetaTmpBucket, tmpFile)
-	w, err := disk.OpenFileDirectIO(filePath, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0666)
+	w, err := OpenFileDirectIO(filePath, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0666)
 	if err != nil {
 		return p, err
 	}
@@ -319,6 +323,25 @@ func getDiskInfo(diskPath string) (di disk.Info, err error) {
 	}
 
 	return di, err
+}
+
+func (s *xlStorage) _openFile(ctx context.Context, volume string, path string, flag int, perm os.FileMode) (FileWriter, error) {
+	volumeDir, err := s.getVolDir(volume)
+	if err != nil {
+		return nil, err
+	}
+
+	filePath := pathJoin(volumeDir, path)
+	return OpenFile(filePath, flag, perm)
+}
+func (s *xlStorage) _openFileDirectIO(ctx context.Context, volume string, path string, flag int, perm os.FileMode) (FileWriter, error) {
+	volumeDir, err := s.getVolDir(volume)
+	if err != nil {
+		return nil, err
+	}
+
+	filePath := pathJoin(volumeDir, path)
+	return OpenFileDirectIO(filePath, flag, perm)
 }
 
 // Implements stringer compatible interface.
@@ -1081,7 +1104,7 @@ func (s *xlStorage) ReadVersion(ctx context.Context, volume, path, versionID str
 			// Enable O_DIRECT optionally only if drive supports it.
 			requireDirectIO := globalStorageClass.GetDMA() == storageclass.DMAReadWrite
 			partPath := fmt.Sprintf("part.%d", fi.Parts[0].Number)
-			fi.Data, err = s.readAllData(volumeDir, pathJoin(volumeDir, path, fi.DataDir, partPath), requireDirectIO)
+			fi.Data, err = s.readAllData(ctx, volume, pathJoin(path, fi.DataDir, partPath), requireDirectIO)
 			if err != nil {
 				return FileInfo{}, err
 			}
@@ -1091,14 +1114,18 @@ func (s *xlStorage) ReadVersion(ctx context.Context, volume, path, versionID str
 	return fi, nil
 }
 
-func (s *xlStorage) readAllData(volumeDir string, filePath string, requireDirectIO bool) (buf []byte, err error) {
+func (s *xlStorage) readAllData(ctx context.Context, volume string, path string, requireDirectIO bool) (buf []byte, err error) {
+	volumeDir, err := s.getVolDir(volume)
+	if err != nil {
+		return nil, err
+	}
 	var r io.ReadCloser
 	if requireDirectIO {
-		var f *os.File
-		f, err = disk.OpenFileDirectIO(filePath, readMode, 0666)
+		var f FileWriter
+		f, err = s.openFileDirectIO(ctx, volume, path, readMode, 0666)
 		r = &odirectReader{f, nil, nil, true, true, s, nil}
 	} else {
-		r, err = OpenFile(filePath, readMode, 0)
+		r, err = s.openFileNormal(ctx, volume, path, readMode, 0)
 	}
 	if err != nil {
 		if osIsNotExist(err) {
@@ -1120,7 +1147,7 @@ func (s *xlStorage) readAllData(volumeDir string, filePath string, requireDirect
 		} else if isSysErrTooManyFiles(err) {
 			return nil, errTooManyOpenFiles
 		} else if isSysErrInvalidArg(err) {
-			st, _ := Lstat(filePath)
+			st, _ := Lstat(pathJoin(volumeDir, path))
 			if st != nil && st.IsDir() {
 				// Linux returns InvalidArg for directory O_DIRECT
 				// we need to keep this fallback code to return correct
@@ -1160,7 +1187,7 @@ func (s *xlStorage) ReadAll(ctx context.Context, volume string, path string) (bu
 	}
 
 	requireDirectIO := globalStorageClass.GetDMA() == storageclass.DMAReadWrite
-	return s.readAllData(volumeDir, filePath, requireDirectIO)
+	return s.readAllData(ctx, volume, path, requireDirectIO)
 }
 
 // ReadFile reads exactly len(buf) bytes into buf. It returns the
@@ -1207,7 +1234,7 @@ func (s *xlStorage) ReadFile(ctx context.Context, volume string, path string, of
 	}
 
 	// Open the file for reading.
-	file, err := Open(filePath)
+	file, err := s.openFileNormal(ctx, volume, path, readMode, 0)
 	if err != nil {
 		switch {
 		case osIsNotExist(err):
@@ -1268,14 +1295,22 @@ func (s *xlStorage) ReadFile(ctx context.Context, volume string, path string, of
 	return int64(len(buffer)), nil
 }
 
-func (s *xlStorage) openFile(filePath string, mode int) (f *os.File, err error) {
+func (s *xlStorage) openFile(ctx context.Context, volume string, path string, mode int) (FileWriter, error) {
+
+	volumeDir, err := s.getVolDir(volume)
+	if err != nil {
+		return nil, err
+	}
+
+	filePath := pathJoin(volumeDir, path)
+
 	// Create top level directories if they don't exist.
 	// with mode 0777 mkdir honors system umask.
-	if err = mkdirAll(pathutil.Dir(filePath), 0777); err != nil {
+	if err := mkdirAll(pathutil.Dir(filePath), 0777); err != nil {
 		return nil, osErrToFileErr(err)
 	}
 
-	w, err := OpenFile(filePath, mode|writeMode, 0666)
+	w, err := s.openFileNormal(ctx, volume, path, mode|writeMode, 0666)
 	if err != nil {
 		// File path cannot be verified since one of the parents is a file.
 		switch {
@@ -1297,7 +1332,7 @@ func (s *xlStorage) openFile(filePath string, mode int) (f *os.File, err error) 
 
 // To support O_DIRECT reads for erasure backends.
 type odirectReader struct {
-	f         *os.File
+	f         FileWriter
 	buf       []byte
 	bufp      *[]byte
 	freshRead bool
@@ -1323,7 +1358,7 @@ func (o *odirectReader) Read(buf []byte) (n int, err error) {
 		n, err = o.f.Read(o.buf)
 		if err != nil && err != io.EOF {
 			if isSysErrInvalidArg(err) {
-				if err = disk.DisableDirectIO(o.f); err != nil {
+				if err = disk.DisableDirectIO(o.f.Fd()); err != nil {
 					o.err = err
 					return n, err
 				}
@@ -1381,13 +1416,13 @@ func (s *xlStorage) ReadFileStream(ctx context.Context, volume, path string, off
 		return nil, err
 	}
 
-	var file *os.File
+	var file FileWriter
 	// O_DIRECT only supported if offset is zero
 	if offset == 0 && globalStorageClass.GetDMA() == storageclass.DMAReadWrite {
-		file, err = disk.OpenFileDirectIO(filePath, readMode, 0666)
+		file, err = s.openFileDirectIO(ctx, volume, path, readMode, 0666)
 	} else {
 		// Open the file for reading.
-		file, err = OpenFile(filePath, readMode, 0666)
+		file, err = s.openFileNormal(ctx, volume, path, readMode, 0666)
 	}
 	if err != nil {
 		switch {
@@ -1505,7 +1540,7 @@ func (s *xlStorage) CreateFile(ctx context.Context, volume, path string, fileSiz
 	if fileSize >= 0 && fileSize <= smallFileThreshold {
 		// For streams smaller than 128KiB we simply write them as O_DSYNC (fdatasync)
 		// and not O_DIRECT to avoid the complexities of aligned I/O.
-		w, err := s.openFile(filePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC)
+		w, err := s.openFile(ctx, volume, path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC)
 		if err != nil {
 			return err
 		}
@@ -1531,13 +1566,13 @@ func (s *xlStorage) CreateFile(ctx context.Context, volume, path string, fileSiz
 		return osErrToFileErr(err)
 	}
 
-	w, err := OpenFileDirectIO(filePath, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0666)
+	w, err := s.openFileDirectIO(ctx, volume, path, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0666)
 	if err != nil {
 		return osErrToFileErr(err)
 	}
 
 	defer func() {
-		disk.Fdatasync(w) // Only interested in flushing the size_t not mtime/atime
+		disk.Fdatasync(w.Fd()) // Only interested in flushing the size_t not mtime/atime
 		w.Close()
 	}()
 
@@ -1569,7 +1604,7 @@ func (s *xlStorage) WriteAll(ctx context.Context, volume string, path string, b 
 		return err
 	}
 
-	w, err := s.openFile(filePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC)
+	w, err := s.openFile(ctx, volume, path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC)
 	if err != nil {
 		return err
 	}
@@ -1612,10 +1647,10 @@ func (s *xlStorage) AppendFile(ctx context.Context, volume string, path string, 
 		return err
 	}
 
-	var w *os.File
 	// Create file if not found. Not doing O_DIRECT here to avoid the code that does buffer aligned writes.
+	var w FileWriter
 	// AppendFile() is only used by healing code to heal objects written in old format.
-	w, err = s.openFile(filePath, os.O_CREATE|os.O_APPEND|os.O_WRONLY)
+	w, err = s.openFile(ctx, volume, path, os.O_CREATE|os.O_APPEND|os.O_WRONLY)
 	if err != nil {
 		return err
 	}

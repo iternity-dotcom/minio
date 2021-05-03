@@ -24,7 +24,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"io"
-	"io/fs"
 	"io/ioutil"
 	"net/url"
 	"os"
@@ -166,382 +165,31 @@ func newFSV1Storage(ep Endpoint) (fsStorageAPI, error) {
 	return p, nil
 }
 
-type writeLocker interface {
-	io.ReadWriteSeeker
-	io.Closer
-	Truncate(int64) error
-	Stat() (fs.FileInfo, error)
-}
-
-type readLocker interface {
-	io.ReadSeeker
-	io.Closer
-	Stat() (fs.FileInfo, error)
-}
-
-type lockPaths struct {
-	volume   string
-	path     string
-	lockPath string
-}
-
-func (lp *lockPaths) Volume() string {
-	return lp.volume
-}
-
-func (lp *lockPaths) Path() string {
-	return lp.path
-}
-
-func (lp *lockPaths) LockPath() string {
-	return lp.lockPath
-}
-
-type rwLock struct {
-	*lockPaths
-	getVolDir func(string) (string, error)
-	openFile  func(filePath string, mode int) (*os.File, error)
-	*lock.LockedFile
-}
-
-func (l *rwLock) Close() error {
-	return nil
-}
-func (l *rwLock) LockType() LockType {
-	return writeLock
-}
-
-type rLock struct {
-	*lockPaths
-	*lock.RLockedFile
-}
-
-func (l *rLock) Close() error {
-	return nil
-}
-func (l *rLock) LockType() LockType {
-	return readLock
-}
-
-type nLock struct {
-	*lockPaths
-}
-
-func (l *nLock) LockType() LockType {
-	return noLock
-}
-
-type metaLock interface {
-	Volume() string
-	Path() string
-	LockPath() string
-	LockType() LockType
-}
-type locks map[string]metaLock
-
-func getLocks(ctx context.Context) locks {
-	var l interface{}
-	var fl locks
-	var ok bool
-	if l = ctx.Value(objectLock); l == nil {
-		return nil
-	}
-
-	if fl, ok = l.(locks); !ok {
-		return nil
-	}
-	return fl
-}
-
-func (s *fsv1Storage) rMetaLocker(ctx context.Context, volume string, path string) (readLocker, error) {
-
-	metaVolDir, err := s.getVolDir(minioMetaBucket)
-	if err != nil {
-		return nil, err
-	}
-
-	volDir, err := s.getVolDir(volume)
-	if err != nil {
-		return nil, err
-	}
-	fsPath := pathJoin(volDir, path)
-
-	locks := getLocks(ctx)
-
-	for _, l := range locks {
-		if l.LockType() == writeLock || l.LockType() == readLock {
-			if fsPath == l.LockPath() {
-				rl, ok := l.(readLocker)
-				if !ok {
-					return nil, errInvalidArgument
-				}
-				rl.Seek(0, io.SeekStart)
-				return rl, nil
-			}
-			if l.Volume() == volume && l.Path() == path {
-				return OpenFile(pathJoin(volDir, path), readMode, 0)
-			}
-		} else if l.LockType() == noLock {
-			if fsPath == l.LockPath() {
-				return OpenFile(pathJoin(volDir, path), readMode, 0)
-			}
-			if l.Volume() == volume && l.Path() == path {
-				return OpenFile(pathJoin(volDir, path), readMode, 0)
-			}
-		}
-
-	}
-
-	// it is in the meta bucket, but it is not in the meta path
-	if HasPrefix(fsPath, metaVolDir) && !HasPrefix(fsPath, pathJoin(metaVolDir, bucketMetaPrefix)) {
-		return OpenFile(pathJoin(volDir, path), readMode, 0)
-	}
-
-	return nil, errFileNotFound
-}
-
-func (s *fsv1Storage) rwMetaLocker(ctx context.Context, volume string, path string, truncate bool) (writeLocker, error) {
-
-	metaVolDir, err := s.getVolDir(minioMetaBucket)
-	if err != nil {
-		return nil, err
-	}
-
-	volDir, err := s.getVolDir(volume)
-	if err != nil {
-		return nil, err
-	}
-	fsPath := pathJoin(volDir, path)
-
-	locks := getLocks(ctx)
-	var flags int
-	if truncate {
-		flags = os.O_CREATE | os.O_WRONLY | os.O_TRUNC
-	} else {
-		flags = os.O_CREATE | os.O_WRONLY
-	}
-	for _, l := range locks {
-		if l.LockType() != writeLock {
-			continue
-		}
-
-		if fsPath == l.LockPath() {
-			wl, ok := l.(writeLocker)
-			if !ok {
-				return nil, errInvalidArgument
-			}
-			wl.Seek(0, io.SeekStart)
-			if truncate {
-				wl.Truncate(0)
-			}
-
-			return wl, nil
-		}
-		if l.Volume() == volume && l.Path() == path {
-			return s.openFile(pathJoin(volDir, path), flags)
-		}
-
-	}
-	// it is in the meta bucket, but it is not in the meta path
-	if HasPrefix(fsPath, metaVolDir) && !HasPrefix(fsPath, pathJoin(metaVolDir, bucketMetaPrefix)) {
-		return s.openFile(pathJoin(volDir, path), flags)
-	}
-
-	return nil, errFileNotFound
-}
-
 func (s *fsv1Storage) ContextWithMetaLock(ctx context.Context, lockType LockType, volume string, paths ...string) (context.Context, func(err ...error), error) {
+
+	if l := ctx.Value(objectLock); l != nil {
+		return nil, nil, lock.ErrAlreadyLocked
+	}
+	var fLocks locks
+	var cleanup func(err ...error)
+	var err error
 	switch lockType {
 	case writeLock:
-		return s.contextWithRWMetaLock(ctx, volume, paths...)
+		fLocks, cleanup, err = s.rwPool.newRWMetaLock(s, volume, paths...)
 	case readLock:
-		return s.contextWithRMetaLock(ctx, volume, paths...)
+		fLocks, cleanup, err = s.rwPool.newRMetaLock(s, volume, paths...)
 	case noLock:
-		return s.contextWithNMetaLock(ctx, volume, paths...)
+		fLocks, cleanup, err = s.rwPool.newNMetaLock(s, volume, paths...)
 	default:
 		return nil, nil, errInvalidArgument
 	}
-}
 
-func (s *fsv1Storage) contextWithNMetaLock(ctx context.Context, volume string, paths ...string) (context.Context, func(err ...error), error) {
-
-	if l := ctx.Value(objectLock); l != nil {
-		return nil, nil, lock.ErrAlreadyLocked
+	if err != nil {
+		return nil, nil, err
 	}
-
-	fLocks := make(locks, len(paths))
-	errs := make([]error, len(paths))
-	cleanups := make([]func(error), len(paths))
-	cleanup := func(errs ...error) {
-		for i, cleanupFunction := range cleanups {
-			if cleanupFunction != nil {
-				cleanupFunction(errs[i])
-			}
-		}
-	}
-	for i, path := range paths {
-		if HasSuffix(path, slashSeparator) {
-			continue
-		}
-		lockVolDir, lockFile, err := s.getLockPath(volume, path)
-		if err != nil {
-			errs[i] = err
-			cleanup(errs...)
-			return nil, nil, err
-		}
-		lockPath := pathJoin(lockVolDir, lockFile)
-
-		if _, ok := fLocks[lockPath]; ok {
-			continue
-		}
-		fLocks[lockPath] = &nLock{
-			lockPaths: &lockPaths{
-				volume:   volume,
-				path:     path,
-				lockPath: lockPath,
-			},
-		}
-		cleanups[i] = func(err error) {}
-	}
-
 	return context.WithValue(ctx, objectLock, fLocks), cleanup, nil
 }
 
-func (s *fsv1Storage) contextWithRMetaLock(ctx context.Context, volume string, paths ...string) (context.Context, func(err ...error), error) {
-
-	if l := ctx.Value(objectLock); l != nil {
-		return nil, nil, lock.ErrAlreadyLocked
-	}
-
-	fLocks := make(locks, len(paths))
-	errs := make([]error, len(paths))
-	cleanups := make([]func(error), len(paths))
-	cleanup := func(errs ...error) {
-		for i, cleanupFunction := range cleanups {
-			if cleanupFunction != nil {
-				cleanupFunction(errs[i])
-			}
-		}
-	}
-	for i, path := range paths {
-		if HasSuffix(path, slashSeparator) {
-			continue
-		}
-		lockVolDir, lockFile, err := s.getLockPath(volume, path)
-		if err != nil {
-			errs[i] = err
-			cleanup(errs...)
-			return nil, nil, err
-		}
-		lockPath := pathJoin(lockVolDir, lockFile)
-
-		if _, ok := fLocks[lockPath]; ok {
-			continue
-		}
-		var rlk *lock.RLockedFile
-		rlk, err = s.rwPool.Open(lockPath)
-		if err != nil {
-			if err == errFileNotFound {
-				fLocks[lockPath] = &nLock{
-					lockPaths: &lockPaths{
-						volume:   volume,
-						path:     path,
-						lockPath: lockPath,
-					},
-				}
-				cleanups[i] = func(err error) {}
-			} else {
-				errs[i] = err
-				cleanup(errs...)
-				return nil, nil, err
-			}
-		} else {
-			fLocks[lockPath] = &rLock{
-				lockPaths: &lockPaths{
-					volume:   volume,
-					path:     path,
-					lockPath: lockPath,
-				},
-				RLockedFile: rlk,
-			}
-			cleanups[i] = func(err error) {
-				s.rwPool.Close(lockPath)
-			}
-
-		}
-
-	}
-
-	return context.WithValue(ctx, objectLock, fLocks), cleanup, nil
-}
-
-func (s *fsv1Storage) contextWithRWMetaLock(ctx context.Context, volume string, paths ...string) (context.Context, func(err ...error), error) {
-
-	if l := ctx.Value(objectLock); l != nil {
-		return nil, nil, lock.ErrAlreadyLocked
-	}
-
-	fLocks := make(locks, len(paths))
-	errs := make([]error, len(paths))
-	cleanups := make([]func(error), len(paths))
-	cleanup := func(errs ...error) {
-		for i, cleanupFunction := range cleanups {
-			if cleanupFunction != nil {
-				cleanupFunction(errs[i])
-			}
-		}
-	}
-	for i, path := range paths {
-		if HasSuffix(path, slashSeparator) {
-			continue
-		}
-		lockVolDir, lockFile, err := s.getLockPath(volume, path)
-		if err != nil {
-			errs[i] = err
-			cleanup(errs...)
-			return nil, nil, err
-		}
-		lockPath := pathJoin(lockVolDir, lockFile)
-
-		if _, ok := fLocks[lockPath]; ok {
-			continue
-		}
-		var wlk *lock.LockedFile
-		wlk, err = s.rwPool.Write(lockPath)
-		var freshFile bool
-		if err != nil {
-			wlk, err = s.rwPool.Create(lockPath)
-			if err != nil {
-				errs[i] = err
-				cleanup(errs...)
-				return nil, nil, err
-			}
-			freshFile = true
-		}
-		fLocks[lockPath] = &rwLock{
-			lockPaths: &lockPaths{
-				volume:   volume,
-				path:     path,
-				lockPath: lockPath,
-			},
-			LockedFile: wlk,
-			openFile:   s.openFile,
-			getVolDir:  s.getVolDir,
-		}
-		cleanups[i] = func(err error) {
-			wlk.Close()
-			if err != nil && freshFile {
-				s.deleteFile(lockVolDir, lockPath, true)
-			}
-		}
-	}
-
-	return context.WithValue(ctx, objectLock, fLocks), cleanup, nil
-}
-
-func (s *fsv1Storage) getMetaPathFile(volume string, path string) string {
-	return pathJoin(bucketMetaPrefix, volume, path, fsMetaJSONFile)
-}
 func (s *fsv1Storage) getLockPath(volume string, path string) (string, string, error) {
 	if HasPrefix(pathJoin(volume, path), minioMetaBucket) {
 		volDir, err := s.getVolDir(volume)
@@ -556,7 +204,18 @@ func (s *fsv1Storage) getLockPath(volume string, path string) (string, string, e
 	}
 	return volDir, s.getMetaPathFile(volume, path), nil
 }
+func (s *fsv1Storage) getMetaPathFile(volume string, path string) string {
+	return pathJoin(bucketMetaPrefix, volume, path, fsMetaJSONFile)
+}
 
+func (s *fsv1Storage) rMetaLocker(ctx context.Context, volume string, path string) (FileWriter, error) {
+	locks := getLocks(ctx)
+	return locks.rMetaLocker(s, volume, path)
+}
+func (s *fsv1Storage) rwMetaLocker(ctx context.Context, volume string, path string, truncate bool) (FileWriter, error) {
+	locks := getLocks(ctx)
+	return locks.rwMetaLocker(s, volume, path, truncate)
+}
 func (s *fsv1Storage) CacheEntriesToObjInfos(cacheEntries metaCacheEntriesSorted, opts listPathOptions) []ObjectInfo {
 	return cacheEntries.objectInfos(opts.Bucket, opts.Prefix, opts.Separator, func(objectInfoBuf []byte) (ObjectInfo, error) {
 		oi := ObjectInfo{}
@@ -1074,33 +733,6 @@ func (s *fsv1Storage) RenameData(ctx context.Context, srcVolume, srcPath string,
 	}
 
 	return nil
-}
-
-func (s *fsv1Storage) openFile(filePath string, mode int) (f *os.File, err error) {
-	// Create top level directories if they don't exist.
-	// with mode 0777 mkdir honors system umask.
-	if err = mkdirAll(pathutil.Dir(filePath), 0777); err != nil {
-		return nil, osErrToFileErr(err)
-	}
-
-	w, err := OpenFile(filePath, mode|writeMode, 0666)
-	if err != nil {
-		// File path cannot be verified since one of the parents is a file.
-		switch {
-		case isSysErrIsDir(err):
-			return nil, errIsNotRegular
-		case osIsPermission(err):
-			return nil, errFileAccessDenied
-		case isSysErrIO(err):
-			return nil, errFaultyDisk
-		case isSysErrTooManyFiles(err):
-			return nil, errTooManyOpenFiles
-		default:
-			return nil, err
-		}
-	}
-
-	return w, nil
 }
 
 // ReadVersion - reads metadata and returns FileInfo at path `fs.json`

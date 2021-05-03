@@ -231,6 +231,11 @@ func SameFile(fi1, fi2 os.FileInfo) bool {
 // directio.AlignSize is defined as 0 in MacOS causing divide by 0 error.
 const directioAlignSize = 4096
 
+type fdWriter interface {
+	io.Writer
+	Fd() uintptr
+}
+
 // CopyAligned - copies from reader to writer using the aligned input
 // buffer, it is expected that input buffer is page aligned to
 // 4K page boundaries. Without passing aligned buffer may cause
@@ -240,14 +245,14 @@ const directioAlignSize = 4096
 // used with DIRECT I/O based file descriptor and it is expected that
 // input writer *os.File not a generic io.Writer. Make sure to have
 // the file opened for writes with syscall.O_DIRECT flag.
-func CopyAligned(w *os.File, r io.Reader, alignedBuf []byte, totalSize int64) (int64, error) {
+func CopyAligned(w fdWriter, r io.Reader, alignedBuf []byte, totalSize int64) (int64, error) {
 	// Writes remaining bytes in the buffer.
-	writeUnaligned := func(w *os.File, buf []byte) (remainingWritten int64, err error) {
+	writeUnaligned := func(w fdWriter, buf []byte) (remainingWritten int64, err error) {
 		// Disable O_DIRECT on fd's on unaligned buffer
 		// perform an amortized Fdatasync(fd) on the fd at
 		// the end, this is performed by the caller before
 		// closing 'w'.
-		if err = disk.DisableDirectIO(w); err != nil {
+		if err = disk.DisableDirectIO(w.Fd()); err != nil {
 			return remainingWritten, err
 		}
 		return io.Copy(w, bytes.NewReader(buf))

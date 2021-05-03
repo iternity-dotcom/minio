@@ -85,7 +85,7 @@ func GetHealthInfo(ctx context.Context, drive, fsPath string) (Latency, Throughp
 	}
 
 	// Sync every full writes fdatasync
-	Fdatasync(w)
+	Fdatasync(w.Fd())
 
 	for i := range latencies {
 		throughput := float64(blockSize) / latencies[i]
