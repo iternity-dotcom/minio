@@ -87,11 +87,11 @@ type fsAppendFile struct {
 type fsStorageAPI interface {
 	StorageAPI
 	MetaTmpBucket() string
-	CacheEntriesToObjInfos(cacheEntries metaCacheEntriesSorted, opts listPathOptions) []ObjectInfo
 	ContextWithMetaLock(ctx context.Context, lockType LockType, volume string, path ...string) (context.Context, func(err ...error), error)
 	EncodeDirObject(object string) string
 	DecodeDirObject(object string) string
 	IsDirObject(object string) bool
+	VersioningSupported() bool
 }
 
 // NewFSXLObjectLayer - initialize new fs object layer using the new xl storage meta format.
@@ -326,7 +326,7 @@ func (fs *FSObjects) GetDisksID(_ ...string) []StorageAPI {
 
 // MakeBucketWithLocation - create a new bucket, returns if it already exists.
 func (fs *FSObjects) MakeBucketWithLocation(ctx context.Context, bucket string, opts BucketOptions) error {
-	if opts.LockEnabled || opts.VersioningEnabled {
+	if (opts.LockEnabled || opts.VersioningEnabled) && !fs.disk.VersioningSupported() {
 		return NotImplemented{}
 	}
 
@@ -347,6 +347,11 @@ func (fs *FSObjects) MakeBucketWithLocation(ctx context.Context, bucket string, 
 	}
 
 	meta := newBucketMetadata(bucket)
+	if opts.LockEnabled {
+		meta.VersioningConfigXML = enabledBucketVersioningConfig
+		meta.ObjectLockConfigXML = enabledBucketObjectLockConfig
+	}
+
 	if err := meta.Save(ctx, fs); err != nil {
 		return toObjectErr(err, bucket)
 	}
@@ -354,6 +359,53 @@ func (fs *FSObjects) MakeBucketWithLocation(ctx context.Context, bucket string, 
 	globalBucketMetadataSys.Set(bucket, meta)
 
 	return nil
+}
+
+func (fs *FSObjects) PutObjectMetadata(ctx context.Context, bucket, object string, opts ObjectOptions) (ObjectInfo, error) {
+	object = fs.disk.EncodeDirObject(object)
+
+	var err error
+	// Lock the object before updating tags.
+	lk := fs.NewNSLock(bucket, object)
+	ctx, err = lk.GetLock(ctx, globalOperationTimeout)
+	if err != nil {
+		return ObjectInfo{}, err
+	}
+	defer lk.Unlock()
+
+	ctx, cleanup, err := fs.disk.ContextWithMetaLock(ctx, writeLock, bucket, object)
+	if err != nil {
+		return ObjectInfo{}, err
+	}
+
+	defer func() {
+		cleanup(err)
+	}()
+
+	fi, err := fs.disk.ReadVersion(ctx, bucket, object, opts.VersionID, false)
+	if err != nil {
+		return ObjectInfo{}, toObjectErr(err, bucket, object)
+	}
+
+	if fi.Deleted {
+		if opts.VersionID == "" {
+			return ObjectInfo{}, toObjectErr(errFileNotFound, bucket, object)
+		}
+		return ObjectInfo{}, toObjectErr(errMethodNotAllowed, bucket, object)
+	}
+
+	for k, v := range opts.UserDefined {
+		fi.Metadata[k] = v
+	}
+	fi.ModTime = opts.MTime
+	fi.VersionID = opts.VersionID
+
+	if err = fs.disk.UpdateMetadata(ctx, bucket, object, fi); err != nil {
+		return ObjectInfo{}, toObjectErr(err, bucket, object)
+	}
+
+	objInfo := fi.ToObjectInfo(bucket, object)
+	return objInfo, nil
 }
 
 // GetBucketPolicy - only needed for FS in NAS mode
@@ -490,7 +542,7 @@ func (fs *FSObjects) DeleteBucket(ctx context.Context, bucket string, forceDelet
 // if source object and destination object are same we only
 // update metadata.
 func (fs *FSObjects) CopyObject(ctx context.Context, srcBucket, srcObject, dstBucket, dstObject string, srcInfo ObjectInfo, srcOpts, dstOpts ObjectOptions) (ObjectInfo, error) {
-	if srcOpts.VersionID != "" && srcOpts.VersionID != nullVersionID {
+	if srcOpts.VersionID != "" && srcOpts.VersionID != nullVersionID && !fs.disk.VersioningSupported(){
 		return ObjectInfo{}, VersionNotFound{
 			Bucket:    srcBucket,
 			Object:    srcObject,
@@ -611,7 +663,7 @@ func (fs *FSObjects) updateMetaObject(ctx context.Context, bucket, object string
 func (fs *FSObjects) GetObjectNInfo(ctx context.Context, bucket, object string, rs *HTTPRangeSpec, h http.Header, lockType LockType, opts ObjectOptions) (*GetObjectReader, error) {
 	var cleanup func(...error)
 	var err error
-	if opts.VersionID != "" && opts.VersionID != nullVersionID {
+	if  opts.VersionID != "" && opts.VersionID != nullVersionID && !fs.disk.VersioningSupported() {
 		return nil, VersionNotFound{
 			Bucket:    bucket,
 			Object:    object,
@@ -672,18 +724,10 @@ func (fs *FSObjects) GetObjectNInfo(ctx context.Context, bucket, object string, 
 	}
 	objInfo := fi.ToObjectInfo(bucket, object)
 
-	// For a directory or an empty file, we need to return a reader that returns no bytes.
-	if fs.disk.IsDirObject(object) || fi.Size == 0 {
-		// The lock taken above is released when
-		// objReader.Close() is called by the caller.
-		return NewGetObjectReaderFromReader(bytes.NewBuffer(nil), objInfo, opts, nsUnlocker, cleanUpFn)
-	}
-
 	if objInfo.DeleteMarker {
 		if opts.VersionID == "" {
 			err = errFileNotFound
 		} else {
-
 			err = errMethodNotAllowed
 		}
 		cleanUpFn()
@@ -692,6 +736,15 @@ func (fs *FSObjects) GetObjectNInfo(ctx context.Context, bucket, object string, 
 			ObjInfo: objInfo,
 		}, toObjectErr(err, bucket, object)
 	}
+
+	// For a directory or an empty file, we need to return a reader that returns no bytes.
+	if fs.disk.IsDirObject(object) || fi.Size == 0 {
+		// The lock taken above is released when
+		// objReader.Close() is called by the caller.
+		return NewGetObjectReaderFromReader(bytes.NewBuffer(nil), objInfo, opts, nsUnlocker, cleanUpFn)
+	}
+
+
 
 	if objInfo.TransitionStatus == lifecycle.TransitionComplete {
 		// If transitioned, stream from transition tier unless object is restored locally or restore date is past.
@@ -745,7 +798,7 @@ func (fs *FSObjects) GetObjectNInfo(ctx context.Context, bucket, object string, 
 func (fs *FSObjects) GetObjectInfo(ctx context.Context, bucket, object string, opts ObjectOptions) (ObjectInfo, error) {
 
 	var cleanup func(...error)
-	if opts.VersionID != "" && opts.VersionID != nullVersionID {
+	if  opts.VersionID != "" && opts.VersionID != nullVersionID && !fs.disk.VersioningSupported() {
 		return ObjectInfo{}, VersionNotFound{
 			Bucket:    bucket,
 			Object:    object,
@@ -847,7 +900,7 @@ func (fs *FSObjects) parentDirIsObject(ctx context.Context, bucket, parent strin
 // Additionally writes `fs.json` which carries the necessary metadata
 // for future object operations.
 func (fs *FSObjects) PutObject(ctx context.Context, bucket string, object string, r *PutObjReader, opts ObjectOptions) (ObjectInfo, error) {
-	if opts.Versioned {
+	if opts.Versioned && !fs.disk.VersioningSupported() {
 		return ObjectInfo{}, NotImplemented{}
 	}
 
@@ -1003,7 +1056,7 @@ func (fs *FSObjects) DeleteObjects(ctx context.Context, bucket string, objects [
 	errs := make([]error, len(objects))
 	objSets := set.NewStringSet()
 	for i := range objects {
-		if objects[i].VersionID != "" {
+		if objects[i].VersionID != "" && !fs.disk.VersioningSupported() {
 			errs[i] = VersionNotFound{
 				Bucket:    bucket,
 				Object:    objects[i].ObjectName,
@@ -1131,7 +1184,7 @@ func (fs *FSObjects) DeleteObjects(ctx context.Context, bucket string, objects [
 // DeleteObject - deletes an object from a bucket, this operation is destructive
 // and there are no rollbacks supported.
 func (fs *FSObjects) DeleteObject(ctx context.Context, bucket, object string, opts ObjectOptions) (ObjectInfo, error) {
-	if opts.VersionID != "" && opts.VersionID != nullVersionID {
+	if opts.VersionID != "" && opts.VersionID != nullVersionID && !fs.disk.VersioningSupported() {
 		return ObjectInfo{}, VersionNotFound{
 			Bucket:    bucket,
 			Object:    object,
@@ -1267,14 +1320,16 @@ func (fs *FSObjects) DeleteObject(ctx context.Context, bucket, object string, op
 	}, nil
 }
 
-// ListObjectVersions not implemented for FS mode.
-func (fs *FSObjects) ListObjectVersions(ctx context.Context, bucket, prefix, marker, versionMarker, delimiter string, maxKeys int) (loi ListObjectVersionsInfo, e error) {
-	return loi, NotImplemented{}
-}
+func (fs *FSObjects) ListObjectVersions(ctx context.Context, bucket, prefix, marker, versionMarker, delimiter string, maxKeys int) (ListObjectVersionsInfo, error) {
+	loi := ListObjectVersionsInfo{}
+	if !fs.disk.VersioningSupported() {
+		return loi, NotImplemented{}
+	}
 
-// ListObjects - list all objects at prefix upto maxKeys., optionally delimited by '/'. Maintains the list pool
-// state for future re-entrant list requests.
-func (fs *FSObjects) ListObjects(ctx context.Context, bucket, prefix, marker, delimiter string, maxKeys int) (loi ListObjectsInfo, e error) {
+	if marker == "" && versionMarker != "" {
+		return loi, NotImplemented{}
+	}
+
 	atomic.AddInt64(&fs.activeIOCount, 1)
 	defer func() {
 		atomic.AddInt64(&fs.activeIOCount, -1)
@@ -1289,39 +1344,144 @@ func (fs *FSObjects) ListObjects(ctx context.Context, bucket, prefix, marker, de
 		Bucket:             bucket,
 		Prefix:             prefix,
 		Separator:          delimiter,
-		Limit:              maxKeys,
+		Limit:              maxKeysPlusOne(maxKeys, marker != ""),
 		Marker:             marker,
 		Recursive:          recursive,
 		InclDeleted:        true,
 		IncludeDirectories: delimiter == SlashSeparator,
-		AskDisks:           0,
 	}
 
-	return fs.fsListObjects(ctx, opts)
+	entries, err := fs.fsListObjects(ctx, opts)
+
+	var eof bool
+	if err != nil {
+		if err == io.EOF {
+			eof = true
+		} else {
+			return ListObjectVersionsInfo{}, err
+		}
+	}
+
+	if opts.Limit > 0 && entries.len() > opts.Limit {
+		entries.truncate(opts.Limit)
+		eof = false
+	}
+
+	if opts.Marker != "" && len(entries.o) > 0 && entries.o[0].name == opts.Marker && versionMarker == ""{
+		entries.o = entries.o[1:]
+	}
+
+	objInfos := entries.fileInfoVersions(bucket, prefix, delimiter, versionMarker)
+
+	if maxKeys > 0 && len(objInfos) > maxKeys {
+		objInfos = objInfos[:maxKeys]
+		eof = false
+	}
+	for _, objInfo := range objInfos {
+		if objInfo.IsDir && objInfo.ModTime.IsZero() && opts.Separator != "" {
+			loi.Prefixes = append(loi.Prefixes, objInfo.Name)
+			continue
+		}
+		loi.Objects = append(loi.Objects, objInfo)
+	}
+
+	if !eof && len(objInfos) > 0{
+		loi.IsTruncated = true
+		last := objInfos[len(objInfos)-1]
+		loi.NextMarker = last.Name
+		loi.NextVersionIDMarker = last.VersionID
+	}
+
+	return loi, nil
 }
 
-func (fs *FSObjects) fsListObjects(ctx context.Context, opts listPathOptions) (ListObjectsInfo, error) {
-	var loi ListObjectsInfo
+// ListObjects - list all objects at prefix upto maxKeys., optionally delimited by '/'. Maintains the list pool
+// state for future re-entrant list requests.
+func (fs *FSObjects) ListObjects(ctx context.Context, bucket, prefix, marker, delimiter string, maxKeys int) (ListObjectsInfo, error) {
+	atomic.AddInt64(&fs.activeIOCount, 1)
+	defer func() {
+		atomic.AddInt64(&fs.activeIOCount, -1)
+	}()
+
+	// Default is recursive, if delimiter is set then list non recursive.
+	recursive := true
+	if delimiter == SlashSeparator {
+		recursive = false
+	}
+	opts := listPathOptions{
+		Bucket:             bucket,
+		Prefix:             prefix,
+		Separator:          delimiter,
+		Limit:              maxKeysPlusOne(maxKeys, marker != ""),
+		Marker:             marker,
+		Recursive:          recursive,
+		InclDeleted:        false,
+		IncludeDirectories: delimiter == SlashSeparator,
+	}
+
+	entries, err := fs.fsListObjects(ctx, opts)
+
+	var eof bool
+	if err != nil {
+		if err == io.EOF {
+			eof = true
+		} else {
+			return ListObjectsInfo{}, err
+		}
+	}
+
+	if opts.Limit > 0 && entries.len() > opts.Limit {
+		entries.truncate(opts.Limit)
+		eof = false
+	}
+
+	if opts.Marker != "" && len(entries.o) > 0 && entries.o[0].name == opts.Marker {
+		entries.o = entries.o[1:]
+	}
+
+	objInfos := entries.fileInfos(bucket, prefix, delimiter)
+
+	result := ListObjectsInfo{}
+	for _, objInfo := range objInfos {
+		if objInfo.IsDir && opts.Separator != "" {
+			result.Prefixes = append(result.Prefixes, objInfo.Name)
+			continue
+		}
+		result.Objects = append(result.Objects, objInfo)
+	}
+
+	if !eof && len(objInfos) > 0{
+		result.IsTruncated = true
+		if len(objInfos) > 0 {
+			result.NextMarker = objInfos[len(objInfos)-1].Name
+		}
+	}
+
+	return result, nil
+}
+
+func (fs *FSObjects) fsListObjects(ctx context.Context, opts listPathOptions) (metaCacheEntriesSorted, error) {
+	var m metaCacheEntriesSorted
 
 	// Cancel upstream if we finish before we expect.
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	if err := checkListObjsArgs(ctx, opts.Bucket, opts.Prefix, opts.Marker, fs); err != nil {
-		return loi, err
+		return m, err
 	}
 
 	// Marker is set validate pre-condition.
-	if opts.Marker != "" {
+	if opts.Marker != "" && opts.Prefix != "" {
 		// Marker not common with prefix is not implemented. Send an empty response
 		if !HasPrefix(opts.Marker, opts.Prefix) {
-			return loi, nil
+			return m, io.EOF
 		}
 	}
 
 	// With max keys of zero we have reached eof, return right here.
 	if opts.Limit == 0 {
-		return loi, nil
+		return m, io.EOF
 	}
 
 	// For delimiter and prefix as '/' we do not list anything at all
@@ -1330,13 +1490,13 @@ func (fs *FSObjects) fsListObjects(ctx context.Context, opts listPathOptions) (L
 	// as '/' we don't have any entries, since all the keys are
 	// of form 'keyName/...'
 	if opts.Separator == SlashSeparator && opts.Prefix == SlashSeparator {
-		return loi, nil
+		return m, io.EOF
 	}
 
 	r, w := io.Pipe()
 	metaR, err := newMetacacheReader(r)
 	if err != nil {
-		return loi, err
+		return m, err
 	}
 
 	// Make sure we close the pipe so blocked writes doesn't stay around.
@@ -1361,47 +1521,7 @@ func (fs *FSObjects) fsListObjects(ctx context.Context, opts listPathOptions) (L
 		}
 	}()
 
-	var eof bool
-	result := ListObjectsInfo{}
-
-	opts.Limit = maxKeysPlusOne(opts.Limit, opts.Marker != "")
-	entries, err := metaR.filter(opts)
-	if err != nil {
-		if err == io.EOF {
-			eof = true
-		} else {
-			return loi, err
-		}
-	}
-
-	if opts.Limit > 0 && entries.len() > opts.Limit {
-		entries.truncate(opts.Limit)
-		eof = false
-	}
-
-	if opts.Marker != "" && len(entries.o) > 0 && entries.o[0].name == opts.Marker {
-		entries.o = entries.o[1:]
-	}
-
-	objInfos := fs.disk.CacheEntriesToObjInfos(entries, opts)
-
-	for _, objInfo := range objInfos {
-		if objInfo.IsDir && opts.Separator != "" {
-			result.Prefixes = append(result.Prefixes, objInfo.Name)
-			continue
-		}
-		result.Objects = append(result.Objects, objInfo)
-	}
-
-	if !eof {
-		result.IsTruncated = true
-		if len(objInfos) > 0 {
-			result.NextMarker = objInfos[len(objInfos)-1].Name
-		}
-	}
-
-	// Success.
-	return result, nil
+	return metaR.filter(opts)
 }
 
 // fileInfoVersionsFS is a copy of fileInfos converts the metadata to FileInfoVersions where possible.
@@ -1462,7 +1582,7 @@ func (m *metaCacheEntriesSorted) objectInfos(bucket, prefix, delimiter string, o
 
 // GetObjectTags - get object tags from an existing object
 func (fs *FSObjects) GetObjectTags(ctx context.Context, bucket, object string, opts ObjectOptions) (*tags.Tags, error) {
-	if opts.VersionID != "" && opts.VersionID != nullVersionID {
+	if opts.VersionID != "" && opts.VersionID != nullVersionID && !fs.disk.VersioningSupported() {
 		return nil, VersionNotFound{
 			Bucket:    bucket,
 			Object:    object,
@@ -1471,7 +1591,7 @@ func (fs *FSObjects) GetObjectTags(ctx context.Context, bucket, object string, o
 	}
 
 	object = fs.disk.EncodeDirObject(object)
-	oi, err := fs.GetObjectInfo(ctx, bucket, object, ObjectOptions{})
+	oi, err := fs.GetObjectInfo(ctx, bucket, object, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -1483,7 +1603,7 @@ func (fs *FSObjects) GetObjectTags(ctx context.Context, bucket, object string, o
 func (fs *FSObjects) PutObjectTags(ctx context.Context, bucket, object string, tags string, opts ObjectOptions) (ObjectInfo, error) {
 	object = fs.disk.EncodeDirObject(object)
 
-	if opts.VersionID != "" && opts.VersionID != nullVersionID {
+	if opts.VersionID != "" && opts.VersionID != nullVersionID && !fs.disk.VersioningSupported() {
 		return ObjectInfo{}, VersionNotFound{
 			Bucket:    bucket,
 			Object:    object,

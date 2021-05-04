@@ -213,15 +213,6 @@ func (s *fsv1Storage) _openFile(ctx context.Context, volume string, path string,
 	return locks.metaLocker(s, volume, path, flag, perm)
 }
 
-func (s *fsv1Storage) CacheEntriesToObjInfos(cacheEntries metaCacheEntriesSorted, opts listPathOptions) []ObjectInfo {
-	return cacheEntries.objectInfos(opts.Bucket, opts.Prefix, opts.Separator, func(objectInfoBuf []byte) (ObjectInfo, error) {
-		oi := ObjectInfo{}
-		var json = jsoniter.ConfigCompatibleWithStandardLibrary
-		err := json.Unmarshal(objectInfoBuf, &oi)
-		return oi, err
-	})
-}
-
 func (s *fsv1Storage) MetaTmpBucket() string {
 	return s.metaTmpBucket
 }
@@ -236,6 +227,10 @@ func (s *fsv1Storage) DecodeDirObject(object string) string {
 
 func (s *fsv1Storage) IsDirObject(object string) bool {
 	return HasSuffix(object, slashSeparator)
+}
+
+func (s *fsv1Storage) VersioningSupported() bool {
+	return false
 }
 
 func (s *fsv1Storage) String() string {
@@ -1224,30 +1219,46 @@ func (s *fsv1Storage) isObjectDir(bucket, prefix string) bool {
 	return len(entries) == 0
 }
 
-func (s *fsv1Storage) getObjectInfoNoFSLockBuf(bucket, object string) ([]byte, error) {
-	objInfo, err := s.getObjectInfoNoFSLock(bucket, object)
+func (s *fsv1Storage) getXLMetaV2NoFSLockBuf(bucket, object string) ([]byte, error) {
+	xlmeta, err := s.getXLMetaV2NoFSLock(bucket, object)
 	if err != nil {
 		return nil, err
 	}
 
-	var json = jsoniter.ConfigCompatibleWithStandardLibrary
-	return json.Marshal(objInfo)
+	return xlmeta.AppendTo(nil)
 }
 
-func (s *fsv1Storage) getObjectInfoNoFSLock(bucket, object string) (oi ObjectInfo, e error) {
-	fsMeta := fsMetaV1{}
+func (s *fsv1Storage) getXLMetaV2NoFSLock(bucket, object string) (xlMetaV2, error) {
+	xlMeta := xlMetaV2{}
 	if HasSuffix(object, SlashSeparator) {
 		fi, err := fsStatDir(s.ctx, pathJoin(s.String(), bucket, object))
 		if err != nil {
-			return oi, err
+			return xlMeta, err
 		}
-		return fsMeta.ToObjectInfo(bucket, object, fi), nil
+
+		xlMeta.Versions = []xlMetaV2Version{
+			{
+				Type: ObjectType,
+				ObjectV2: &xlMetaV2Object{
+					ErasureAlgorithm: ReedSolomon,
+					BitrotChecksumAlgo: HighwayHash,
+					PartNumbers: []int{1},
+					Size: 0,
+					PartActualSizes: []int64{0},
+					PartSizes: []int64{0},
+					PartETags: []string{""},
+					ModTime: fi.ModTime().UnixNano(),
+				},
+			},
+		}
+		return xlMeta, nil
 	}
 
 	fsMetaPath := pathJoin(s.String(), minioMetaBucket, bucketMetaPrefix, bucket, object, fsMetaJSONFile)
 	// Read `fs.json` to perhaps contend with
 	// parallel Put() operations.
 
+	var fsMeta fsMetaV1
 	rc, _, err := fsOpenFile(s.ctx, fsMetaPath, 0)
 	if err == nil {
 		fsMetaBuf, rerr := ioutil.ReadAll(rc)
@@ -1272,16 +1283,33 @@ func (s *fsv1Storage) getObjectInfoNoFSLock(bucket, object string) (oi ObjectInf
 	// Ignore if `fs.json` is not available, this is true for pre-existing data.
 	if err != nil && err != errFileNotFound {
 		logger.LogIf(s.ctx, err)
-		return oi, err
+		return xlMetaV2{}, err
 	}
 
 	// Stat the file to get file size.
 	fi, err := fsStatFile(s.ctx, pathJoin(s.String(), bucket, object))
 	if err != nil {
-		return oi, err
+		return xlMetaV2{}, err
 	}
 
-	return fsMeta.ToObjectInfo(bucket, object, fi), nil
+	xlMeta.Versions = []xlMetaV2Version{
+		{
+			Type: ObjectType,
+			ObjectV2: &xlMetaV2Object{
+				ErasureAlgorithm: ReedSolomon,
+				BitrotChecksumAlgo: HighwayHash,
+				PartNumbers: []int{1},
+				MetaUser: fsMeta.Meta,
+				Size: fsMeta.Parts[0].Size,
+				PartActualSizes: []int64{fsMeta.Parts[0].ActualSize},
+				PartSizes: []int64{fsMeta.Parts[0].Size},
+				PartETags: []string{""},
+				ModTime: fi.ModTime().UnixNano(),
+			},
+		},
+	}
+
+	return xlMeta, nil
 }
 
 // WalkDir will traverse a directory and return all entries found.
@@ -1346,7 +1374,7 @@ func (s *fsv1Storage) WalkDir(ctx context.Context, opts WalkDirOptions, wr io.Wr
 			if strings.HasSuffix(entry, slashSeparator) {
 				cacheEntry := metaCacheEntry{name: pathJoin(current, entry)}
 				if s.isObjectDir(opts.Bucket, pathJoin(current, entry)) {
-					cacheEntry.metadata, err = s.getObjectInfoNoFSLockBuf(opts.Bucket, pathJoin(current, entry))
+					cacheEntry.metadata, err = s.getXLMetaV2NoFSLockBuf(opts.Bucket, pathJoin(current, entry))
 					if err != nil {
 						logger.LogIf(ctx, err)
 						continue
@@ -1374,7 +1402,7 @@ func (s *fsv1Storage) WalkDir(ctx context.Context, opts WalkDirOptions, wr io.Wr
 			}
 			// If root was an object return it as such.
 			var meta metaCacheEntry
-			meta.metadata, err = s.getObjectInfoNoFSLockBuf(opts.Bucket, pathJoin(current, entry))
+			meta.metadata, err = s.getXLMetaV2NoFSLockBuf(opts.Bucket, pathJoin(current, entry))
 			if err != nil {
 				logger.LogIf(ctx, err)
 				continue
