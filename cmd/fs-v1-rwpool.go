@@ -40,6 +40,8 @@ type truncatingFileWriter interface {
 	FileWriter
 	Truncate(int64) error
 }
+
+// FileWriter is a wrapper interface, which mimics *os.File
 type FileWriter interface {
 	io.ReadWriteSeeker
 	io.Closer
@@ -122,7 +124,7 @@ func getLocks(ctx context.Context) locks {
 
 type storageFunctions interface {
 	getLockPath(volume string, path string) (string, string, error)
-	getVolDir(string) (string, error)
+	getVolDir(volume string) (string, error)
 	deleteFile(string, string, bool) error
 }
 
@@ -322,8 +324,9 @@ func (fsi *fsIOPool) Close(path string) error {
 	return nil
 }
 
-func (ls locks) rMetaLocker(s storageFunctions, volume string, path string) (FileWriter, error) {
+func (ls locks) metaLocker(s storageFunctions, volume string, path string, flag int, perm os.FileMode) (FileWriter, error) {
 
+	readLock := false
 	metaVolDir, err := s.getVolDir(minioMetaBucket)
 	if err != nil {
 		return nil, err
@@ -335,6 +338,32 @@ func (ls locks) rMetaLocker(s storageFunctions, volume string, path string) (Fil
 	}
 	fsPath := pathJoin(volDir, path)
 
+	var f FileWriter
+	if flag&os.O_WRONLY == 0 && flag&os.O_RDWR == 0 {
+		readLock = true
+		f, err = ls.rMetaLocker(fsPath, volume, path, flag, perm)
+	} else {
+		f, err = ls.rwMetaLocker(fsPath, volume, path, flag, perm)
+	}
+
+	if err != nil {
+		return nil, err
+	}
+	if f != nil {
+		return f, nil
+	}
+
+	// it is in the meta bucket, but it is not in the meta path
+	if HasPrefix(fsPath, metaVolDir) && !HasPrefix(fsPath, pathJoin(metaVolDir, bucketMetaPrefix)) {
+		if readLock {
+			return OpenFile(pathJoin(volDir, path), flag, perm)
+		}
+		return createFile(pathJoin(volDir, path), flag)
+	}
+	return nil, errFileNotFound
+}
+
+func (ls locks) rMetaLocker(fsPath string, volume string, path string, flag int, perm os.FileMode) (FileWriter, error) {
 	for _, l := range ls {
 		if l.LockType() == writeLock || l.LockType() == readLock {
 			if fsPath == l.LockPath() {
@@ -346,45 +375,29 @@ func (ls locks) rMetaLocker(s storageFunctions, volume string, path string) (Fil
 				return rl, nil
 			}
 			if l.Volume() == volume && HasPrefix(path, l.Path()) {
-				return OpenFile(pathJoin(volDir, path), readMode, 0)
+				return OpenFile(fsPath, flag, perm)
 			}
 		} else if l.LockType() == noLock {
 			if fsPath == l.LockPath() {
-				return OpenFile(pathJoin(volDir, path), readMode, 0)
+				return OpenFile(fsPath, flag, perm)
 			}
 			if l.Volume() == volume && HasPrefix(path, l.Path()) {
-				return OpenFile(pathJoin(volDir, path), readMode, 0)
+				return OpenFile(fsPath, flag, perm)
 			}
 		}
-
 	}
-
-	// it is in the meta bucket, but it is not in the meta path
-	if HasPrefix(fsPath, metaVolDir) && !HasPrefix(fsPath, pathJoin(metaVolDir, bucketMetaPrefix)) {
-		return OpenFile(pathJoin(volDir, path), readMode, 0)
-	}
-
-	return nil, errFileNotFound
+	return nil, nil
 }
 
-func (ls locks) rwMetaLocker(s storageFunctions, volume string, path string, truncate bool) (FileWriter, error) {
+func (ls locks) rwMetaLocker(fsPath string, volume string, path string, flag int, perm os.FileMode) (FileWriter, error) {
 
-	metaVolDir, err := s.getVolDir(minioMetaBucket)
-	if err != nil {
-		return nil, err
+	truncate := false
+	append := false
+	if (flag & os.O_TRUNC) > 0 {
+		truncate = true
 	}
-
-	volDir, err := s.getVolDir(volume)
-	if err != nil {
-		return nil, err
-	}
-	fsPath := pathJoin(volDir, path)
-
-	var flags int
-	if truncate {
-		flags = os.O_CREATE | os.O_WRONLY | os.O_TRUNC
-	} else {
-		flags = os.O_CREATE | os.O_WRONLY
+	if (flag & os.O_APPEND) > 0 {
+		append = true
 	}
 	for _, l := range ls {
 		if l.LockType() != writeLock {
@@ -396,24 +409,23 @@ func (ls locks) rwMetaLocker(s storageFunctions, volume string, path string, tru
 			if !ok {
 				return nil, errInvalidArgument
 			}
-			wl.Seek(0, io.SeekStart)
 			if truncate {
+				wl.Seek(0, io.SeekStart)
 				wl.Truncate(0)
+			} else if append {
+				wl.Seek(0, io.SeekEnd)
+			} else {
+				wl.Seek(0, io.SeekStart)
 			}
 
 			return wl, nil
 		}
 		if l.Volume() == volume && HasPrefix(path, l.Path()) {
-			return createFile(pathJoin(volDir, path), flags)
+			return createFile(fsPath, flag)
 		}
-
-	}
-	// it is in the meta bucket, but it is not in the meta path
-	if HasPrefix(fsPath, metaVolDir) && !HasPrefix(fsPath, pathJoin(metaVolDir, bucketMetaPrefix)) {
-		return createFile(pathJoin(volDir, path), flags)
 	}
 
-	return nil, errFileNotFound
+	return nil, nil
 }
 
 func (fsi *fsIOPool) newNMetaLock(s storageFunctions, volume string, paths ...string) (locks, func(err ...error), error) {

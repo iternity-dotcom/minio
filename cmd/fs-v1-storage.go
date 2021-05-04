@@ -208,14 +208,11 @@ func (s *fsv1Storage) getMetaPathFile(volume string, path string) string {
 	return pathJoin(bucketMetaPrefix, volume, path, fsMetaJSONFile)
 }
 
-func (s *fsv1Storage) rMetaLocker(ctx context.Context, volume string, path string) (FileWriter, error) {
+func (s *fsv1Storage) _openFile(ctx context.Context, volume string, path string, flag int, perm os.FileMode) (FileWriter, error) {
 	locks := getLocks(ctx)
-	return locks.rMetaLocker(s, volume, path)
+	return locks.metaLocker(s, volume, path, flag, perm)
 }
-func (s *fsv1Storage) rwMetaLocker(ctx context.Context, volume string, path string, truncate bool) (FileWriter, error) {
-	locks := getLocks(ctx)
-	return locks.rwMetaLocker(s, volume, path, truncate)
-}
+
 func (s *fsv1Storage) CacheEntriesToObjInfos(cacheEntries metaCacheEntriesSorted, opts listPathOptions) []ObjectInfo {
 	return cacheEntries.objectInfos(opts.Bucket, opts.Prefix, opts.Separator, func(objectInfoBuf []byte) (ObjectInfo, error) {
 		oi := ObjectInfo{}
@@ -480,7 +477,7 @@ func (s *fsv1Storage) AppendFile(ctx context.Context, volume string, path string
 		return err
 	}
 
-	file, err := s.rwMetaLocker(ctx, volume, path, false)
+	file, err := s._openFile(ctx, volume, path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0666)
 	if err != nil {
 		return err
 	}
@@ -508,7 +505,7 @@ func (s *fsv1Storage) CreateFile(ctx context.Context, volume, path string, fileS
 		return errInvalidArgument
 	}
 
-	file, err := s.rwMetaLocker(ctx, volume, path, true)
+	file, err := s._openFile(ctx, volume, path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0666)
 	if err != nil {
 		return err
 	}
@@ -635,7 +632,7 @@ func (s *fsv1Storage) WriteAll(ctx context.Context, volume, path string, b []byt
 	if err = checkPathLength(filePath); err != nil {
 		return err
 	}
-	file, err := s.rwMetaLocker(ctx, volume, path, true)
+	file, err := s._openFile(ctx, volume, path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0666)
 	if err != nil {
 		return err
 	}
@@ -901,7 +898,7 @@ func (s *fsv1Storage) ReadAll(ctx context.Context, volume string, path string) (
 		return nil, err
 	}
 
-	file, err := s.rMetaLocker(ctx, volume, path)
+	file, err := s._openFile(ctx, volume, path, readMode, 0)
 	if err != nil {
 		return nil, s.osErrToFileErr(err, volumeDir, filePath)
 	}
@@ -932,7 +929,7 @@ func (s *fsv1Storage) ReadFileStream(ctx context.Context, volume, path string, o
 		return nil, err
 	}
 
-	file, err := s.rMetaLocker(ctx, volume, path)
+	file, err := s._openFile(ctx, volume, path, readMode, 0666)
 	if err != nil {
 		return nil, s.osErrToFileErr(err, volumeDir, filePath)
 	}

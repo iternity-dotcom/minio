@@ -76,15 +76,6 @@ func (x *fsXlStorage) getMetaPathFile(volume string, path string) string {
 	return pathJoin(path, xlStorageFormatFile)
 }
 
-func (x *fsXlStorage) rMetaLocker(ctx context.Context, volume string, path string) (FileWriter, error) {
-	locks := getLocks(ctx)
-	return locks.rMetaLocker(x, volume, path)
-}
-func (x *fsXlStorage) rwMetaLocker(ctx context.Context, volume string, path string, truncate bool) (FileWriter, error) {
-	locks := getLocks(ctx)
-	return locks.rwMetaLocker(x, volume, path, truncate)
-}
-
 func (x *fsXlStorage) MetaTmpBucket() string {
 	return x.metaTmpBucket
 }
@@ -124,28 +115,5 @@ func newLocalFSXLStorage(fsPath string) (fsStorageAPI, error) {
 
 func (x *fsXlStorage) _openFile(ctx context.Context, volume string, path string, flag int, perm os.FileMode) (FileWriter, error) {
 	locks := getLocks(ctx)
-	truncate := false
-	append := false
-
-	if (flag & os.O_TRUNC) > 0 {
-		truncate = true
-	}
-	if (flag & os.O_APPEND) > 0 {
-		append = true
-	}
-	if flag&os.O_WRONLY == 0 && flag&os.O_RDWR == 0 {
-		return locks.rMetaLocker(x, volume, path)
-	} else {
-		fw, err := locks.rwMetaLocker(x, volume, path, truncate)
-		if err != nil {
-			return nil, err
-		}
-		if append {
-			_, err := fw.Seek(0, io.SeekEnd)
-			if err != nil {
-				return nil, err
-			}
-		}
-		return fw, nil
-	}
+	return locks.metaLocker(x, volume, path, flag, perm)
 }
