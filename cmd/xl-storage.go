@@ -1909,9 +1909,10 @@ func (s *xlStorage) RenameData(ctx context.Context, srcVolume, srcPath string, f
 		return err
 	}
 
-	dstBuf, err := xioutil.ReadFile(dstFilePath)
+	dstBuf := make([]byte, 0)
+	f, err := s.openFileNormal(ctx, dstVolume, pathJoin(dstPath, xlStorageFormatFile), readMode, 0)
 	if err != nil {
-		if !osIsNotExist(err) {
+		if err != errFileNotFound && !osIsNotExist(err) {
 			return osErrToFileErr(err)
 		}
 		// errFileNotFound comes here.
@@ -1920,9 +1921,16 @@ func (s *xlStorage) RenameData(ctx context.Context, srcVolume, srcPath string, f
 			return err
 		}
 		if err == nil {
-			dstBuf, err = xioutil.ReadFile(dstFilePath)
-			if err != nil && !osIsNotExist(err) {
-				return osErrToFileErr(err)
+			f, err = s.openFileNormal(ctx, dstVolume, pathJoin(dstPath, xlStorageFormatFile), readMode, 0)
+			if err != nil {
+				if err != errFileNotFound && !osIsNotExist(err) {
+					return osErrToFileErr(err)
+				}
+			} else {
+				dstBuf, err = xioutil.ReadOpenedFile(f)
+				if err != nil {
+					return osErrToFileErr(err)
+				}
 			}
 		}
 		if err == errFileNotFound {
@@ -1957,8 +1965,12 @@ func (s *xlStorage) RenameData(ctx context.Context, srcVolume, srcPath string, f
 				}
 			}
 		}
+	} else {
+		dstBuf, err = xioutil.ReadOpenedFile(f)
+		if err != nil {
+			return osErrToFileErr(err)
+		}
 	}
-
 	var xlMeta xlMetaV2
 	var legacyPreserved bool
 	if len(dstBuf) > 0 {

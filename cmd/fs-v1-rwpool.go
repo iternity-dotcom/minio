@@ -44,9 +44,9 @@ type truncatingFileWriter interface {
 // FileWriter is a wrapper interface, which mimics *os.File
 type FileWriter interface {
 	io.ReadWriteSeeker
+	io.ReaderAt
 	io.Closer
 	Fd() uintptr
-	ReadAt(b []byte, off int64) (n int, err error)
 	Stat() (fs.FileInfo, error)
 }
 
@@ -354,7 +354,7 @@ func (ls locks) metaLocker(s storageFunctions, volume string, path string, flag 
 	}
 
 	// it is in the meta bucket, but it is not in the meta path
-	if HasPrefix(fsPath, metaVolDir) && !HasPrefix(fsPath, pathJoin(metaVolDir, bucketMetaPrefix)) {
+	if ls == nil || (HasPrefix(fsPath, metaVolDir) && !HasPrefix(fsPath, pathJoin(metaVolDir, bucketMetaPrefix))) {
 		if readLock {
 			return OpenFile(pathJoin(volDir, path), flag, perm)
 		}
