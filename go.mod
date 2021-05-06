@@ -18,7 +18,6 @@ require (
 	github.com/colinmarc/hdfs/v2 v2.2.0
 	github.com/coredns/coredns v1.4.0
 	github.com/coreos/go-semver v0.3.0 // indirect
-	github.com/coreos/go-systemd v0.0.0-20190321100706-95778dfbb74e // indirect
 	github.com/coreos/pkg v0.0.0-20180928190104-399ea9e2e55f // indirect
 	github.com/dchest/siphash v1.2.1
 	github.com/dgrijalva/jwt-go v3.2.0+incompatible
@@ -29,13 +28,21 @@ require (
 	github.com/fatih/color v1.10.0
 	github.com/fatih/structs v1.1.0
 	github.com/go-ldap/ldap/v3 v3.2.4
+	github.com/go-lintpack/lintpack v0.5.2 // indirect
 	github.com/go-sql-driver/mysql v1.5.0
+	github.com/golangci/errcheck v0.0.0-20181223084120-ef45e06d44b6 // indirect
+	github.com/golangci/go-tools v0.0.0-20190318055746-e32c54105b7c // indirect
+	github.com/golangci/goconst v0.0.0-20180610141641-041c5f2b40f3 // indirect
+	github.com/golangci/gocyclo v0.0.0-20180528134321-2becd97e67ee // indirect
+	github.com/golangci/golangci-lint v1.39.0 // indirect
+	github.com/golangci/gosec v0.0.0-20190211064107-66fb7fc33547 // indirect
+	github.com/golangci/ineffassign v0.0.0-20190609212857-42439a7714cc // indirect
+	github.com/golangci/prealloc v0.0.0-20180630174525-215b22d4de21 // indirect
 	github.com/gomodule/redigo v2.0.0+incompatible
 	github.com/google/martian v2.1.1-0.20190517191504-25dcb96d9e51+incompatible // indirect
 	github.com/google/uuid v1.1.2
 	github.com/gorilla/handlers v1.5.1
 	github.com/gorilla/mux v1.8.0
-	github.com/hashicorp/golang-lru v0.5.3 // indirect
 	github.com/jcmturner/gokrb5/v8 v8.4.2
 	github.com/json-iterator/go v1.1.10
 	github.com/klauspost/compress v1.11.12
@@ -75,13 +82,16 @@ require (
 	github.com/rjeczalik/notify v0.9.2
 	github.com/rs/cors v1.7.0
 	github.com/secure-io/sio-go v0.3.1
-	github.com/shirou/gopsutil/v3 v3.21.1
+	github.com/shirou/gopsutil v0.0.0-20180427012116-c95755e4bcd7 // indirect
+	github.com/shirou/gopsutil/v3 v3.21.2
+	github.com/shirou/w32 v0.0.0-20160930032740-bb4de0191aa4 // indirect
 	github.com/spaolacci/murmur3 v1.1.0 // indirect
 	github.com/spf13/pflag v1.0.5 // indirect
 	github.com/streadway/amqp v1.0.0
 	github.com/tidwall/gjson v1.6.8
 	github.com/tidwall/sjson v1.0.4
 	github.com/tinylib/msgp v1.1.3
+	github.com/ttacon/chalk v0.0.0-20160626202418-22c06c80ed31 // indirect
 	github.com/valyala/tcplisten v0.0.0-20161114210144-ceec8f93295a
 	github.com/willf/bitset v1.1.11 // indirect
 	github.com/willf/bloom v2.0.3+incompatible
@@ -89,14 +99,14 @@ require (
 	go.etcd.io/etcd v0.0.0-20201125193152-8a03d2e9614b
 	go.uber.org/zap v1.14.1
 	golang.org/x/crypto v0.0.0-20210415154028-4f45737414dc
-	golang.org/x/mod v0.4.0 // indirect
 	golang.org/x/net v0.0.0-20210226172049-e18ecbb05110
-	golang.org/x/sys v0.0.0-20210225134936-a50acf3fe073
+	golang.org/x/sys v0.0.0-20210228012217-479acdf4ea46
 	golang.org/x/time v0.0.0-20200416051211-89c76fbcd5d1 // indirect
 	golang.org/x/tools v0.1.1-0.20210201201750-4d4ee958a9b7 // indirect
-	google.golang.org/api v0.25.0
-	google.golang.org/genproto v0.0.0-20200527145253-8367513e4ece // indirect
-	gopkg.in/yaml.v2 v2.3.0
-	honnef.co/go/tools v0.0.1-2020.1.6 // indirect
+	google.golang.org/api v0.29.0
+	gopkg.in/airbrake/gobrake.v2 v2.0.9 // indirect
+	gopkg.in/gemnasium/logrus-airbrake-hook.v2 v2.1.2 // indirect
+	gopkg.in/yaml.v2 v2.4.0
 	sigs.k8s.io/yaml v1.2.0 // indirect
+	sourcegraph.com/sqs/pbtypes v0.0.0-20180604144634-d3ebe8f20ae4 // indirect
 )

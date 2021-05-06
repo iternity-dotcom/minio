@@ -20,7 +20,6 @@
 package disk
 
 import (
-	"os"
 	"syscall"
 )
 
