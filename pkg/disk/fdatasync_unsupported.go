@@ -19,10 +19,6 @@
 
 package disk
 
-import (
-	"os"
-)
-
 // Fdatasync is a no-op
 func Fdatasync(fd uintptr) error {
 	return nil
