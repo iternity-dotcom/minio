@@ -1931,6 +1931,7 @@ func (s *xlStorage) RenameData(ctx context.Context, srcVolume, srcPath string, f
 				if err != nil {
 					return osErrToFileErr(err)
 				}
+				f.Close()
 			}
 		}
 		if err == errFileNotFound {
@@ -1970,6 +1971,7 @@ func (s *xlStorage) RenameData(ctx context.Context, srcVolume, srcPath string, f
 		if err != nil {
 			return osErrToFileErr(err)
 		}
+		f.Close()
 	}
 	var xlMeta xlMetaV2
 	var legacyPreserved bool
