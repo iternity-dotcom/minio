@@ -20,7 +20,6 @@
 package disk
 
 import (
-	"os"
 	"syscall"
 )
 
@@ -34,6 +33,6 @@ import (
 //
 // The aim of fdatasync() is to reduce disk activity for applications that
 // do not require all metadata to be synchronized with the disk.
-func Fdatasync(f *os.File) error {
-	return syscall.Fdatasync(int(f.Fd()))
+func Fdatasync(fd uintptr) error {
+	return syscall.Fdatasync(int(fd))
 }

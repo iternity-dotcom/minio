@@ -185,12 +185,27 @@ func calculateStreamContentLength(dataLen, chunkSize int64) int64 {
 }
 
 func prepareFS() (ObjectLayer, string, error) {
+
 	nDisks := 1
 	fsDirs, err := getRandomDisks(nDisks)
 	if err != nil {
 		return nil, "", err
 	}
 	obj, err := NewFSObjectLayer(fsDirs[0])
+	if err != nil {
+		return nil, "", err
+	}
+	return obj, fsDirs[0], nil
+}
+
+func prepareFSXL() (ObjectLayer, string, error) {
+
+	nDisks := 1
+	fsDirs, err := getRandomDisks(nDisks)
+	if err != nil {
+		return nil, "", err
+	}
+	obj, err := NewFSXLObjectLayer(fsDirs[0])
 	if err != nil {
 		return nil, "", err
 	}
@@ -229,6 +244,17 @@ func initFSObjects(disk string, t *testing.T) (obj ObjectLayer) {
 	return obj
 }
 
+// Initialize FSXL objects.
+func initFSXLObjects(disk string, t *testing.T) (obj ObjectLayer) {
+	var err error
+	obj, err = NewFSXLObjectLayer(disk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newTestConfig(globalMinioDefaultRegion, obj)
+	return obj
+}
+
 // TestErrHandler - Go testing.T satisfy this interface.
 // This makes it easy to run the TestServer from any of the tests.
 // Using this interface, functionalities to be used in tests can be
@@ -240,6 +266,9 @@ type TestErrHandler interface {
 const (
 	// FSTestStr is the string which is used as notation for Single node ObjectLayer in the unit tests.
 	FSTestStr string = "FS"
+
+	// FSTestStr is the string which is used as notation for Single node ObjectLayer in the unit tests.
+	FSXLTestStr string = "FSXL"
 
 	// ErasureTestStr is the string which is used as notation for Erasure ObjectLayer in the unit tests.
 	ErasureTestStr string = "Erasure"
@@ -268,6 +297,8 @@ var globalTestTmpDir = os.TempDir()
 func reseed() uint32 {
 	return uint32(time.Now().UnixNano() + int64(os.Getpid()))
 }
+
+var randSrc = rand.NewSource(UTCNow().UnixNano())
 
 // nextSuffix - provides a new unique suffix every time the function is called.
 func nextSuffix() string {
@@ -1248,13 +1279,12 @@ func getTestWebRPCResponse(resp *httptest.ResponseRecorder, data interface{}) er
 
 // Function to generate random string for bucket/object names.
 func randString(n int) string {
-	src := rand.NewSource(UTCNow().UnixNano())
 
 	b := make([]byte, n)
 	// A rand.Int63() generates 63 random bits, enough for letterIdxMax letters!
-	for i, cache, remain := n-1, src.Int63(), letterIdxMax; i >= 0; {
+	for i, cache, remain := n-1, randSrc.Int63(), letterIdxMax; i >= 0; {
 		if remain == 0 {
-			cache, remain = src.Int63(), letterIdxMax
+			cache, remain = randSrc.Int63(), letterIdxMax
 		}
 		if idx := int(cache & letterIdxMask); idx < len(letterBytes) {
 			b[i] = letterBytes[idx]
@@ -1653,13 +1683,22 @@ func prepareTestBackend(ctx context.Context, instanceType string) (ObjectLayer, 
 	// Total number of disks for Erasure backend is set to 16.
 	case ErasureTestStr:
 		return prepareErasure16(ctx)
-	default:
+	case FSXLTestStr:
+		// return FS backend by default.
+		obj, disk, err := prepareFSXL()
+		if err != nil {
+			return nil, nil, err
+		}
+		return obj, []string{disk}, nil
+	case FSTestStr:
 		// return FS backend by default.
 		obj, disk, err := prepareFS()
 		if err != nil {
 			return nil, nil, err
 		}
 		return obj, []string{disk}, nil
+	default:
+		return nil, nil, fmt.Errorf("unknown instance type: %s", instanceType)
 	}
 }
 
@@ -1850,6 +1889,19 @@ func ExecObjectLayerAPITest(t *testing.T, objAPITest objAPITestType, endpoints [
 	// Executing the object layer tests for single node setup.
 	objAPITest(objLayer, FSTestStr, bucketFS, fsAPIRouter, credentials, t)
 
+	objLayer, fsXLDir, err := prepareFSXL()
+	if err != nil {
+		t.Fatalf("Initialization of object layer failed for single node setup: %s", err)
+	}
+
+	bucketFSXL, fsXLAPIRouter, err := initAPIHandlerTest(objLayer, endpoints)
+	if err != nil {
+		t.Fatalf("Initialization of API handler tests failed: <ERROR> %s", err)
+	}
+
+	// Executing the object layer tests for single node setup.
+	objAPITest(objLayer, FSXLTestStr, bucketFSXL, fsXLAPIRouter, credentials, t)
+
 	objLayer, erasureDisks, err := prepareErasure16(ctx)
 	if err != nil {
 		t.Fatalf("Initialization of object layer failed for Erasure setup: %s", err)
@@ -1864,7 +1916,7 @@ func ExecObjectLayerAPITest(t *testing.T, objAPITest objAPITestType, endpoints [
 	objAPITest(objLayer, ErasureTestStr, bucketErasure, erAPIRouter, credentials, t)
 
 	// clean up the temporary test backend.
-	removeRoots(append(erasureDisks, fsDir))
+	removeRoots(append(erasureDisks, fsDir, fsXLDir))
 }
 
 // ExecExtendedObjectLayerTest will execute the tests with combinations of encrypted & compressed.
@@ -1914,11 +1966,35 @@ func ExecObjectLayerTest(t TestErrHandler, objTest objTestType) {
 	}
 
 	initAllSubsystems(ctx, objLayer)
-
 	globalIAMSys.InitStore(objLayer)
 
 	// Executing the object layer tests for single node setup.
 	objTest(objLayer, FSTestStr, t)
+
+	if localMetacacheMgr != nil {
+		localMetacacheMgr.deleteAll()
+	}
+	defer setObjectLayer(newObjectLayerFn())
+
+	objLayer, fsXLDir, err := prepareFSXL()
+	if err != nil {
+		t.Fatalf("Initialization of object layer failed for single node setup (XLStorage): %s", err)
+	}
+	setObjectLayer(objLayer)
+
+	newAllSubsystems()
+
+	// initialize the server and obtain the credentials and root.
+	// credentials are necessary to sign the HTTP request.
+	if err = newTestConfig(globalMinioDefaultRegion, objLayer); err != nil {
+		t.Fatal("Unexpected error", err)
+	}
+
+	initAllSubsystems(ctx, objLayer)
+	globalIAMSys.InitStore(objLayer)
+
+	// Executing the object layer tests for single node setup.
+	objTest(objLayer, FSXLTestStr, t)
 
 	if localMetacacheMgr != nil {
 		localMetacacheMgr.deleteAll()
@@ -1935,10 +2011,9 @@ func ExecObjectLayerTest(t TestErrHandler, objTest objTestType) {
 	defer objLayer.Shutdown(context.Background())
 
 	initAllSubsystems(ctx, objLayer)
-
 	globalIAMSys.InitStore(objLayer)
 
-	defer removeRoots(append(fsDirs, fsDir))
+	defer removeRoots(append(fsDirs, fsDir, fsXLDir))
 	// Executing the object layer tests for Erasure.
 	objTest(objLayer, ErasureTestStr, t)
 

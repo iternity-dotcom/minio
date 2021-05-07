@@ -91,10 +91,16 @@ type fsStorageAPI interface {
 	VersioningSupported() bool
 }
 
+// NewFSXLObjectLayer - initialize new fs object layer using the new xl storage meta format.
+func NewFSXLObjectLayer(fsPath string) (ObjectLayer, error) {
+	return newFSObjectLayer(fsPath, newLocalFSXLStorage)
+}
+
 // NewFSObjectLayer - initialize new fs object layer.
 func NewFSObjectLayer(fsPath string) (ObjectLayer, error) {
 	return newFSObjectLayer(fsPath, newLocalFSV1Storage)
 }
+
 func newFSObjectLayer(fsPath string, createStorageAPI func(string) (fsStorageAPI, error)) (ObjectLayer, error) {
 	ctx := GlobalContext
 

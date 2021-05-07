@@ -1,0 +1,125 @@
+package cmd
+
+import (
+	"bytes"
+	"context"
+	"io"
+	"os"
+	pathutil "path"
+
+	"github.com/minio/minio/pkg/etag"
+	"github.com/minio/minio/pkg/hash"
+	"github.com/minio/minio/pkg/lock"
+)
+
+type fsXlStorage struct {
+	*xlStorage
+	metaTmpBucket string
+	// FS rw pool.
+	rwPool *fsIOPool
+}
+
+func (x *fsXlStorage) CreateFile(ctx context.Context, volume, path string, fileSize int64, r io.Reader) error {
+	err := x.xlStorage.CreateFile(ctx, volume, path, fileSize, r)
+	if err != nil {
+		return err
+	}
+
+	if countR, ok := r.(*countingReader); ok {
+		hashR := countR.PutObjReader.Reader
+		expectedMD5 := hashR.MD5()
+		calculatedMD5 := hashR.MD5Current()
+		if len(expectedMD5) != 0 && !bytes.Equal(expectedMD5, calculatedMD5) {
+			return hash.BadDigest{
+				ExpectedMD5:   etag.ETag(expectedMD5).String(),
+				CalculatedMD5: etag.ETag(calculatedMD5).String(),
+			}
+		}
+	}
+
+	return nil
+}
+
+func (x *fsXlStorage) ContextWithMetaLock(ctx context.Context, lockType LockType, volume string, paths ...string) (context.Context, func(err ...error), error) {
+	// return ctx, func(err ...error) {}, nil
+	if l := ctx.Value(objectLock); l != nil {
+		return nil, nil, lock.ErrAlreadyLocked
+	}
+	var fLocks locks
+	var cleanup func(err ...error)
+	var err error
+	switch lockType {
+	case writeLock:
+		fLocks, cleanup, err = x.rwPool.newRWMetaLock(x, volume, paths...)
+	case readLock:
+		fLocks, cleanup, err = x.rwPool.newRMetaLock(x, volume, paths...)
+	case noLock:
+		fLocks, cleanup, err = x.rwPool.newNMetaLock(x, volume, paths...)
+	default:
+		return nil, nil, errInvalidArgument
+	}
+
+	if err != nil {
+		return nil, nil, err
+	}
+	return context.WithValue(ctx, objectLock, fLocks), cleanup, nil
+}
+
+func (x *fsXlStorage) getLockPath(volume string, path string) (string, string, error) {
+	volDir, err := x.getVolDir(volume)
+	if err != nil {
+		return "", "", err
+	}
+	return volDir, x.getMetaPathFile(volume, path), nil
+}
+
+func (x *fsXlStorage) checkPathInObject(path string, object string) bool {
+	// is it a part.??? object in a data dir
+	return pathutil.Dir(pathutil.Dir(path)) == object
+}
+
+func (x *fsXlStorage) getMetaPathFile(volume string, path string) string {
+	return pathJoin(path, xlStorageFormatFile)
+}
+
+func (x *fsXlStorage) MetaTmpBucket() string {
+	return x.metaTmpBucket
+}
+
+func (x *fsXlStorage) EncodeDirObject(object string) string {
+	return encodeDirObject(object)
+}
+
+func (x *fsXlStorage) DecodeDirObject(object string) string {
+	return decodeDirObject(object)
+}
+
+func (x *fsXlStorage) IsDirObject(object string) bool {
+	return HasSuffix(object, globalDirSuffix)
+}
+
+func (x *fsXlStorage) VersioningSupported() bool {
+	return true
+}
+
+func newLocalFSXLStorage(fsPath string) (fsStorageAPI, error) {
+	storage, err := newLocalXLStorage(fsPath)
+	if err != nil {
+		return nil, err
+	}
+	x := &fsXlStorage{
+		xlStorage:     storage,
+		metaTmpBucket: minioMetaTmpBucket,
+		rwPool: &fsIOPool{
+			readersMap: make(map[string]*lock.RLockedFile),
+		},
+	}
+	x.xlStorage.openFileNormal = x._openFile
+	x.xlStorage.openFileDirectIO = x._openFile
+	return x, nil
+}
+
+func (x *fsXlStorage) _openFile(ctx context.Context, volume string, path string, flag int, perm os.FileMode) (FileWriter, error) {
+	locks := getLocks(ctx)
+	return locks.metaLocker(x, volume, path, flag, perm)
+}
