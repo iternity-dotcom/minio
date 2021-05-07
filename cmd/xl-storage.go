@@ -2092,7 +2092,11 @@ func (s *xlStorage) RenameData(ctx context.Context, srcVolume, srcPath string, f
 		}
 
 		// Commit meta-file
-		if err = renameAll(srcFilePath, dstFilePath); err != nil {
+		if err = s.WriteAll(ctx, dstVolume, pathJoin(dstPath, xlStorageFormatFile), dstBuf); err != nil {
+			logger.LogIf(ctx, err)
+			return err
+		}
+		if err = renameAll(srcFilePath, pathutil.Join(s.diskPath, minioMetaTmpDeletedBucket, mustGetUUID())); err != nil {
 			logger.LogIf(ctx, err)
 			return osErrToFileErr(err)
 		}
