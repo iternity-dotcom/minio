@@ -2083,8 +2083,7 @@ func (s *xlStorage) RenameData(ctx context.Context, srcVolume, srcPath string, f
 	}
 
 	// Remove parent dir of the source file if empty
-	parentDir := pathutil.Dir(srcFilePath)
-	s.deleteFile(srcVolumeDir, parentDir, false)
+	s.deleteFile(srcVolumeDir, srcFilePath, false)
 	return nil
 }
 
