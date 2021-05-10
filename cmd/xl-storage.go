@@ -899,19 +899,7 @@ func (s *xlStorage) DeleteVersion(ctx context.Context, volume, path string, fi F
 	}
 
 	// Move everything to trash.
-	filePath := retainSlash(pathJoin(volumeDir, path))
-	if err = checkPathLength(filePath); err != nil {
-		return err
-	}
-	err = renameAll(filePath, pathutil.Join(s.diskPath, minioMetaTmpDeletedBucket, mustGetUUID()))
-
-	// Delete parents if needed.
-	filePath = retainSlash(pathutil.Dir(pathJoin(volumeDir, path)))
-	if filePath == retainSlash(volumeDir) {
-		return err
-	}
-	s.deleteFile(volumeDir, filePath, false)
-	return err
+	return s.deleteFile(volumeDir, pathJoin(volumeDir, path, xlStorageFormatFile), true)
 }
 
 // Updates only metadata for a given version.
@@ -2074,10 +2062,6 @@ func (s *xlStorage) RenameData(ctx context.Context, srcVolume, srcPath string, f
 	}
 
 	if srcDataPath != "" {
-		if err = s.WriteAll(ctx, srcVolume, pathJoin(srcPath, xlStorageFormatFile), dstBuf); err != nil {
-			return err
-		}
-
 		if oldDstDataPath != "" {
 			renameAll(oldDstDataPath, pathutil.Join(s.diskPath, minioMetaTmpDeletedBucket, mustGetUUID()))
 		}
@@ -2090,22 +2074,12 @@ func (s *xlStorage) RenameData(ctx context.Context, srcVolume, srcPath string, f
 				return osErrToFileErr(err)
 			}
 		}
+	}
 
-		// Commit meta-file
-		if err = s.WriteAll(ctx, dstVolume, pathJoin(dstPath, xlStorageFormatFile), dstBuf); err != nil {
-			logger.LogIf(ctx, err)
-			return err
-		}
-		if err = renameAll(srcFilePath, pathutil.Join(s.diskPath, minioMetaTmpDeletedBucket, mustGetUUID())); err != nil {
-			logger.LogIf(ctx, err)
-			return osErrToFileErr(err)
-		}
-	} else {
-		// Write meta-file directly, no data
-		if err = s.WriteAll(ctx, dstVolume, pathJoin(dstPath, xlStorageFormatFile), dstBuf); err != nil {
-			logger.LogIf(ctx, err)
-			return err
-		}
+	// Commit meta-file
+	if err = s.WriteAll(ctx, dstVolume, pathJoin(dstPath, xlStorageFormatFile), dstBuf); err != nil {
+		logger.LogIf(ctx, err)
+		return err
 	}
 
 	// Remove parent dir of the source file if empty
