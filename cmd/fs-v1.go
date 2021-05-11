@@ -1073,7 +1073,8 @@ func (fs *FSObjects) DeleteObjects(ctx context.Context, bucket string, objects [
 	}
 
 	// Acquire a bulk write lock across 'objects'
-	multiDeleteLock := fs.NewNSLock(bucket, objSets.ToSlice()...)
+	objLockSlice := objSets.ToSlice()
+	multiDeleteLock := fs.NewNSLock(bucket, objLockSlice...)
 	ctx, err := multiDeleteLock.GetLock(ctx, globalOperationTimeout)
 	if err != nil {
 		for i := range errs {
@@ -1083,17 +1084,6 @@ func (fs *FSObjects) DeleteObjects(ctx context.Context, bucket string, objects [
 	}
 	defer multiDeleteLock.Unlock()
 
-	ctx, cleanup, err := fs.disk.ContextWithMetaLock(ctx, writeLock, bucket, objSets.ToSlice()...)
-	if err != nil {
-		for i := range errs {
-			errs[i] = err
-		}
-		return dobjects, errs
-	}
-
-	defer func() {
-		cleanup(errs...)
-	}()
 	versions := make([]FileInfo, 0)
 	objIdxToVerIdx := make(map[int]int, len(objects))
 	for i := range objects {
@@ -1133,11 +1123,23 @@ func (fs *FSObjects) DeleteObjects(ctx context.Context, bucket string, objects [
 		})
 	}
 
+	ctx, cleanup, err := fs.disk.ContextWithMetaLock(ctx, writeLock, bucket, objLockSlice...)
+	if err != nil {
+		for i := range errs {
+			errs[i] = err
+		}
+		return dobjects, errs
+	}
+
+	cleanupErrs := make([]error, len(objSets))
+	defer func() {
+		cleanup(cleanupErrs...)
+	}()
+
 	// Initialize list of errors.
 	delObjErrs := fs.disk.DeleteVersions(ctx, bucket, versions)
 
 	// Reduce errors for each object
-
 	for objIndex := range objects {
 		verIdx := objIdxToVerIdx[objIndex]
 
@@ -1146,6 +1148,13 @@ func (fs *FSObjects) DeleteObjects(ctx context.Context, bucket string, objects [
 			err = errs[objIndex]
 		} else if delObjErrs[verIdx] != errFileNotFound {
 			err = delObjErrs[verIdx]
+		}
+
+		if delObjErrs[verIdx] != nil {
+			lockPos, ok := findFirst(objLockSlice, versions[verIdx].Name)
+			if ok {
+				cleanupErrs[lockPos] = delObjErrs[verIdx]
+			}
 		}
 
 		if objects[objIndex].VersionID != "" {
@@ -1179,6 +1188,16 @@ func (fs *FSObjects) DeleteObjects(ctx context.Context, bucket string, objects [
 	}
 
 	return dobjects, errs
+}
+
+func findFirst(strSlice []string, name string) (int, bool) {
+	for idx, element := range strSlice {
+		if element == name {
+			return idx, true
+		}
+	}
+
+	return 0, false
 }
 
 // DeleteObject - deletes an object from a bucket, this operation is destructive
