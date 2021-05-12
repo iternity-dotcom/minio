@@ -1107,13 +1107,11 @@ func (s *xlStorage) readAllData(ctx context.Context, volume string, path string,
 	if err != nil {
 		return nil, err
 	}
-	var r io.ReadCloser
+	var f FileWriter
 	if requireDirectIO {
-		var f FileWriter
 		f, err = s.openFileDirectIO(ctx, volume, path, readMode, 0666)
-		r = &odirectReader{f, nil, nil, true, true, s, nil}
 	} else {
-		r, err = s.openFileNormal(ctx, volume, path, readMode, 0)
+		f, err = s.openFileNormal(ctx, volume, path, readMode, 0)
 	}
 	if err != nil {
 		if osIsNotExist(err) {
@@ -1147,8 +1145,19 @@ func (s *xlStorage) readAllData(ctx context.Context, volume string, path string,
 		return nil, err
 	}
 
-	defer r.Close()
-	buf, err = ioutil.ReadAll(r)
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, osErrToFileErr(err)
+	}
+
+	if requireDirectIO {
+		or := &odirectReader{io.NewSectionReader(f, 0, fi.Size()), nil, nil, true, false, s, nil, f.Fd()}
+		buf, err = ioutil.ReadAll(or)
+	} else {
+		buf, err = ioutil.ReadAll(io.NewSectionReader(f, 0, fi.Size()))
+	}
+
 	if err != nil {
 		err = osErrToFileErr(err)
 	}
@@ -1320,13 +1329,14 @@ func (s *xlStorage) openFile(ctx context.Context, volume string, path string, mo
 
 // To support O_DIRECT reads for erasure backends.
 type odirectReader struct {
-	f         FileWriter
+	f         io.Reader
 	buf       []byte
 	bufp      *[]byte
 	freshRead bool
 	smallFile bool
 	s         *xlStorage
 	err       error
+	fd        uintptr
 }
 
 // Read - Implements Reader interface.
@@ -1346,7 +1356,7 @@ func (o *odirectReader) Read(buf []byte) (n int, err error) {
 		n, err = o.f.Read(o.buf)
 		if err != nil && err != io.EOF {
 			if isSysErrInvalidArg(err) {
-				if err = disk.DisableDirectIO(o.f.Fd()); err != nil {
+				if err = disk.DisableDirectIO(o.fd); err != nil {
 					o.err = err
 					return n, err
 				}
@@ -1378,13 +1388,12 @@ func (o *odirectReader) Read(buf []byte) (n int, err error) {
 }
 
 // Close - Release the buffer and close the file.
-func (o *odirectReader) Close() error {
+func (o *odirectReader) Close() {
 	if o.smallFile {
 		o.s.poolSmall.Put(o.bufp)
 	} else {
 		o.s.poolLarge.Put(o.bufp)
 	}
-	return o.f.Close()
 }
 
 // ReadFileStream - Returns the read stream of the file.
@@ -1448,28 +1457,30 @@ func (s *xlStorage) ReadFileStream(ctx context.Context, volume, path string, off
 	}
 
 	if offset == 0 && globalStorageClass.GetDMA() == storageclass.DMAReadWrite {
-		or := &odirectReader{file, nil, nil, true, false, s, nil}
+		or := &odirectReader{io.NewSectionReader(file, 0, st.Size()), nil, nil, true, false, s, nil, file.Fd()}
 		if length <= smallFileThreshold {
-			or = &odirectReader{file, nil, nil, true, true, s, nil}
+			or = &odirectReader{io.NewSectionReader(file, 0, st.Size()), nil, nil, true, true, s, nil, file.Fd()}
 		}
 		r := struct {
 			io.Reader
 			io.Closer
 		}{Reader: io.LimitReader(or, length), Closer: closeWrapper(func() error {
-			return or.Close()
+			or.Close()
+			return file.Close()
 		})}
 		return r, nil
 	}
 
+	seeker := io.NewSectionReader(file, 0, st.Size())
 	r := struct {
 		io.Reader
 		io.Closer
-	}{Reader: io.LimitReader(file, length), Closer: closeWrapper(func() error {
+	}{Reader: io.LimitReader(seeker, length), Closer: closeWrapper(func() error {
 		return file.Close()
 	})}
 
 	if offset > 0 {
-		if _, err = file.Seek(offset, io.SeekStart); err != nil {
+		if _, err = seeker.Seek(offset, io.SeekStart); err != nil {
 			r.Close()
 			return nil, err
 		}
@@ -1915,7 +1926,11 @@ func (s *xlStorage) RenameData(ctx context.Context, srcVolume, srcPath string, f
 					return osErrToFileErr(err)
 				}
 			} else {
-				dstBuf, err = xioutil.ReadOpenedFile(f)
+				fi, err := f.Stat()
+				if err != nil {
+					return osErrToFileErr(err)
+				}
+				dstBuf, err = ioutil.ReadAll(io.NewSectionReader(f, 0, fi.Size()))
 				if err != nil {
 					return osErrToFileErr(err)
 				}
@@ -1955,7 +1970,11 @@ func (s *xlStorage) RenameData(ctx context.Context, srcVolume, srcPath string, f
 			}
 		}
 	} else {
-		dstBuf, err = xioutil.ReadOpenedFile(f)
+		fi, err := f.Stat()
+		if err != nil {
+			return osErrToFileErr(err)
+		}
+		dstBuf, err = ioutil.ReadAll(io.NewSectionReader(f, 0, fi.Size()))
 		if err != nil {
 			return osErrToFileErr(err)
 		}

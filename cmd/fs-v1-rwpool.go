@@ -371,7 +371,6 @@ func (ls locks) rMetaLocker(fsPath string, volume string, path string, flag int,
 				if !ok {
 					return nil, errInvalidArgument
 				}
-				rl.Seek(0, io.SeekStart)
 				return rl, nil
 			}
 			if l.Volume() == volume && HasPrefix(path, l.Path()) {

@@ -24,14 +24,8 @@ package ioutil
 
 import (
 	"io"
-	"io/fs"
 	"os"
 )
-
-type fileReader interface {
-	io.Reader
-	Stat() (fs.FileInfo, error)
-}
 
 // ReadFile reads the named file and returns the contents.
 // A successful call returns err == nil, not err == EOF.
@@ -45,11 +39,7 @@ func ReadFile(name string) ([]byte, error) {
 		return nil, err
 	}
 	defer f.Close()
-	return ReadOpenedFile(f)
-}
 
-// ReadOpenedFile is the same as ReadFile, but using an opened file instead of file name
-func ReadOpenedFile(f fileReader) ([]byte, error) {
 	var size int
 	if info, err := f.Stat(); err == nil {
 		size64 := info.Size()

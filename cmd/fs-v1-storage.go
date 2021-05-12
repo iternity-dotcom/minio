@@ -900,7 +900,11 @@ func (s *fsv1Storage) ReadAll(ctx context.Context, volume string, path string) (
 
 	defer file.Close()
 
-	buf, err := ioutil.ReadAll(file)
+	fi, err := file.Stat()
+	if err != nil {
+		return nil, osErrToFileErr(err)
+	}
+	buf, err := ioutil.ReadAll(io.NewSectionReader(file, 0, fi.Size()))
 	if err != nil {
 		err = osErrToFileErr(err)
 	}
@@ -942,16 +946,17 @@ func (s *fsv1Storage) ReadFileStream(ctx context.Context, volume, path string, o
 		return nil, errIsNotRegular
 	}
 
+	seeker := io.NewSectionReader(file, 0, st.Size())
 	r := struct {
 		io.Reader
 		io.Closer
-	}{Reader: io.LimitReader(file, length), Closer: closeWrapper(func() error {
+	}{Reader: io.LimitReader(seeker, length), Closer: closeWrapper(func() error {
 		file.Close()
 		return nil
 	})}
 
 	if offset > 0 {
-		if _, err = file.Seek(offset, io.SeekStart); err != nil {
+		if _, err = seeker.Seek(offset, io.SeekStart); err != nil {
 			file.Close()
 			return nil, err
 		}
