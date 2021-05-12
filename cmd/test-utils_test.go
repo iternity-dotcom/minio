@@ -296,6 +296,8 @@ func reseed() uint32 {
 	return uint32(time.Now().UnixNano() + int64(os.Getpid()))
 }
 
+var randSrc = rand.NewSource(UTCNow().UnixNano())
+
 // nextSuffix - provides a new unique suffix every time the function is called.
 func nextSuffix() string {
 	randmu.Lock()
@@ -1273,13 +1275,11 @@ func getTestWebRPCResponse(resp *httptest.ResponseRecorder, data interface{}) er
 
 // Function to generate random string for bucket/object names.
 func randString(n int) string {
-	src := rand.NewSource(UTCNow().UnixNano())
-
 	b := make([]byte, n)
 	// A rand.Int63() generates 63 random bits, enough for letterIdxMax letters!
-	for i, cache, remain := n-1, src.Int63(), letterIdxMax; i >= 0; {
+	for i, cache, remain := n-1, randSrc.Int63(), letterIdxMax; i >= 0; {
 		if remain == 0 {
-			cache, remain = src.Int63(), letterIdxMax
+			cache, remain = randSrc.Int63(), letterIdxMax
 		}
 		if idx := int(cache & letterIdxMask); idx < len(letterBytes) {
 			b[i] = letterBytes[idx]
