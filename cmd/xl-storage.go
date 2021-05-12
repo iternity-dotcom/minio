@@ -1151,6 +1151,10 @@ func (s *xlStorage) readAllData(ctx context.Context, volume string, path string,
 		return nil, osErrToFileErr(err)
 	}
 
+	if !fi.Mode().IsRegular() {
+		return nil, errFileNotFound
+	}
+
 	if requireDirectIO {
 		or := &odirectReader{io.NewSectionReader(f, 0, fi.Size()), nil, nil, true, false, s, nil, f.Fd()}
 		buf, err = ioutil.ReadAll(or)
