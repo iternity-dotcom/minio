@@ -84,7 +84,7 @@ func (sys *BucketMetadataSys) Update(bucket string, configFile string, configDat
 		// This code is needed only for gateway implementations.
 		switch configFile {
 		case bucketSSEConfig:
-			if globalGatewayName == NASBackendGateway {
+			if globalGatewayName == NASBackendGateway || globalGatewayName == NASXLBackendGateway {
 				meta, err := loadBucketMetadata(GlobalContext, objAPI, bucket)
 				if err != nil {
 					return err
@@ -93,7 +93,7 @@ func (sys *BucketMetadataSys) Update(bucket string, configFile string, configDat
 				return meta.Save(GlobalContext, objAPI)
 			}
 		case bucketLifecycleConfig:
-			if globalGatewayName == NASBackendGateway {
+			if globalGatewayName == NASBackendGateway || globalGatewayName == NASXLBackendGateway {
 				meta, err := loadBucketMetadata(GlobalContext, objAPI, bucket)
 				if err != nil {
 					return err
@@ -102,7 +102,7 @@ func (sys *BucketMetadataSys) Update(bucket string, configFile string, configDat
 				return meta.Save(GlobalContext, objAPI)
 			}
 		case bucketTaggingConfig:
-			if globalGatewayName == NASBackendGateway {
+			if globalGatewayName == NASBackendGateway || globalGatewayName == NASXLBackendGateway {
 				meta, err := loadBucketMetadata(GlobalContext, objAPI, bucket)
 				if err != nil {
 					return err
@@ -111,7 +111,7 @@ func (sys *BucketMetadataSys) Update(bucket string, configFile string, configDat
 				return meta.Save(GlobalContext, objAPI)
 			}
 		case bucketNotificationConfig:
-			if globalGatewayName == NASBackendGateway {
+			if globalGatewayName == NASBackendGateway || globalGatewayName == NASXLBackendGateway {
 				meta, err := loadBucketMetadata(GlobalContext, objAPI, bucket)
 				if err != nil {
 					return err
