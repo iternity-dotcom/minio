@@ -364,25 +364,23 @@ func (ls locks) metaLocker(s storageFunctions, volume string, path string, flag 
 }
 
 func (ls locks) rMetaLocker(fsPath string, volume string, path string, flag int, perm os.FileMode) (FileWriter, error) {
-	for _, l := range ls {
+	if l, ok := ls[fsPath]; ok {
 		if l.LockType() == writeLock || l.LockType() == readLock {
-			if fsPath == l.LockPath() {
-				rl, ok := l.(FileWriter)
-				if !ok {
-					return nil, errInvalidArgument
-				}
-				return rl, nil
+			rl, ok := l.(FileWriter)
+			if !ok {
+				return nil, errInvalidArgument
 			}
-			if l.Volume() == volume && HasPrefix(path, l.Path()) {
-				return OpenFile(fsPath, flag, perm)
-			}
+			return rl, nil
 		} else if l.LockType() == noLock {
-			if fsPath == l.LockPath() {
-				return OpenFile(fsPath, flag, perm)
-			}
-			if l.Volume() == volume && HasPrefix(path, l.Path()) {
-				return OpenFile(fsPath, flag, perm)
-			}
+			return OpenFile(fsPath, flag, perm)
+		}
+
+		return nil, errInvalidArgument
+	}
+
+	for _, l := range ls {
+		if l.Volume() == volume && (path == l.Path() || pathutil.Dir(path) == l.Path()) {
+			return OpenFile(fsPath, flag, perm)
 		}
 	}
 	return nil, nil
@@ -398,12 +396,9 @@ func (ls locks) rwMetaLocker(fsPath string, volume string, path string, flag int
 	if (flag & os.O_APPEND) > 0 {
 		append = true
 	}
-	for _, l := range ls {
-		if l.LockType() != writeLock {
-			continue
-		}
 
-		if fsPath == l.LockPath() {
+	if l, ok := ls[fsPath]; ok {
+		if l.LockType() == writeLock {
 			wl, ok := l.(truncatingFileWriter)
 			if !ok {
 				return nil, errInvalidArgument
@@ -419,7 +414,16 @@ func (ls locks) rwMetaLocker(fsPath string, volume string, path string, flag int
 
 			return wl, nil
 		}
-		if l.Volume() == volume && HasPrefix(path, l.Path()) {
+
+		return nil, errInvalidArgument
+	}
+
+	for _, l := range ls {
+		if l.LockType() != writeLock {
+			continue
+		}
+
+		if l.Volume() == volume && (path == l.Path() || pathutil.Dir(path) == l.Path()) {
 			return createFile(fsPath, flag)
 		}
 	}
