@@ -220,7 +220,6 @@ func (sys *BucketMetadataSys) Update(bucket string, configFile string, configDat
 // For all other bucket specific metadata, use the relevant
 // calls implemented specifically for each of those features.
 func (sys *BucketMetadataSys) Get(bucket string) (BucketMetadata, error) {
-	// TODO: versioning - should we load data from the buckets for nasxl??? at least versioning and objectlock???
 	if globalIsGateway || bucket == minioMetaBucket {
 		return newBucketMetadata(bucket), errConfigNotFound
 	}
@@ -329,7 +328,7 @@ func (sys *BucketMetadataSys) GetLifecycleConfig(bucket string) (*lifecycle.Life
 // GetNotificationConfig returns configured notification config
 // The returned object may not be modified.
 func (sys *BucketMetadataSys) GetNotificationConfig(bucket string) (*event.Config, error) {
-	if globalIsGateway && globalGatewayName == NASBackendGateway {
+	if globalIsGateway && (globalGatewayName == NASBackendGateway || globalGatewayName == NASXLBackendGateway) {
 		// Only needed in case of NAS gateway.
 		objAPI := newObjectLayerFn()
 		if objAPI == nil {
