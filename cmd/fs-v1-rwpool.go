@@ -379,7 +379,7 @@ func (ls locks) rMetaLocker(fsPath string, volume string, path string, flag int,
 	}
 
 	for _, l := range ls {
-		if l.Volume() == volume && (path == l.Path() || pathutil.Dir(path) == l.Path()) {
+		if l.Volume() == volume && (path == l.Path() || pathutil.Dir(pathutil.Dir(path)) == l.Path()) {
 			return OpenFile(fsPath, flag, perm)
 		}
 	}
@@ -423,7 +423,7 @@ func (ls locks) rwMetaLocker(fsPath string, volume string, path string, flag int
 			continue
 		}
 
-		if l.Volume() == volume && (path == l.Path() || pathutil.Dir(path) == l.Path()) {
+		if l.Volume() == volume && (path == l.Path() || pathutil.Dir(pathutil.Dir(path)) == l.Path()) {
 			return createFile(fsPath, flag)
 		}
 	}
