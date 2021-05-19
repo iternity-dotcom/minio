@@ -5,6 +5,7 @@ import (
 	"context"
 	"io"
 	"os"
+	pathutil "path"
 
 	"github.com/minio/minio/pkg/etag"
 	"github.com/minio/minio/pkg/hash"
@@ -70,6 +71,10 @@ func (x *fsXlStorage) getLockPath(volume string, path string) (string, string, e
 		return "", "", err
 	}
 	return volDir, x.getMetaPathFile(volume, path), nil
+}
+func (s *fsXlStorage) checkPathInObject(path string, object string) bool {
+	// is it a part.??? object in a data dir
+	return pathutil.Dir(pathutil.Dir(path)) == object
 }
 
 func (x *fsXlStorage) getMetaPathFile(volume string, path string) string {

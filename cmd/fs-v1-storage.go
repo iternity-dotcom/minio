@@ -207,6 +207,10 @@ func (s *fsv1Storage) getLockPath(volume string, path string) (string, string, e
 func (s *fsv1Storage) getMetaPathFile(volume string, path string) string {
 	return pathJoin(bucketMetaPrefix, volume, path, fsMetaJSONFile)
 }
+func (s *fsv1Storage) checkPathInObject(path string, object string) bool {
+	// is it the object itself
+	return object == path
+}
 
 func (s *fsv1Storage) _openFile(ctx context.Context, volume string, path string, flag int, perm os.FileMode) (FileWriter, error) {
 	locks := getLocks(ctx)

@@ -52,7 +52,7 @@ type FileWriter interface {
 
 type lockPaths struct {
 	volume   string
-	path     string
+	object   string
 	lockPath string
 }
 
@@ -60,8 +60,8 @@ func (lp *lockPaths) Volume() string {
 	return lp.volume
 }
 
-func (lp *lockPaths) Path() string {
-	return lp.path
+func (lp *lockPaths) Object() string {
+	return lp.object
 }
 
 func (lp *lockPaths) LockPath() string {
@@ -102,7 +102,7 @@ func (l *nLock) LockType() LockType {
 
 type metaLock interface {
 	Volume() string
-	Path() string
+	Object() string
 	LockPath() string
 	LockType() LockType
 }
@@ -124,8 +124,9 @@ func getLocks(ctx context.Context) locks {
 
 type storageFunctions interface {
 	getLockPath(volume string, path string) (string, string, error)
+	checkPathInObject(path string, object string) bool
 	getVolDir(volume string) (string, error)
-	deleteFile(string, string, bool) error
+	deleteFile(volDir string, filePath string, recurse bool) error
 }
 
 // lookupToRead - looks up an fd from readers map and
@@ -341,9 +342,9 @@ func (ls locks) metaLocker(s storageFunctions, volume string, path string, flag 
 	var f FileWriter
 	if flag&os.O_WRONLY == 0 && flag&os.O_RDWR == 0 {
 		readLock = true
-		f, err = ls.rMetaLocker(fsPath, volume, path, flag, perm)
+		f, err = ls.rMetaLocker(s, fsPath, volume, path, flag, perm)
 	} else {
-		f, err = ls.rwMetaLocker(fsPath, volume, path, flag, perm)
+		f, err = ls.rwMetaLocker(s, fsPath, volume, path, flag, perm)
 	}
 
 	if err != nil {
@@ -363,7 +364,7 @@ func (ls locks) metaLocker(s storageFunctions, volume string, path string, flag 
 	return nil, errFileNotFound
 }
 
-func (ls locks) rMetaLocker(fsPath string, volume string, path string, flag int, perm os.FileMode) (FileWriter, error) {
+func (ls locks) rMetaLocker(s storageFunctions, fsPath string, volume string, path string, flag int, perm os.FileMode) (FileWriter, error) {
 	if l, ok := ls[fsPath]; ok {
 		if l.LockType() == writeLock || l.LockType() == readLock {
 			rl, ok := l.(FileWriter)
@@ -379,14 +380,14 @@ func (ls locks) rMetaLocker(fsPath string, volume string, path string, flag int,
 	}
 
 	for _, l := range ls {
-		if l.Volume() == volume && (path == l.Path() || pathutil.Dir(pathutil.Dir(path)) == l.Path()) {
+		if l.Volume() == volume && s.checkPathInObject(path, l.Object()) {
 			return OpenFile(fsPath, flag, perm)
 		}
 	}
 	return nil, nil
 }
 
-func (ls locks) rwMetaLocker(fsPath string, volume string, path string, flag int, perm os.FileMode) (FileWriter, error) {
+func (ls locks) rwMetaLocker(s storageFunctions, fsPath string, volume string, path string, flag int, perm os.FileMode) (FileWriter, error) {
 
 	truncate := false
 	append := false
@@ -423,7 +424,7 @@ func (ls locks) rwMetaLocker(fsPath string, volume string, path string, flag int
 			continue
 		}
 
-		if l.Volume() == volume && (path == l.Path() || pathutil.Dir(pathutil.Dir(path)) == l.Path()) {
+		if l.Volume() == volume && s.checkPathInObject(path, l.Object()) {
 			return createFile(fsPath, flag)
 		}
 	}
@@ -461,7 +462,7 @@ func (fsi *fsIOPool) newNMetaLock(s storageFunctions, volume string, paths ...st
 		fLocks[lockPath] = &nLock{
 			lockPaths: &lockPaths{
 				volume:   volume,
-				path:     path,
+				object:   path,
 				lockPath: lockPath,
 			},
 		}
@@ -505,7 +506,7 @@ func (fsi *fsIOPool) newRMetaLock(s storageFunctions, volume string, paths ...st
 				fLocks[lockPath] = &nLock{
 					lockPaths: &lockPaths{
 						volume:   volume,
-						path:     path,
+						object:   path,
 						lockPath: lockPath,
 					},
 				}
@@ -519,7 +520,7 @@ func (fsi *fsIOPool) newRMetaLock(s storageFunctions, volume string, paths ...st
 			fLocks[lockPath] = &rLock{
 				lockPaths: &lockPaths{
 					volume:   volume,
-					path:     path,
+					object:   path,
 					lockPath: lockPath,
 				},
 				RLockedFile: rlk,
@@ -576,7 +577,7 @@ func (fsi *fsIOPool) newRWMetaLock(s storageFunctions, volume string, paths ...s
 		fLocks[lockPath] = &rwLock{
 			lockPaths: &lockPaths{
 				volume:   volume,
-				path:     path,
+				object:   path,
 				lockPath: lockPath,
 			},
 			LockedFile: wlk,
