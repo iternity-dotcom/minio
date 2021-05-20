@@ -128,6 +128,24 @@ func (sys *BucketMetadataSys) Update(bucket string, configFile string, configDat
 				return err
 			}
 			return objAPI.SetBucketPolicy(GlobalContext, bucket, config)
+		case bucketVersioningConfig:
+			if globalGatewayName == NASXLBackendGateway {
+				meta, err := loadBucketMetadata(GlobalContext, objAPI, bucket)
+				if err != nil {
+					return err
+				}
+				meta.VersioningConfigXML = configData
+				return meta.Save(GlobalContext, objAPI)
+			}
+		case objectLockConfig:
+			if globalGatewayName == NASXLBackendGateway {
+				meta, err := loadBucketMetadata(GlobalContext, objAPI, bucket)
+				if err != nil {
+					return err
+				}
+				meta.ObjectLockConfigXML = configData
+				return meta.Save(GlobalContext, objAPI)
+			}
 		}
 		return NotImplemented{}
 	}
@@ -220,6 +238,19 @@ func (sys *BucketMetadataSys) Get(bucket string) (BucketMetadata, error) {
 // GetVersioningConfig returns configured versioning config
 // The returned object may not be modified.
 func (sys *BucketMetadataSys) GetVersioningConfig(bucket string) (*versioning.Versioning, error) {
+	if globalIsGateway && globalGatewayName == NASXLBackendGateway {
+		// Only needed in case of NASXL gateway.
+		objAPI := newObjectLayerFn()
+		if objAPI == nil {
+			return nil, errServerNotInitialized
+		}
+		meta, err := loadBucketMetadata(GlobalContext, objAPI, bucket)
+		if err != nil {
+			return nil, err
+		}
+		return meta.versioningConfig, nil
+	}
+
 	meta, err := sys.GetConfig(bucket)
 	if err != nil {
 		return nil, err
@@ -246,6 +277,25 @@ func (sys *BucketMetadataSys) GetTaggingConfig(bucket string) (*tags.Tags, error
 // GetObjectLockConfig returns configured object lock config
 // The returned object may not be modified.
 func (sys *BucketMetadataSys) GetObjectLockConfig(bucket string) (*objectlock.Config, error) {
+	if globalIsGateway && globalGatewayName == NASXLBackendGateway {
+		// Only needed in case of NASXL gateway.
+		objAPI := newObjectLayerFn()
+		if objAPI == nil {
+			return nil, errServerNotInitialized
+		}
+		meta, err := loadBucketMetadata(GlobalContext, objAPI, bucket)
+		if err != nil {
+			if errors.Is(err, errConfigNotFound) {
+				return nil, BucketObjectLockConfigNotFound{Bucket: bucket}
+			}
+			return nil, err
+		}
+		if meta.objectLockConfig == nil {
+			return nil, BucketObjectLockConfigNotFound{Bucket: bucket}
+		}
+		return meta.objectLockConfig, nil
+	}
+
 	meta, err := sys.GetConfig(bucket)
 	if err != nil {
 		if errors.Is(err, errConfigNotFound) {
