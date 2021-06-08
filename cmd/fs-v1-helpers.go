@@ -309,9 +309,14 @@ func fsCreateFile(ctx context.Context, filePath string, reader io.Reader, falloc
 	if err != nil {
 		return 0, osErrToFileErr(err)
 	}
-	defer writer.Close()
 
 	bytesWritten, err := io.Copy(writer, reader)
+	if err != nil {
+		logger.LogIf(ctx, err)
+		return 0, err
+	}
+
+	err = writer.Close()
 	if err != nil {
 		logger.LogIf(ctx, err)
 		return 0, err
