@@ -289,6 +289,7 @@ func listObjects(ctx context.Context, obj ObjectLayer, bucket, prefix, marker, d
 		if !ok {
 			// Closed channel.
 			eof = true
+			break
 		}
 
 		if HasSuffix(walkResult.entry, SlashSeparator) {
