@@ -1074,6 +1074,11 @@ func (fs *FSObjects) parentDirIsObject(ctx context.Context, bucket, parent strin
 // Additionally writes `fs.json` which carries the necessary metadata
 // for future object operations.
 func (fs *FSObjects) PutObject(ctx context.Context, bucket string, object string, r *PutObjReader, opts ObjectOptions) (objInfo ObjectInfo, err error) {
+	now := time.Now()
+	defer func() {
+		timeTrack(now, fmt.Sprintf("objLayer.PutObject(bucket: %s, object: %s, noLock: %t)", bucket, object, opts.NoLock))
+	}()
+	
 	if opts.Versioned {
 		return objInfo, NotImplemented{}
 	}
@@ -1107,7 +1112,7 @@ func (fs *FSObjects) putObject(ctx context.Context, bucket string, object string
 	var fsTmpObjPath string
 	now := time.Now()
 	defer func() {
-		timeTrack(now, fmt.Sprintf("objLayer.PutObject(bucket: %s, object: %s, noLock: %t) -> filePath: %s", bucket, object, opts.NoLock, fsTmpObjPath))
+		timeTrack(now, fmt.Sprintf("objLayer.putObject(bucket: %s, object: %s, noLock: %t) -> filePath: %s", bucket, object, opts.NoLock, fsTmpObjPath))
 	}()
 
 	data := r.Reader
