@@ -20,10 +20,12 @@ package cmd
 import (
 	"context"
 	"io"
+	"log"
 	"os"
 	pathutil "path"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/minio/minio/cmd/logger"
 	"github.com/minio/minio/pkg/lock"
@@ -481,4 +483,9 @@ func fsRemoveMeta(ctx context.Context, basePath, deletePath, tmpDir string) erro
 		return fsDeleteFile(ctx, tmpDir, tmpPath)
 	}
 	return fsDeleteFile(ctx, basePath, deletePath)
+}
+
+func timeTrack(start time.Time, name string) {
+	elapsed := time.Since(start)
+	log.Printf("%s took %s", name, elapsed)
 }

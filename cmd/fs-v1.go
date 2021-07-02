@@ -925,6 +925,12 @@ func (fs *FSObjects) parentDirIsObject(ctx context.Context, bucket, parent strin
 // Additionally writes `fs.json` which carries the necessary metadata
 // for future object operations.
 func (fs *FSObjects) PutObject(ctx context.Context, bucket string, object string, r *PutObjReader, opts ObjectOptions) (ObjectInfo, error) {
+	var tmpPartPath string
+	now := time.Now()
+	defer func() {
+		timeTrack(now, fmt.Sprintf("objLayer.PutObject(bucket: %s, object: %s, noLock: %t) -> filePath: %s", bucket, object, opts.NoLock, tmpPartPath))
+	}()
+
 	if opts.Versioned && !fs.disk.VersioningSupported() {
 		return ObjectInfo{}, NotImplemented{}
 	}
@@ -1012,7 +1018,8 @@ func (fs *FSObjects) PutObject(ctx context.Context, bucket string, object string
 		// Uploaded object will first be written to the temporary location which will eventually
 		// be renamed to the actual location. It is first written to the temporary location
 		// so that cleaning it up will be easy if the server goes down.
-		err = fs.disk.CreateFile(ctx, fs.disk.MetaTmpBucket(), pathJoin(tempObjFolder, fi.DataDir, partName), cReader.Size(), cReader)
+		tmpPartPath = pathJoin(tempObjFolder, fi.DataDir, partName)
+		err = fs.disk.CreateFile(ctx, fs.disk.MetaTmpBucket(), tmpPartPath, cReader.Size(), cReader)
 		if err != nil {
 			// Should return IncompleteBody{} error when reader has fewer
 			// bytes than specified in request header.

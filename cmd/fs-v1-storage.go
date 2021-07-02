@@ -23,6 +23,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"io/ioutil"
 	"net/url"
@@ -496,17 +497,25 @@ func (s *fsv1Storage) AppendFile(ctx context.Context, volume string, path string
 }
 
 func (s *fsv1Storage) CreateFile(ctx context.Context, volume, path string, fileSize int64, r io.Reader) error {
+	defer timeTrack(time.Now(), fmt.Sprintf("storage.CreateFile(volume: %s, path: %s, fileSize: %d)", volume, path, fileSize))
+
 	if fileSize < -1 {
 		return errInvalidArgument
 	}
 
+	start := time.Now()
 	file, err := s._openFile(ctx, volume, path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0666)
+	timeTrack(start, fmt.Sprintf("storage.CreateFile.openFile(volume: %s, path: %s, fileSize: %d)", volume, path, fileSize))
+
 	if err != nil {
 		return err
 	}
 	defer file.Close()
 
+	start = time.Now()
 	written, err := io.Copy(file, r)
+	timeTrack(start, fmt.Sprintf("storage.CreateFile.copy(volume: %s, path: %s, fileSize: %d)", volume, path, fileSize))
+
 	if err != nil {
 		logger.LogIf(ctx, err)
 		return err
