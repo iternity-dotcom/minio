@@ -19,11 +19,14 @@ package cmd
 
 import (
 	"context"
+	"fmt"
 	"io"
+	"log"
 	"os"
 	pathutil "path"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/minio/minio/cmd/logger"
 	"github.com/minio/minio/pkg/lock"
@@ -275,6 +278,11 @@ func fsOpenFile(ctx context.Context, readPath string, offset int64) (io.ReadClos
 
 // Creates a file and copies data from incoming reader.
 func fsCreateFile(ctx context.Context, filePath string, reader io.Reader, fallocSize int64) (int64, error) {
+	now := time.Now()
+	defer func() {
+		timeTrack(now, fmt.Sprintf("helper.fsCreateFile(filePath: %s)", filePath))
+	}()
+
 	if filePath == "" || reader == nil {
 		logger.LogIf(ctx, errInvalidArgument)
 		return 0, errInvalidArgument
@@ -311,7 +319,10 @@ func fsCreateFile(ctx context.Context, filePath string, reader io.Reader, falloc
 	}
 	defer writer.Close()
 
+	start := time.Now()
 	bytesWritten, err := io.Copy(writer, reader)
+	timeTrack(start, fmt.Sprintf("helper.fsCreateFile.copy(filePath: %s)", filePath))
+
 	if err != nil {
 		logger.LogIf(ctx, err)
 		return 0, err
@@ -454,4 +465,9 @@ func fsRemoveMeta(ctx context.Context, basePath, deletePath, tmpDir string) erro
 		return fsDeleteFile(ctx, tmpDir, tmpPath)
 	}
 	return fsDeleteFile(ctx, basePath, deletePath)
+}
+
+func timeTrack(start time.Time, name string) {
+	elapsed := time.Since(start)
+	log.Printf("%s took %s", name, elapsed)
 }

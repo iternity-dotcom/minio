@@ -1104,6 +1104,12 @@ func (fs *FSObjects) PutObject(ctx context.Context, bucket string, object string
 
 // putObject - wrapper for PutObject
 func (fs *FSObjects) putObject(ctx context.Context, bucket string, object string, r *PutObjReader, opts ObjectOptions) (objInfo ObjectInfo, retErr error) {
+	var fsTmpObjPath string
+	now := time.Now()
+	defer func() {
+		timeTrack(now, fmt.Sprintf("objLayer.PutObject(bucket: %s, object: %s, noLock: %t) -> filePath: %s", bucket, object, opts.NoLock, fsTmpObjPath))
+	}()
+
 	data := r.Reader
 
 	// No metadata is set, allocate a new one.
@@ -1182,7 +1188,7 @@ func (fs *FSObjects) putObject(ctx context.Context, bucket string, object string
 	// so that cleaning it up will be easy if the server goes down.
 	tempObj := mustGetUUID()
 
-	fsTmpObjPath := pathJoin(fs.fsPath, minioMetaTmpBucket, fs.fsUUID, tempObj)
+	fsTmpObjPath = pathJoin(fs.fsPath, minioMetaTmpBucket, fs.fsUUID, tempObj)
 	bytesWritten, err := fsCreateFile(ctx, fsTmpObjPath, data, data.Size())
 
 	// Delete the temporary object in the case of a
