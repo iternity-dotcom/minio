@@ -280,7 +280,7 @@ func createFile(filePath string, mode int) (f *os.File, err error) {
 		return nil, osErrToFileErr(err)
 	}
 
-	w, err := OpenFile(filePath, mode|writeMode, 0666)
+	w, err := OpenFile(filePath, mode, 0666)
 	if err != nil {
 		// File path cannot be verified since one of the parents is a file.
 		switch {

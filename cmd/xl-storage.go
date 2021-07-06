@@ -1321,7 +1321,7 @@ func (s *xlStorage) openFile(ctx context.Context, volume string, path string, mo
 		return nil, osErrToFileErr(err)
 	}
 
-	w, err := s.openFileNormal(ctx, volume, path, mode|writeMode, 0666)
+	w, err := s.openFileNormal(ctx, volume, path, mode, 0666)
 	if err != nil {
 		// File path cannot be verified since one of the parents is a file.
 		switch {

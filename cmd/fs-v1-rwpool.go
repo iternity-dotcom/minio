@@ -404,6 +404,7 @@ func (ls locks) rwMetaLocker(s storageFunctions, fsPath string, volume string, p
 
 	if l, ok := ls[fsPath]; ok {
 		if l.LockType() == writeLock {
+			flag = flag | os.O_SYNC
 			wl, ok := l.(truncatingFileWriter)
 			if !ok {
 				return nil, errInvalidArgument
